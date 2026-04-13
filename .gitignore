@@ -1,0 +1,132 @@
+# ── Python ────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# ── Test / coverage / type cache ─────────────────────────────
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+htmlcov/
+
+# ── Type checkers / linters ──────────────────────────────────
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+.ruff_cache/
+
+# ── Environments ─────────────────────────────────────────────
+.env
+.envrc
+.venv
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+# Keep .env.example tracked so contributors know what variables to set.
+!.env.example
+
+# ── uv ───────────────────────────────────────────────────────
+# uv.lock IS committed for reproducible installs — do not ignore it.
+# Only ignore the cache.
+.uv-cache/
+
+# ── Jupyter / IPython ────────────────────────────────────────
+.ipynb_checkpoints
+profile_default/
+ipython_config.py
+
+# ── Cython debug ─────────────────────────────────────────────
+cython_debug/
+
+# ── PEP 582 ──────────────────────────────────────────────────
+__pypackages__/
+
+# ── Sphinx / mkdocs ──────────────────────────────────────────
+docs/_build/
+site/
+
+# ── IDEs / editors ───────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*.swn
+*.iml
+*~
+.project
+.pydevproject
+.settings/
+.spyderproject
+.spyproject
+.ropeproject
+
+# ── OS junk ──────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ── Project-specific ─────────────────────────────────────────
+# get_youtube_information caches under OS temp dir (not the repo),
+# but if anyone runs the tool with --temp-dir pointing here:
+yt_*.xml
+
+# Local server data dir (if user picks --temp-dir under repo)
+.aismartbuddy/
+
+# Local notes / scratch
+*.scratch
+.scratch/
+TODO.local.md
+NOTES.local.md
+
+# ── Ignore tooling state directories that aren't part of the project ──
+# Comment out any of these if you DO want to track them.
+# .agents/, .claude/, .meridian/ contain agent/skill/plan state.
+# These are currently committed in the initial baseline; uncomment to
+# stop tracking them going forward.
+# .agents/
+# .claude/
+# .meridian/

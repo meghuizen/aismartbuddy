@@ -1,293 +1,501 @@
 # AISmartBuddy
 
-An MCP (Model Context Protocol) server that gives AI assistants on-demand SQL and graph database capabilities with token-optimized output.
+An MCP (Model Context Protocol) server that gives AI assistants on-demand SQL, graph, structured-thinking, holonic, scoring, and YouTube ingestion capabilities — with token-optimized output, multi-tenant isolation, and Arrow/Polars-backed performance.
 
-## What It Does
+**Repo**: https://github.com/meghuizen/aismartbuddy
 
-AISmartBuddy provides AI assistants with temporary, session-based databases:
+---
 
-- **SQL Sessions** (DuckDB) — Tabular data, analytics, aggregations, joins, window functions, CSV/JSON/Parquet import
-- **Graph Sessions** (LadybugDB/Cypher) — Relationship data, networks, hierarchies, path finding, pattern matching
-- **Smart Routing** — A `suggest_database` tool helps the AI choose the right database for each task
+## What you get
 
-Each session gets an isolated temporary database that is automatically cleaned up when destroyed or timed out.
+- **49 MCP tools** across seven domains (SQL · Graph · Think · Holon · Score · YouTube · Meta)
+- **Token-optimized output** — Arrow → Polars → CSV pipeline (10-100× faster than `csv.writer`); transcripts in compact `[MM:SS] text` Markdown
+- **Multi-tenant** — every session bound to `(user_id, project_id)` with per-session locks
+- **Cursor-based pagination** — page through huge result sets without re-running queries
+- **YouTube ingestion** — `get_youtube_information` returns title, description, available languages, and the full timed transcript in one call; lxml-cached on disk; gracefully degrades on partial failures
+- **Three transports** — `stdio` (default, for desktop clients), `sse` (for remote)
 
-## Quick Start
+---
 
-### Install
+## Run instantly with `uvx` (no clone, no install)
 
-```bash
-# Clone the repo
-git clone https://github.com/your-org/aismartbuddy.git
-cd aismartbuddy
-
-# Install with uv (recommended)
-uv sync
-
-# Or install with pip
-pip install -e .
-```
-
-### Run
+The fastest way to use AISmartBuddy is with `uvx`, which fetches and runs the latest `main` from GitHub on demand:
 
 ```bash
-# stdio transport (default — for Claude Code, Cursor, etc.)
-uv run python -m aismartbuddy
+# stdio (default — for Claude Code / Claude Desktop)
+uvx --from git+https://github.com/meghuizen/aismartbuddy aismartbuddy
 
-# SSE transport (for remote/web clients)
-uv run python -m aismartbuddy --transport sse --port 8000
+# Pin a specific tag for reproducibility
+uvx --from git+https://github.com/meghuizen/aismartbuddy@v0.1.0 aismartbuddy
+
+# SSE for remote use
+uvx --from git+https://github.com/meghuizen/aismartbuddy aismartbuddy \
+    --transport sse --host 0.0.0.0 --port 8000
 ```
 
-### Connect to Claude Code
+`uv` caches the build, so subsequent runs are instant. Force a refresh with `--reinstall` or `uv cache clean`.
 
-Add to your `.claude/settings.json`:
+---
+
+## Connect to Claude Code
+
+The `claude mcp add` CLI is the simplest path:
+
+```bash
+claude mcp add aismartbuddy uvx --from git+https://github.com/meghuizen/aismartbuddy aismartbuddy
+```
+
+Or hand-edit `~/.claude.json` (project-scoped) / `~/.claude/settings.json` (user-scoped):
 
 ```json
 {
   "mcpServers": {
     "aismartbuddy": {
-      "command": "uv",
-      "args": ["run", "python", "-m", "aismartbuddy"]
+      "command": "uvx",
+      "args": [
+        "--from", "git+https://github.com/meghuizen/aismartbuddy",
+        "aismartbuddy"
+      ],
+      "env": {
+        "AISMARTBUDDY_DEFAULT_USER_ID": "your-name",
+        "AISMARTBUDDY_DEFAULT_PROJECT_ID": "scratch"
+      }
     }
   }
 }
 ```
 
-## Tools Reference
-
-| Tool | Description |
-|------|-------------|
-| **SQL Tools** | |
-| `sql_create_session` | Create a temporary SQL database session (DuckDB) |
-| `sql_query` | Execute SQL queries — SELECT, CREATE TABLE, INSERT, analytics |
-| `sql_import` | Import data (CSV, TSV, JSON, JSONL, Parquet, custom-delimited) |
-| `sql_import_batch` | Import multiple data chunks into one table sequentially |
-| `sql_schema` | List tables or describe a specific table's schema |
-| `sql_destroy_session` | Destroy session and clean up temp files |
-| **Graph Core Tools** | |
-| `graph_create_session` | Create a temporary graph database session (LadybugDB) |
-| `graph_query` | Execute Cypher queries — MATCH, CREATE, path finding |
-| `graph_import` | Import CSV data as nodes or relationships |
-| `graph_schema` | Get graph database schema (tables, relationships) |
-| `graph_destroy_session` | Destroy session and clean up temp files |
-| **Graph Analytics** | |
-| `graph_statistics` | Full graph overview in one call (node/edge counts, totals) |
-| `graph_neighbors` | Explore N-hop neighborhood around any node |
-| `graph_find_connections` | Find all paths between two nodes (shortest first) |
-| `graph_analyze` | Pre-built analytics: orphans, hubs, categories, cross-connections |
-| **Graph Comparison** | |
-| `graph_compare` | Compare two graph sessions (structure, nodes, properties) |
-| `graph_cross_reference` | Cross-reference nodes between two graphs (CSV diff) |
-| **Knowledge Graph** | |
-| `graph_knowledge_add` | Add knowledge entity with confidence and provenance |
-| `graph_knowledge_relate` | Add semantic relationship (supports/contradicts/causes/etc.) |
-| `graph_knowledge_infer` | Run inference: contradictions, gaps, chains, clusters |
-| `graph_knowledge_summary` | Complete knowledge graph overview in one call |
-| **Meta** | |
-| `suggest_database` | Recommend SQL vs Graph for a given use case |
-
-## SQL Tools (DuckDB)
-
-### Create a Session
-
-```
-sql_create_session → session_id: "a1b2c3d4e5f6g7h8"
-```
-
-### Import Data
-
-```
-sql_import(session_id, "sales", "date,product,amount\n2024-01-01,Widget,100\n2024-01-02,Gadget,250", format="csv")
-→ Created table and imported 2 rows into 'sales'.
-```
-
-### Run Queries
-
-```
-sql_query(session_id, "SELECT product, SUM(amount) as total FROM sales GROUP BY product ORDER BY total DESC")
-→ # 2 rows x 2 columns
-  product,total
-  Gadget,250
-  Widget,100
-```
-
-### Analytical Queries
-
-DuckDB supports advanced SQL including window functions, CTEs, and date operations:
-
-```sql
--- Window functions
-SELECT name, salary, RANK() OVER (ORDER BY salary DESC) FROM employees;
-
--- CTEs
-WITH monthly AS (SELECT date_trunc('month', date) as month, SUM(amount) as total FROM sales GROUP BY 1)
-SELECT * FROM monthly ORDER BY month;
-
--- Direct file queries
-SELECT * FROM read_csv_auto('data.csv');
-```
-
-## Graph Tools (LadybugDB)
-
-### Create a Session
-
-```
-graph_create_session → session_id: "h8g7f6e5d4c3b2a1"
-```
-
-### Define Schema (required first!)
-
-```
-graph_query(session_id, "CREATE NODE TABLE Person (id INT64 PRIMARY KEY, name STRING, age INT64);")
-graph_query(session_id, "CREATE REL TABLE Knows (FROM Person TO Person, since INT64);")
-```
-
-### Add Data and Query
-
-```
-graph_query(session_id, "CREATE (p:Person {id: 1, name: 'Alice', age: 30});")
-graph_query(session_id, "MATCH (p:Person) RETURN p.name, p.age;")
-```
-
-### Import Bulk Data
-
-```
-graph_import(session_id, "Person", "id,name,age\n1,Alice,30\n2,Bob,25\n3,Carol,35",
-             table_type="node", schema="id INT64 PRIMARY KEY, name STRING, age INT64")
-```
-
-### Path Finding
-
-```
-graph_query(session_id, """
-  MATCH p = shortest_path((a:Person)-[:Knows*]->(b:Person))
-  WHERE a.name = 'Alice' AND b.name = 'Carol'
-  RETURN nodes(p), rels(p);
-""")
-```
-
-## Running
-
-### CLI Options
-
-```
-Usage: aismartbuddy [OPTIONS]
-
-Options:
-  --transport [stdio|sse]    Transport protocol (default: stdio)
-  --port INTEGER             Port for SSE transport (default: 8000)
-  --host TEXT                Host for SSE transport (default: 127.0.0.1)
-  --temp-dir TEXT            Override temp directory for databases
-  --max-rows INTEGER         Max rows per query result (default: 1000)
-  --max-chars INTEGER        Max characters per response (default: 50000)
-  --session-timeout INTEGER  Session timeout in seconds (default: 3600)
-  --help                     Show this message and exit.
-```
-
-### Docker
+Verify with `/mcp` inside Claude Code, or:
 
 ```bash
-docker build -t aismartbuddy .
-docker run -i aismartbuddy
+claude mcp list
+claude mcp get aismartbuddy
 ```
 
-### Environment Variables
+---
 
-Copy `.env.example` to `.env` and configure:
+## Connect to Claude Desktop
 
-```bash
-AISMARTBUDDY_TEMP_DIR=/tmp/aismartbuddy
-AISMARTBUDDY_MAX_ROWS=1000
-AISMARTBUDDY_MAX_CHARS=50000
-AISMARTBUDDY_SESSION_TIMEOUT=3600
+Edit your `claude_desktop_config.json`:
+
+| OS | Path |
+|---|---|
+| **macOS** | `~/Library/Application Support/Claude/claude_desktop_config.json` |
+| **Windows** | `%APPDATA%\Claude\claude_desktop_config.json` |
+| **Linux** | `~/.config/Claude/claude_desktop_config.json` |
+
+```json
+{
+  "mcpServers": {
+    "aismartbuddy": {
+      "command": "uvx",
+      "args": [
+        "--from", "git+https://github.com/meghuizen/aismartbuddy",
+        "aismartbuddy"
+      ]
+    }
+  }
+}
 ```
+
+Restart Claude Desktop. The 49 tools should appear in the tool inventory icon.
+
+> **Windows note**: if `uvx` isn't on `%PATH%` for the desktop process, use the absolute path: `"command": "C:\\Users\\<you>\\.local\\bin\\uvx.exe"`.
+
+---
 
 ## Debugging
 
-### Test the Server Locally
+### 1. Logs
+
+The server prints startup info and warnings to **stderr** (stdout is reserved for the JSON-RPC stream on stdio). Capture them while running through Claude clients via your shell:
 
 ```bash
-# Run with verbose logging
-uv run python -m aismartbuddy 2>server.log
+# Run manually with stderr captured to a file
+uvx --from git+https://github.com/meghuizen/aismartbuddy aismartbuddy 2>aismartbuddy.log
 
-# In another terminal, check the log
-tail -f server.log
+# In another terminal
+tail -f aismartbuddy.log
 ```
 
-### Use the MCP Inspector
+Increase Python logging verbosity with the standard `LOGLEVEL`:
 
 ```bash
-# Install the MCP inspector
-npx @modelcontextprotocol/inspector
-
-# Point it at AISmartBuddy
-npx @modelcontextprotocol/inspector uv run python -m aismartbuddy
+LOGLEVEL=DEBUG uvx --from git+https://github.com/meghuizen/aismartbuddy aismartbuddy 2>aismartbuddy.log
 ```
 
-### Common Issues
+### 2. MCP Inspector (UI)
 
-| Issue | Solution |
-|-------|----------|
-| "Session not found" | Session was destroyed or timed out. Create a new one. |
-| "Not connected" | Internal error — session engine failed to initialize. |
-| Graph "Table does not exist" | You must CREATE NODE TABLE before CREATE nodes. |
-| Import fails | Check CSV has a header row and data matches expected format. |
-
-## Development
-
-### Setup
+The official MCP inspector lets you click through tools, prompts, and resources:
 
 ```bash
-# Install with dev dependencies
+npx @modelcontextprotocol/inspector \
+    uvx --from git+https://github.com/meghuizen/aismartbuddy aismartbuddy
+```
+
+It opens a local web UI; you can call any tool with arbitrary arguments and inspect the JSON-RPC traffic.
+
+### 3. Talk to it as SSE manually
+
+When debugging tool wiring, run as SSE so you can poke at it with `curl`:
+
+```bash
+uvx --from git+https://github.com/meghuizen/aismartbuddy aismartbuddy \
+    --transport sse --host 127.0.0.1 --port 8000
+
+# Open the SSE event stream in another terminal
+curl -N http://127.0.0.1:8000/sse
+```
+
+### 4. Attach a Python debugger
+
+For deep dives into a specific tool, install once and attach `debugpy`:
+
+```bash
+git clone https://github.com/meghuizen/aismartbuddy
+cd aismartbuddy
+uv sync --all-extras
+uv pip install debugpy
+
+# Run with debugpy listening on port 5678
+uv run python -m debugpy --listen 5678 --wait-for-client \
+    -m aismartbuddy --transport sse --port 8000
+```
+
+In VS Code, add a launch config:
+
+```json
+{
+  "type": "debugpy",
+  "request": "attach",
+  "name": "Attach to AISmartBuddy",
+  "connect": { "host": "localhost", "port": 5678 }
+}
+```
+
+### 5. Smoke test in Python
+
+A one-liner end-to-end check (uses the actual server):
+
+```bash
+uv run python -c "
+import anyio
+from aismartbuddy import youtube_client as yt_mod
+from aismartbuddy.tools.youtube import get_youtube_information
+
+async def main():
+    yt_mod.youtube_client = yt_mod.YouTubeClient.create()
+    try:
+        out = await get_youtube_information('https://www.youtube.com/watch?v=LM7DByKOHBs')
+        print(out[:400])
+    finally:
+        yt_mod.youtube_client.close()
+
+anyio.run(main)
+"
+```
+
+### 6. Common issues
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `Session 'X' not found` | Session expired (default 1h idle) or owned by a different user_id | Re-create or pass the right `user_id` parameter |
+| `cache=miss-degraded` in YouTube response | YouTube returned no transcript (disabled / processing / rate-limited) | Read the `## Transcript` block — it explains what to do (retry / different language / skip) |
+| Tool not visible in client | Client didn't restart, or stdio config wrong | Restart client; check `claude mcp get aismartbuddy` for status |
+| `YouTubeClient init failed` in logs | Network blocked at startup | Server still works for non-YouTube tools; YouTube tool returns clear error at call time |
+
+---
+
+## Local development
+
+```bash
+git clone https://github.com/meghuizen/aismartbuddy
+cd aismartbuddy
 uv sync --all-extras
 
-# Or
-pip install -e ".[dev]"
+# Run server (stdio)
+uv run python -m aismartbuddy
+
+# Tests
+uv run pytest -v                       # unit tests (skips integration)
+uv run pytest -m integration -v        # network-dependent integration tests
+
+# Lint + type
+uv run ruff check src/ tests/
+uv run ruff format src/ tests/
+uv run pyright
 ```
 
-### Commands
+---
+
+## Remote deployment
+
+There are two paths depending on your authentication needs:
+
+| Need | Choice |
+|---|---|
+| Just expose it on a private network, no auth | `--transport sse` behind a VPN / private DNS |
+| Production with Entra ID OAuth | **App Service for Containers + Easy Auth** (recommended — Easy Auth handles OAuth) **OR** Container Apps with a TokenVerifier wired into FastMCP |
+
+### Option A — App Service for Containers + Entra ID Easy Auth (recommended)
+
+This is the lowest-friction production path: Easy Auth performs the entire OAuth dance, validates the token, and forwards the user identity in `X-MS-CLIENT-PRINCIPAL-*` headers. Your server doesn't have to implement OAuth itself.
+
+**Architecture:**
+
+```
+┌────────────┐        ┌─────────────────────────┐        ┌──────────────────────┐
+│ MCP client │──HTTPS─│ App Service Easy Auth   │────────│ AISmartBuddy (SSE)   │
+│ (browser/  │  +OAuth│ (Entra ID, OIDC, OAuth) │ Trusted│ /sse, /messages/     │
+│  agent)    │        │ injects X-MS-CLIENT-*   │ network│ Reads headers as     │
+└────────────┘        └─────────────────────────┘        │ user_id              │
+                                                         └──────────────────────┘
+```
+
+**Step 1 — Register the app in Entra ID**
 
 ```bash
-uv run pytest -v              # Run tests
-uv run ruff check src/ tests/ # Lint
-uv run ruff format src/ tests/ # Format
-uv run pyright                 # Type check
+# Set variables
+APP_NAME="aismartbuddy-mcp"
+TENANT_ID="<your-tenant-id>"
+WEBAPP_NAME="aismartbuddy"           # globally unique
+RG="rg-aismartbuddy"
+LOCATION="westeurope"
+
+# Create resource group
+az group create -n $RG -l $LOCATION
+
+# Register app in Entra ID
+APP_ID=$(az ad app create --display-name $APP_NAME \
+    --sign-in-audience AzureADMyOrg \
+    --query appId -o tsv)
+
+# Add a client secret (or use a federated credential / managed identity)
+SECRET=$(az ad app credential reset --id $APP_ID --query password -o tsv)
 ```
 
-### Project Structure
+**Step 2 — Build and push the container**
 
-```
-src/aismartbuddy/
-├── __init__.py          # Package init, version
-├── __main__.py          # CLI entry point (Click)
-├── config.py            # Constants and runtime config
-├── server.py            # FastMCP server, tool/prompt/resource registration
-├── session.py           # SessionManager — lifecycle of temp databases
-├── formatting.py        # Token-optimized output (CSV, tables)
-├── tools/
-│   ├── sql.py           # SQL tools (DuckDB-backed)
-│   ├── graph.py         # Graph tools (LadybugDB-backed)
-│   └── meta.py          # Meta tools (suggest_database)
-└── engines/
-    ├── duckdb_engine.py # DuckDB connection wrapper
-    └── ladybug_engine.py # LadybugDB connection wrapper
+The repo already has a Dockerfile. Switch its `CMD` to SSE and push to ACR:
+
+```bash
+# Override CMD at runtime — no Dockerfile edit needed
+ACR=$(az acr create -n acr$RANDOM -g $RG --sku Basic --query name -o tsv)
+az acr login -n $ACR
+
+docker build -t $ACR.azurecr.io/aismartbuddy:latest .
+docker push $ACR.azurecr.io/aismartbuddy:latest
 ```
 
-## Token Efficiency
+**Step 3 — Create the App Service**
 
-AISmartBuddy defaults to CSV output for SQL queries, which uses 2-3x fewer tokens than JSON:
+```bash
+PLAN=$(az appservice plan create -n plan-$WEBAPP_NAME -g $RG \
+    --is-linux --sku B1 --query name -o tsv)
 
+az webapp create -n $WEBAPP_NAME -g $RG -p $PLAN \
+    --container-image-name $ACR.azurecr.io/aismartbuddy:latest
+
+# Override the entrypoint to run SSE
+az webapp config container set -n $WEBAPP_NAME -g $RG \
+    --container-startup-command "aismartbuddy --transport sse --host 0.0.0.0 --port 8000"
+
+# App Service expects port 80; map our SSE port
+az webapp config appsettings set -n $WEBAPP_NAME -g $RG --settings WEBSITES_PORT=8000
 ```
-# JSON (verbose)
-[{"name": "Alice", "age": 30}, {"name": "Bob", "age": 25}]
 
-# CSV (compact) — default
-name,age
-Alice,30
-Bob,25
+**Step 4 — Enable Easy Auth (Entra ID)**
+
+In Azure Portal: **App Service → Authentication → Add identity provider → Microsoft**.
+- **App registration**: pick the one created in Step 1
+- **Restrict access**: "Require authentication"
+- **Unauthenticated requests**: HTTP 401 Unauthorized
+- **Token store**: enabled
+
+After save, every request to your app must carry a valid Entra ID token. Easy Auth validates it and injects:
+- `X-MS-CLIENT-PRINCIPAL-NAME` — user's UPN (e.g. `alice@contoso.com`)
+- `X-MS-CLIENT-PRINCIPAL-ID` — object ID (stable across renames)
+- `X-MS-TOKEN-AAD-ACCESS-TOKEN` — pass-through token if you need to call downstream APIs
+
+**Step 5 — Map the principal to AISmartBuddy `user_id`**
+
+The current code reads `user_id` from `ctx.client_id` (Bearer token via MCP SDK), the explicit `user_id` parameter, or the `AISMARTBUDDY_DEFAULT_USER_ID` env var (in that priority). With Easy Auth, the simplest wire-up is a tiny middleware in `server.py` that reads `X-MS-CLIENT-PRINCIPAL-ID` and stores it on the request context.
+
+Add this to `server.py` (near where `mcp = FastMCP(...)` is created):
+
+```python
+# server.py — middleware to bind Easy Auth identity to MCP ctx.client_id
+from starlette.middleware.base import BaseHTTPMiddleware
+
+class _EasyAuthIdentityMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        principal_id = request.headers.get("x-ms-client-principal-id")
+        if principal_id:
+            # Stash on scope so MCP request context can pick it up.
+            request.scope["mcp_client_id"] = principal_id
+        return await call_next(request)
+
+mcp = FastMCP(SERVER_NAME, lifespan=app_lifespan)
+# Inject into the SSE app's middleware stack at startup
+@mcp.app.on_event("startup")
+async def _wire_middleware():
+    mcp.app.add_middleware(_EasyAuthIdentityMiddleware)
 ```
 
-This matters when working within AI context windows — less token waste on data formatting means more room for reasoning.
+Then update `identity.py:resolve_identity` to also check `request.scope` for `mcp_client_id` (1-line change). With this in place, every SQL/graph/think session is bound to the authenticated Entra principal — tenants are properly isolated.
+
+**Step 6 — Connect from a client**
+
+For Claude Code / Desktop pointed at the remote SSE endpoint:
+
+```json
+{
+  "mcpServers": {
+    "aismartbuddy-prod": {
+      "url": "https://aismartbuddy.azurewebsites.net/sse",
+      "headers": {
+        "Authorization": "Bearer <your-entra-token>"
+      }
+    }
+  }
+}
+```
+
+Acquire the bearer token from your IdP flow (e.g. `az account get-access-token --resource <APP_ID>`).
+
+### Option B — Container Apps with native MCP OAuth (advanced)
+
+If you want the MCP server itself to validate Bearer tokens (no Easy Auth in front), wire a `TokenVerifier` directly into FastMCP. This is the "remote MCP with OAuth support" model.
+
+**Step 1 — Add the verifier to `server.py`**
+
+```python
+# server.py — direct MCP OAuth via Entra ID JWKS
+import jwt  # add to pyproject.toml: "pyjwt[crypto]>=2.9"
+import httpx
+from mcp.server.auth.provider import TokenVerifier, AccessToken
+from mcp.server.auth.settings import AuthSettings
+
+ENTRA_TENANT_ID = os.environ["AISMARTBUDDY_ENTRA_TENANT"]
+ENTRA_AUDIENCE  = os.environ["AISMARTBUDDY_ENTRA_AUDIENCE"]   # api://<app-id-uri>
+JWKS_URL = f"https://login.microsoftonline.com/{ENTRA_TENANT_ID}/discovery/v2.0/keys"
+ISSUER   = f"https://login.microsoftonline.com/{ENTRA_TENANT_ID}/v2.0"
+
+_jwks_cache: dict | None = None
+
+class EntraTokenVerifier(TokenVerifier):
+    async def verify_token(self, token: str) -> AccessToken | None:
+        global _jwks_cache
+        if _jwks_cache is None:
+            async with httpx.AsyncClient() as client:
+                _jwks_cache = (await client.get(JWKS_URL)).json()
+        try:
+            unverified = jwt.get_unverified_header(token)
+            key = next(
+                k for k in _jwks_cache["keys"] if k["kid"] == unverified["kid"]
+            )
+            payload = jwt.decode(
+                token,
+                jwt.algorithms.RSAAlgorithm.from_jwk(key),
+                algorithms=["RS256"],
+                audience=ENTRA_AUDIENCE,
+                issuer=ISSUER,
+            )
+        except Exception:
+            return None
+        return AccessToken(
+            client_id=payload["oid"],   # stable Entra object ID
+            scopes=payload.get("scp", "").split(),
+            expires_at=payload.get("exp"),
+        )
+
+mcp = FastMCP(
+    SERVER_NAME,
+    lifespan=app_lifespan,
+    token_verifier=EntraTokenVerifier(),
+    auth=AuthSettings(
+        issuer_url=ISSUER,
+        resource_server_url=f"https://{os.environ['WEBSITE_HOSTNAME']}",
+        required_scopes=["mcp.invoke"],
+    ),
+)
+```
+
+**Step 2 — Expose an OAuth scope in your Entra app**
+
+In the app registration → **Expose an API** → add `mcp.invoke` scope. Grant admin consent.
+
+**Step 3 — Deploy to Container Apps**
+
+```bash
+ENV="env-aismartbuddy"
+az containerapp env create -n $ENV -g $RG -l $LOCATION
+
+az containerapp create -n aismartbuddy -g $RG --environment $ENV \
+    --image $ACR.azurecr.io/aismartbuddy:latest \
+    --target-port 8000 --ingress external \
+    --registry-server $ACR.azurecr.io \
+    --env-vars \
+        AISMARTBUDDY_TRANSPORT=sse \
+        AISMARTBUDDY_HOST=0.0.0.0 \
+        AISMARTBUDDY_PORT=8000 \
+        AISMARTBUDDY_ENTRA_TENANT=$TENANT_ID \
+        AISMARTBUDDY_ENTRA_AUDIENCE="api://$APP_ID"
+```
+
+`ctx.client_id` in tool calls now resolves to the authenticated Entra `oid`. Combined with the existing multi-tenant model (`identity.py:resolve_identity`), every session is automatically isolated per Entra principal — no extra middleware needed.
+
+> **Note**: at the time of writing, the `streamable-http` transport is not wired in `__main__.py` (only `stdio` and `sse`). Streamable-HTTP is the modern recommendation for remote MCP and a small follow-up to add to `__main__.py`. Both Easy Auth and the direct verifier above also work with SSE today.
+
+---
+
+## CLI options
+
+```text
+Usage: aismartbuddy [OPTIONS]
+
+Options:
+  --transport [stdio|sse]            Transport (default: stdio)
+  --port INTEGER                     SSE port (default: 8000)
+  --host TEXT                        SSE host (default: 127.0.0.1)
+  --temp-dir TEXT                    Override temp directory
+  --max-rows INTEGER                 Max rows per query result (default: 1000)
+  --max-chars INTEGER                Max chars per response (default: 50000)
+  --session-timeout INTEGER          Session idle timeout (default: 3600)
+  --cursor-timeout INTEGER           Pagination cursor timeout (default: 300)
+  --duckdb-threads INTEGER           DuckDB worker threads (0=auto)
+  --duckdb-memory-limit TEXT         DuckDB memory limit (default: 256MB)
+  --ladybug-buffer-size INTEGER      LadybugDB buffer pool bytes (default: 256MB)
+  --ladybug-threads INTEGER          LadybugDB worker threads (0=auto)
+  --default-user-id TEXT             Fallback user_id (default: "default")
+  --default-project-id TEXT          Fallback project_id (default: "default")
+```
+
+Every option also reads from an `AISMARTBUDDY_*` environment variable (e.g. `AISMARTBUDDY_TRANSPORT=sse`). Useful for Docker / Container Apps configuration without rebuilding.
+
+---
+
+## Tools at a glance
+
+| Group | Tools |
+|---|---|
+| **SQL (DuckDB)** | `sql_create_session`, `sql_query`, `sql_query_next`, `sql_import`, `sql_import_batch`, `sql_schema`, `sql_destroy_session` |
+| **Graph (LadybugDB)** | `graph_create_session`, `graph_query`, `graph_query_next`, `graph_import`, `graph_schema`, `graph_destroy_session`, `graph_statistics`, `graph_neighbors`, `graph_find_connections`, `graph_analyze`, `graph_compare`, `graph_cross_reference`, `graph_knowledge_add`, `graph_knowledge_relate`, `graph_knowledge_infer`, `graph_knowledge_summary` |
+| **Thinking** | `think_create_session`, `think_graph`, `think_graph_validate`, `think_graph_delegate`, `think_decide`, `think_model`, `think_debug`, `think_argue`, `think_collaborate`, `think_science`, `think_monitor`, `think_visualize`, `think_summarize`, `think_destroy_session`, `think_interfere`, `think_interfere_state` |
+| **Holonic** | `holon_create`, `holon_update`, `holon_view`, `holon_analyze`, `holon_query` |
+| **Scoring** | `score_rubric`, `score_evaluate`, `score_gate` |
+| **YouTube** | `get_youtube_information` |
+| **Meta** | `suggest_database` |
+
+See `CLAUDE.md` for tool descriptions and usage patterns. The server also exposes 5 prompts (guides) and 2 resources (sessions listing).
+
+---
+
+## Token efficiency
+
+CSV defaults for SQL/graph results — typically 2-3× fewer tokens than JSON. Transcripts use `[MM:SS] text` (auto-promotes to `[H:MM:SS]` for ≥1 hour videos). Pagination keeps responses bounded; cursor-based paging streams without re-running the query.
+
+---
 
 ## License
 
