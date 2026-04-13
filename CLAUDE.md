@@ -1,0 +1,134 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project Overview
+
+AISmartBuddy is a Python MCP server providing AI assistants with temporary SQL (DuckDB) and graph (LadybugDB/Cypher) database sessions. Output is token-optimized (CSV for bulk data). Designed as a foundation for additional AI-extending tools.
+
+## Tech Stack
+
+- **Language:** Python 3.12+
+- **MCP SDK:** `mcp` (FastMCP) — official Python SDK
+- **SQL Engine:** DuckDB via `duckdb` package
+- **Graph Engine:** LadybugDB via `real-ladybug` package
+- **Data Pipeline:** Arrow (`pyarrow`) → Polars (`polars`) for query results. 10-100x faster than csv.writer.
+- **Transport:** stdio (default), SSE for remote
+- **Package manager:** `uv` (preferred)
+- **Build backend:** hatchling
+
+## Build & Run Commands
+
+```bash
+uv sync                                  # Install dependencies
+uv run python -m aismartbuddy            # Run server (stdio)
+uv run python -m aismartbuddy --transport sse --port 8000  # Run server (SSE)
+uv run pytest -v                         # Run all tests
+uv run pytest tests/test_sql_tools.py::test_name -v  # Single test
+uv run pyright                           # Type check
+uv run ruff check src/ tests/            # Lint
+uv run ruff format src/ tests/           # Format
+```
+
+## Architecture
+
+```
+__main__.py (Click CLI) → server.py (FastMCP + lifespan)
+  ├── identity.py (resolve_identity from ctx/params/env)
+  ├── youtube_client.py (shared YoutubeDL + http session)
+  ├── tools/sql.py      → engines/duckdb_engine.py     ─┐
+  ├── tools/graph.py    → engines/ladybug_engine.py     ├── session.py (SessionManager)
+  ├── tools/think.py    → engines/thinking_engine.py    │
+  ├── tools/holon.py    → engines/thinking_engine.py    │
+  ├── tools/score.py    → engines/thinking_engine.py    │
+  ├── tools/youtube.py  → youtube_client.py + lxml XML cache
+  └── tools/meta.py                                     │
+      formatting.py (Arrow/Polars CSV + legacy csv.writer) ─┘
+```
+
+- **server.py** — FastMCP instance with 49 tools, 5 prompts, 2 resources. Lifespan manages SessionManager + YouTubeClient init/cleanup.
+- **identity.py** — Multi-tenant identity resolution. `resolve_identity(ctx, user_id, project_id)` returns validated `(user_id, project_id)` tuple using priority: ctx.client_id (Bearer auth) → tool parameter → RuntimeConfig default → literal "default". Path-component validation prevents filesystem traversal.
+- **youtube_client.py** — Shared `YouTubeClient` dataclass (requests.Session + YoutubeDL) plus `parse_video_id()` helper that accepts raw 11-char IDs, `watch?v=`, `youtu.be/`, `embed/`, and `shorts/` URLs. Module-level singleton initialized in `app_lifespan` (best-effort — failure does not block server startup; the tool checks for `None` at call time). YoutubeDL uses a no-op logger (to bypass `no_warnings` being overridden by custom loggers) and skips dash/hls format manifests for 2-3× faster metadata-only extraction.
+- **session.py** — Thread-safe SessionManager singleton (uses `threading.Lock`). Maps session_id → engine. Supports "sql", "graph", and "think" session types. Auto-cleans expired sessions and stale pagination cursors.
+- **tools/** — Async tool functions. Access SessionManager via `tools.get_session_manager()`. Wrap blocking engine calls with `anyio.to_thread.run_sync()`.
+- **engines/** — `BaseEngine` ABC with shared temp file handling, Arrow query path (`execute_arrow`), and cursor-based pagination (`execute_paged`, `fetch_next_page`). DuckDB and LadybugDB subclasses use `_require_conn()`. ThinkingEngine is in-memory (does not extend BaseEngine).
+- **formatting.py** — Token-optimized output. Primary path: Arrow Table → Polars DataFrame → `write_csv()`. Legacy path: tuple-based csv.writer (fallback for thinking tools). CSV default for SQL/graph (2-3x fewer tokens than JSON).
+
+### Key patterns
+
+- Tools are named `sql_*`, `graph_*`, `think_*`, `holon_*`, `score_*`, plus a few standalone (`suggest_database`, `get_youtube_information`). 49 total tools: 7 SQL, 16 graph, 1 meta, 16 thinking (+ think_create_session), 5 holonic, 3 scoring, 1 YouTube.
+- **`get_youtube_information(url_or_id, language="en", include_transcript=True, include_timestamps=True)`** — single-call tool returning title, description, available transcript languages, and the full timed transcript as Markdown. Accepts full URLs or raw 11-char video IDs. Results cached as lxml-built XML at `{OS_temp}/yt_{video_id}_{langcode}.xml` (OS handles cleanup). Cache version-stamped (`<video version="1">`); corrupt, vanished (TOCTOU), or older-version caches trigger silent refetch. `include_transcript=False` returns metadata only; `include_timestamps=False` strips `[MM:SS]` prefixes. Timestamps use `[MM:SS]` under 1 hour, `[H:MM:SS]` for longer videos.
+- **YouTube graceful degradation**: when transcript fetch fails (transcripts disabled, language not available, video still processing, rate limit, network blip) the tool returns a degraded response — full metadata + a structured `## Transcript` block containing a stable category code (`TRANSCRIPTS_DISABLED`, `TRANSCRIPT_LANGUAGE_NOT_AVAILABLE`, `TRANSCRIPT_TEMPORARILY_UNAVAILABLE`, `TRANSCRIPT_RATE_LIMITED`, `TRANSCRIPT_NETWORK_ERROR`, `TRANSCRIPT_UNKNOWN_ERROR`), the upstream reason, and an actionable hint. Header reads `cache=miss-degraded`. **Caching policy: only fully successful fetches are persisted** — degraded responses are never cached, so a subsequent call always re-attempts. Only metadata-fetch failure (yt-dlp itself failing) is terminal and raises `ValueError`.
+- **Annotation preset `_READONLY_OPEN`** (in `server.py`): for read-only tools that interact with EXTERNAL services (network calls). Sets `openWorldHint: True` per MCP spec so hosts know not to silently auto-approve. Used for `get_youtube_information`. The four presets are: `_DEFAULT` (closed-world, mutating), `_READONLY` (closed-world, idempotent), `_READONLY_OPEN` (open-world, idempotent — net calls), `_DESTRUCTIVE` (closed-world, destructive).
+- `think_graph` is the primary thinking tool — supports sequential chains, hierarchical decomposition, revision, synthesis, validation, and delegation. Also supports Socratic method as a usage pattern (branch into clarification/assumptions/evidence/perspectives/implications stages).
+- `think_model` provides 13 mental models: first_principles, opportunity_cost, error_propagation, rubber_duck, pareto_principle, assumptions_xray, fishbone, value_of_info, swot, pre_mortem, design_review, complexity, root_cause. Use pre_mortem before implementing, design_review before finalizing, root_cause for debugging.
+- All tools (ThoughtNode, HolonNode, EvaluationRecord) support `refs: list[str]` for cross-referencing outputs across tool groups.
+- `holon_*` tools model domains holonically — entities that are simultaneously wholes and parts. Multi-membership: holons participate in multiple holarchies. Bridge finds paths between distant holons across holarchies. Propagation leaves structural traces (stale projections).
+- Thinking tools (`think_*`) auto-create sessions on first call when `session_id` is omitted. Return compact text (not JSON) for token efficiency.
+- SQL import supports 6 formats: csv, tsv, txt (custom delimiter), json, jsonl, parquet (base64). Plus batch import via `sql_import_batch`.
+- Knowledge graph tools (`graph_knowledge_*`) layer semantic patterns: confidence scores, provenance, typed relations (supports/contradicts/etc.), inference (contradictions, gaps, chains, clusters).
+- **Data flow (SQL/graph):** `engine.execute_arrow(query)` → `pyarrow.Table` → `polars.from_arrow()` → `df.write_csv()` → str. Falls back to tuple-based `execute()` + `csv.writer` if Arrow unavailable.
+- **Pagination:** `sql_query`/`graph_query` accept `offset`/`limit` (random access) and `paginate=True` (cursor-based). Cursor paging uses DuckDB's `to_arrow_reader()` for streaming without full materialization. Use `sql_query_next`/`graph_query_next` for subsequent pages.
+- All database operations are blocking C calls wrapped in `anyio.to_thread.run_sync()` for async safety.
+- Sessions use UUID-keyed temp directories cleaned up on destroy, timeout, or server shutdown. Orphaned dirs from failed `connect()` are auto-cleaned.
+- SessionManager is thread-safe (`threading.Lock` guards all `_sessions` mutations). Periodic cleanup runs on worker thread (with error handling to prevent silent death).
+- **Engine tuning:** DuckDB accepts `threads` and `memory_limit` config. LadybugDB accepts `buffer_pool_size` and `max_num_threads`. Configurable via CLI flags or `AISMARTBUDDY_*` environment variables.
+- Config flows: CLI args (with envvar fallback) → `config.runtime_config` → server lifespan → SessionManager → engine constructors.
+
+## Multi-Tenant Model
+
+Sessions are bound to **(user_id, project_id)** at creation. This supports multiple users, multiple projects per user, and multiple sessions/agents per (user, project) — all isolated from each other on the backend:
+
+- **Identity resolution** (in `identity.py`): `user_id` comes from `ctx.client_id` when MCP Bearer auth is configured (priority 1), otherwise from explicit tool parameter (priority 2), otherwise from `--default-user-id` / `AISMARTBUDDY_DEFAULT_USER_ID` config (priority 3), otherwise literal `"default"`. `project_id` follows the same fallback chain without the Bearer-token path.
+- **Session ID entropy:** 128 bits (`uuid.uuid4().hex`, 32 hex chars) — session_id acts as a capability token. Possession equals authorization in the default case; under Bearer auth the ownership check also validates `session.user_id == ctx.client_id`.
+- **Temp layout:** `{temp_dir}/aismartbuddy/{user_id}/{project_id}/{session_id}/` — disk hierarchy mirrors logical hierarchy.
+- **Per-session lock:** each `SessionInfo` carries a `threading.Lock`. SQL/graph tools acquire it via `run_with_lock(info, fn)` (in `tools/__init__.py`) so two agents sharing a session serialize rather than corrupt engine state.
+- **ThinkingEngine thread safety (three layered patterns):**
+  1. **`@_synchronized` engine methods** — the default. Most mutations are single-step (`add_node`, `revise_node`, `upsert_*`, `add_*`, `join_holarchy`, `close`, `apply_finding`, `finalize_evaluation`). The decorator in `engines/thinking_engine.py` wraps them in `self._state_lock` (a `threading.RLock`). New tools should prefer this pattern.
+  2. **`with engine.state_lock:` in tool code** — for multi-step read-modify-write on engine-owned records that can't be cleanly expressed as a single engine method. Current users: `think_graph_validate`, `think_graph_delegate`, `think_visualize`, `propagate_up`, `propagate_down` in `holon_analyze`. The RLock is reentrant so `@_synchronized` engine calls inside the block work.
+  3. **Sync `_*_locked` helper called under `with engine.state_lock:`** — for tools with large/branching locked bodies that would otherwise require heavy indentation (`_holon_update_locked`, `_think_interfere_locked`). The async wrapper does session resolution + `with engine.state_lock:`, then delegates to a sync helper that runs the whole branch logic atomically.
+- **Resource scoping:** `aismartbuddy://sessions/{user_id}/{project_id}` is the listing resource. The unscoped `aismartbuddy://sessions` returns a helpful error — no cross-tenant enumeration.
+- **Error messages** are constant-text for "not found" vs "owned by someone else" to prevent presence-enumeration attacks.
+- **Path-component validation:** `user_id` and `project_id` must match `^[A-Za-z0-9_.-]{1,64}$` — blocks `../`, `/`, null bytes, reserved names.
+
+**Sharing:** multi-agent collaboration on one session works by sharing the `session_id` (out-of-band). All agents authenticating as the same user on the same project can access the session via just the session_id. No explicit "attach" step and no internal export/import tools — if agents need to copy content between sessions, they orchestrate it themselves via existing query/import tools.
+
+## Authentication (optional)
+
+MCP Bearer token authentication is available for the `streamable-http` and `sse` transports (not stdio). It is **not configured by default** — enable by passing `token_verifier` and `auth` to the `FastMCP(...)` call in `server.py`:
+
+```python
+from mcp.server.auth.provider import TokenVerifier
+from mcp.server.auth.settings import AuthSettings
+
+class MyVerifier(TokenVerifier):
+    async def verify_token(self, token: str):
+        # Validate JWT, return AccessToken or None
+        ...
+
+mcp = FastMCP(
+    SERVER_NAME,
+    lifespan=app_lifespan,
+    token_verifier=MyVerifier(),
+    auth=AuthSettings(
+        issuer_url="https://auth.example.com",
+        resource_server_url="https://your-mcp-server.example.com",
+        required_scopes=["read", "write"],
+    ),
+)
+```
+
+When configured, `ctx.client_id` becomes the authoritative `user_id` — tool-level `user_id` parameters are ignored to prevent claim spoofing. Without configuration, `user_id` is taken from the tool parameter or the configured default, which is appropriate for single-tenant stdio use.
+
+## MCP Integration
+
+```json
+{
+  "mcpServers": {
+    "aismartbuddy": {
+      "command": "uv",
+      "args": ["run", "python", "-m", "aismartbuddy"]
+    }
+  }
+}
+```

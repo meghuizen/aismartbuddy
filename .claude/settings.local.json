@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(rtk git:*)",
+      "Bash(mkdir -p /c/Users/michiele/source/repos/aismartbuddy/.meridian/plans)",
+      "Bash(cp /c/Users/michiele/.claude/plans/wiggly-soaring-eich.md /c/Users/michiele/source/repos/aismartbuddy/.meridian/plans/aismartbuddy-mcp-server.md)",
+      "Bash(cp /c/Users/michiele/.claude/plans/wiggly-soaring-eich.md /c/Users/michiele/source/repos/aismartbuddy/.meridian/plans/pathophysiology-graph-test.md)",
+      "Bash(rtk uv:*)",
+      "Bash(cp /c/Users/michiele/.claude/plans/wiggly-soaring-eich.md /c/Users/michiele/source/repos/aismartbuddy/.meridian/plans/knowledge-graph-support.md)",
+      "Bash(echo \"C:\\\\\\\\Users\\\\\\\\michiele\\\\\\\\source\\\\\\\\repos\\\\\\\\aismartbuddy\\\\\\\\.meridian\\\\\\\\plans\\\\\\\\knowledge-graph-support.md\")",
+      "Bash(cp /c/Users/michiele/.claude/plans/eventual-dazzling-seahorse.md /c/Users/michiele/source/repos/aismartbuddy/.meridian/plans/cognitive-tools-architecture.md)",
+      "Bash(cp /c/Users/michiele/.claude/plans/eventual-dazzling-seahorse.md /c/Users/michiele/source/repos/aismartbuddy/.meridian/plans/interference-protocol.md)",
+      "Bash(cp /c/Users/michiele/.claude/plans/eventual-dazzling-seahorse.md /c/Users/michiele/source/repos/aismartbuddy/.meridian/plans/thought-graph-tools.md)",
+      "Bash(cp /c/Users/michiele/.claude/plans/eventual-dazzling-seahorse.md /c/Users/michiele/source/repos/aismartbuddy/.meridian/plans/holonic-thinking-tools.md)",
+      "Bash(cp /c/Users/michiele/.claude/plans/eventual-dazzling-seahorse.md /c/Users/michiele/source/repos/aismartbuddy/.meridian/plans/clear-thought-adoption.md)",
+      "Bash(cp /c/Users/michiele/.claude/plans/eventual-dazzling-seahorse.md /c/Users/michiele/source/repos/aismartbuddy/.meridian/plans/scoring-evaluation-system.md)",
+      "Bash(cp /c/Users/michiele/.claude/plans/eventual-dazzling-seahorse.md /c/Users/michiele/source/repos/aismartbuddy/.meridian/plans/thought-node-depends-on.md)",
+      "Bash(echo -n \"C:\\\\\\\\Users\\\\\\\\michiele\\\\\\\\source\\\\\\\\repos\\\\\\\\aismartbuddy\\\\\\\\.meridian\\\\\\\\plans\\\\\\\\thought-node-depends-on.md\")",
+      "Bash(cp /c/Users/michiele/.claude/plans/bright-napping-crab.md /c/Users/michiele/source/repos/aismartbuddy/.meridian/plans/arrow-polars-pagination-architectural-overhaul.md)"
+    ]
+  }
+}
