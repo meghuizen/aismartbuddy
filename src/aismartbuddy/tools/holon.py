@@ -110,7 +110,7 @@ def _resolve_holarchy(
 def _holon_summary_line(node: HolonNode, holarchy_id: str) -> str:
     """One-line summary of a holon in a specific holarchy."""
     m = _get_membership(node, holarchy_id)
-    role = m["role_in_parent"] if m else ""
+    role = m["role_in_parent"][:40] if m else ""
     proj = node.projections.get(holarchy_id, "")
     stale = " [STALE]" if holarchy_id in node.stale_projections else ""
     parts = [f"{node.name}"]
@@ -359,9 +359,7 @@ def _holon_update_locked(
             )
         node.projections[holarchy_id] = content
         # Clear stale flag
-        node.stale_projections = [
-            s for s in node.stale_projections if s != holarchy_id
-        ]
+        node.stale_projections.discard(holarchy_id)
         return (
             f"Session: {session_id} | Holon: {holon_id}\n"
             f"Projection in {holarchy_id} updated: {content[:80]}"
@@ -499,16 +497,21 @@ async def holon_view(
             lines.append(f"Context: {node.context}")
         if node.rules:
             lines.append(f"Rules: {'; '.join(node.rules)}")
-        stale = [
-            s for s in node.stale_projections if s == hid
-        ]
-        if stale:
+        if hid in node.stale_projections:
             lines.append("WARNING: Projection in this holarchy is STALE")
+        _MAX_ZOOM_CHILDREN = 20
+        shown_children = children[:_MAX_ZOOM_CHILDREN]
+        omitted_children = len(children) - len(shown_children)
         lines.append(f"\n### Children ({len(children)}):")
-        for i, child in enumerate(children):
+        for i, child in enumerate(shown_children):
             lines.append(f"  {i+1}. {_holon_summary_line(child, hid)}")
             if child.context:
                 lines.append(f"     Context: {child.context[:80]}")
+        if omitted_children:
+            lines.append(
+                f"  ... {omitted_children} more"
+                " (use holon_query resolution=subtree)"
+            )
         if not children:
             lines.append("  (leaf holon — no children)")
         return "\n".join(lines)
@@ -556,13 +559,21 @@ async def holon_view(
         if parent:
             lines.append(f"\n### Shared Parent: {parent.name}")
             lines.append(f"Context: {parent.context or '(none)'}")
+        _MAX_SIDEWAYS_SIBLINGS = 20
+        shown_siblings = siblings[:_MAX_SIDEWAYS_SIBLINGS]
+        omitted_siblings = len(siblings) - len(shown_siblings)
         lines.append(f"\n### Peers ({len(siblings)}):")
-        for sib in siblings:
+        for sib in shown_siblings:
             lines.append(f"  - {_holon_summary_line(sib, hid)}")
             if sib.description:
                 lines.append(f"    Description: {sib.description[:60]}")
             if sib.context:
                 lines.append(f"    Context: {sib.context[:60]}")
+        if omitted_siblings:
+            lines.append(
+                f"  ... {omitted_siblings} more"
+                " (use holon_query resolution=local)"
+            )
         if not siblings:
             lines.append("  (no peers — only child)")
         return "\n".join(lines)
@@ -593,16 +604,27 @@ async def holon_view(
             lines.append(f"{indent}  Context: {anc.context[:60]}")
 
     if len(descendants) > 1:
-        lines.append(f"\n### Descendants ({len(descendants) - 1}):")
-        for desc in descendants:
-            if desc.id == holon_id:
-                continue
+        desc_list = [d for d in descendants if d.id != holon_id]
+        _MAX_CROSS_DESC = 20
+        shown = desc_list[:_MAX_CROSS_DESC]
+        omitted = len(desc_list) - len(shown)
+        lines.append(f"\n### Descendants ({len(desc_list)}):")
+        for desc in shown:
             m = _get_membership(desc, hid)
             lvl = m["level"] if m else "?"
-            lines.append(
-                f"  {desc.name} (L{lvl})"
-                f" | {_holon_summary_line(desc, hid)}"
-            )
+            proj = desc.projections.get(hid, "")
+            stale = " [STALE]" if hid in desc.stale_projections else ""
+            role = m["role_in_parent"][:40] if m and m.get("role_in_parent") else ""
+            parts = [f"  {desc.name} (L{lvl})"]
+            if role:
+                parts.append(f"role={role}")
+            if proj:
+                parts.append(f"proj={proj[:40]}{stale}")
+            elif stale:
+                parts.append(f"proj=?{stale}")
+            lines.append(" | ".join(parts))
+        if omitted:
+            lines.append(f"  ... {omitted} more (use holon_query resolution=subtree)")
 
     stale_count = sum(
         1 for d in descendants if hid in d.stale_projections
@@ -815,8 +837,7 @@ async def holon_analyze(
                 if propagation_type == "inform":
                     sep = "\n" if current.context else ""
                     current.context += f"{sep}[propagated] {insight}"
-                    if hid not in current.stale_projections:
-                        current.stale_projections.append(hid)
+                    current.stale_projections.add(hid)
                 elif propagation_type == "constrain":
                     current.rules.append(f"[propagated] {insight}")
                 elif propagation_type == "transform":
@@ -851,10 +872,10 @@ async def holon_analyze(
         if hid is None:
             raise ValueError("Specify holarchy_id for propagation")
 
-        subtree = engine.get_holon_subtree(holon_id, hid)
         affected: list[str] = []
-        # Atomic propagation — whole subtree updated under one lock
+        # Atomic propagation — snapshot + updates under one lock
         with engine.state_lock:
+            subtree = engine.get_holon_subtree(holon_id, hid)
             for desc in subtree:
                 if desc.id == holon_id:
                     continue
@@ -1055,21 +1076,28 @@ def _analyze_feedback_loops(
         ]
 
     # Find bidirectional references in context/rules
+    _MAX_FEEDBACK_PAIRS = 50
     loops: list[dict] = []
     checked: set[tuple[str, str]] = set()
+    truncated = False
+    texts = {h.id: (h.context + " " + " ".join(h.rules)).lower() for h in holons}
+    names = {h.id: h.name.lower() for h in holons}
+    outer_break = False
     for a in holons:
-        a_text = (a.context + " " + " ".join(a.rules)).lower()
+        if outer_break:
+            break
         for b in holons:
+            if len(checked) >= _MAX_FEEDBACK_PAIRS:
+                truncated = True
+                outer_break = True
+                break
             if a.id == b.id:
                 continue
             pair = tuple(sorted([a.id, b.id]))
             if pair in checked:
                 continue
             checked.add(pair)
-            b_text = (b.context + " " + " ".join(b.rules)).lower()
-            a_refs_b = b.name.lower() in a_text
-            b_refs_a = a.name.lower() in b_text
-            if a_refs_b and b_refs_a:
+            if names[b.id] in texts[a.id] and names[a.id] in texts[b.id]:
                 loops.append({
                     "holon_a": a.name,
                     "holon_b": b.name,
@@ -1092,6 +1120,11 @@ def _analyze_feedback_loops(
             "  No bidirectional references detected. "
             "Feedback loops may exist but aren't reflected "
             "in holon context/rules text yet."
+        )
+    if truncated:
+        lines.append(
+            f"  (search capped at {_MAX_FEEDBACK_PAIRS} pairs"
+            f" across {len(holons)} holons — scope with holon_id to search deeper)"
         )
     return "\n".join(lines)
 

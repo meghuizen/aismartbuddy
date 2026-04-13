@@ -238,7 +238,7 @@ class HolonNode:
     properties: list[str] = field(default_factory=list)
     memberships: list[dict] = field(default_factory=list)
     projections: dict[str, str] = field(default_factory=dict)
-    stale_projections: list[str] = field(default_factory=list)
+    stale_projections: set[str] = field(default_factory=set)
     description_stale: bool = False
     analytical_lenses: list[dict] = field(default_factory=list)
     refs: list[str] = field(default_factory=list)
@@ -746,10 +746,7 @@ class ThinkingEngine:
             node.children_by_holarchy.pop(holarchy_id, None)
             # Remove projections/stale for this holarchy
             node.projections.pop(holarchy_id, None)
-            node.stale_projections = [
-                s for s in node.stale_projections
-                if s != holarchy_id
-            ]
+            node.stale_projections.discard(holarchy_id)
             # Mark for deletion if no memberships remain
             if not node.memberships:
                 to_delete.append(hid)
