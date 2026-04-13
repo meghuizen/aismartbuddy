@@ -363,69 +363,74 @@ For Claude Code / Desktop pointed at the remote SSE endpoint:
 
 Acquire the bearer token from your IdP flow (e.g. `az account get-access-token --resource <APP_ID>`).
 
-### Option B — Container Apps with native MCP OAuth (advanced)
+### Option B — Container Apps with built-in Entra ID OAuth (recommended for MCP-native OAuth)
 
-If you want the MCP server itself to validate Bearer tokens (no Easy Auth in front), wire a `TokenVerifier` directly into FastMCP. This is the "remote MCP with OAuth support" model.
+The repo ships a `TokenVerifier` for Microsoft Entra ID at `src/aismartbuddy/auth.py`. **No code changes required** — activate via environment variables. The server validates incoming Bearer tokens against the configured Entra tenant's JWKS, and `ctx.client_id` becomes the Entra `oid` (stable principal ID), which the multi-tenant model (`identity.py`) automatically picks up to scope every session per user.
 
-**Step 1 — Add the verifier to `server.py`**
+**Step 1 — Register an Entra app + expose a scope**
 
-```python
-# server.py — direct MCP OAuth via Entra ID JWKS
-import jwt  # add to pyproject.toml: "pyjwt[crypto]>=2.9"
-import httpx
-from mcp.server.auth.provider import TokenVerifier, AccessToken
-from mcp.server.auth.settings import AuthSettings
+```bash
+APP_NAME="aismartbuddy-mcp"
+TENANT_ID="<your-tenant-id>"
+RG="rg-aismartbuddy"
+LOCATION="westeurope"
 
-ENTRA_TENANT_ID = os.environ["AISMARTBUDDY_ENTRA_TENANT"]
-ENTRA_AUDIENCE  = os.environ["AISMARTBUDDY_ENTRA_AUDIENCE"]   # api://<app-id-uri>
-JWKS_URL = f"https://login.microsoftonline.com/{ENTRA_TENANT_ID}/discovery/v2.0/keys"
-ISSUER   = f"https://login.microsoftonline.com/{ENTRA_TENANT_ID}/v2.0"
+az group create -n $RG -l $LOCATION
 
-_jwks_cache: dict | None = None
+# Create app registration
+APP_ID=$(az ad app create --display-name $APP_NAME \
+    --sign-in-audience AzureADMyOrg --query appId -o tsv)
 
-class EntraTokenVerifier(TokenVerifier):
-    async def verify_token(self, token: str) -> AccessToken | None:
-        global _jwks_cache
-        if _jwks_cache is None:
-            async with httpx.AsyncClient() as client:
-                _jwks_cache = (await client.get(JWKS_URL)).json()
-        try:
-            unverified = jwt.get_unverified_header(token)
-            key = next(
-                k for k in _jwks_cache["keys"] if k["kid"] == unverified["kid"]
-            )
-            payload = jwt.decode(
-                token,
-                jwt.algorithms.RSAAlgorithm.from_jwk(key),
-                algorithms=["RS256"],
-                audience=ENTRA_AUDIENCE,
-                issuer=ISSUER,
-            )
-        except Exception:
-            return None
-        return AccessToken(
-            client_id=payload["oid"],   # stable Entra object ID
-            scopes=payload.get("scp", "").split(),
-            expires_at=payload.get("exp"),
-        )
+# Set the Application ID URI (used as the audience claim)
+APP_URI="api://$APP_ID"
+az ad app update --id $APP_ID --identifier-uris $APP_URI
 
-mcp = FastMCP(
-    SERVER_NAME,
-    lifespan=app_lifespan,
-    token_verifier=EntraTokenVerifier(),
-    auth=AuthSettings(
-        issuer_url=ISSUER,
-        resource_server_url=f"https://{os.environ['WEBSITE_HOSTNAME']}",
-        required_scopes=["mcp.invoke"],
-    ),
-)
+# Expose the mcp.invoke scope (one-shot via the manifest)
+SCOPE_ID=$(uuidgen)  # or python -c "import uuid; print(uuid.uuid4())"
+cat > scopes.json <<EOF
+{
+  "api": {
+    "oauth2PermissionScopes": [{
+      "id": "$SCOPE_ID",
+      "value": "mcp.invoke",
+      "type": "User",
+      "adminConsentDisplayName": "Invoke AISmartBuddy MCP tools",
+      "adminConsentDescription": "Allows the calling app to invoke MCP tools.",
+      "userConsentDisplayName": "Use AISmartBuddy MCP",
+      "userConsentDescription": "Use AISmartBuddy MCP on your behalf.",
+      "isEnabled": true
+    }]
+  }
+}
+EOF
+az ad app update --id $APP_ID --set @scopes.json
 ```
 
-**Step 2 — Expose an OAuth scope in your Entra app**
+**Step 2 — Build the container with the [entra] extra**
 
-In the app registration → **Expose an API** → add `mcp.invoke` scope. Grant admin consent.
+The extra adds `pyjwt[crypto]` + `httpx` (the latter is already a transitive dep). Update the Dockerfile or override at install time:
 
-**Step 3 — Deploy to Container Apps**
+```dockerfile
+# Dockerfile — add this line if not already there
+RUN uv pip install --system "aismartbuddy[entra] @ git+https://github.com/meghuizen/aismartbuddy"
+```
+
+Or for the existing Dockerfile (which uses `uv pip install --system .`), append `[entra]`:
+
+```dockerfile
+RUN uv pip install --system ".[entra]"
+```
+
+Build and push:
+
+```bash
+ACR=$(az acr create -n acr$RANDOM -g $RG --sku Basic --query name -o tsv)
+az acr login -n $ACR
+docker build -t $ACR.azurecr.io/aismartbuddy:latest .
+docker push $ACR.azurecr.io/aismartbuddy:latest
+```
+
+**Step 3 — Deploy to Container Apps with the OAuth env vars**
 
 ```bash
 ENV="env-aismartbuddy"
@@ -435,17 +440,52 @@ az containerapp create -n aismartbuddy -g $RG --environment $ENV \
     --image $ACR.azurecr.io/aismartbuddy:latest \
     --target-port 8000 --ingress external \
     --registry-server $ACR.azurecr.io \
+    --command "aismartbuddy" \
+    --args "--transport sse --host 0.0.0.0 --port 8000" \
     --env-vars \
-        AISMARTBUDDY_TRANSPORT=sse \
-        AISMARTBUDDY_HOST=0.0.0.0 \
-        AISMARTBUDDY_PORT=8000 \
         AISMARTBUDDY_ENTRA_TENANT=$TENANT_ID \
-        AISMARTBUDDY_ENTRA_AUDIENCE="api://$APP_ID"
+        AISMARTBUDDY_ENTRA_AUDIENCE=$APP_URI \
+        AISMARTBUDDY_ENTRA_REQUIRED_SCOPE=mcp.invoke
+
+# Get the public URL
+FQDN=$(az containerapp show -n aismartbuddy -g $RG --query properties.configuration.ingress.fqdn -o tsv)
+echo "https://$FQDN/sse"
 ```
 
-`ctx.client_id` in tool calls now resolves to the authenticated Entra `oid`. Combined with the existing multi-tenant model (`identity.py:resolve_identity`), every session is automatically isolated per Entra principal — no extra middleware needed.
+Optional: pass `AISMARTBUDDY_ENTRA_RESOURCE_SERVER_URL=https://$FQDN` so the OAuth resource-server metadata advertises the public hostname (used by clients during dynamic discovery).
 
-> **Note**: at the time of writing, the `streamable-http` transport is not wired in `__main__.py` (only `stdio` and `sse`). Streamable-HTTP is the modern recommendation for remote MCP and a small follow-up to add to `__main__.py`. Both Easy Auth and the direct verifier above also work with SSE today.
+**Behavior at runtime:**
+- Both env vars set + `[entra]` extra installed → server validates every Bearer token against your tenant.
+- Both env vars set + extra NOT installed → server exits at startup with a clear "install aismartbuddy[entra]" error.
+- Only one of the two env vars set → server logs a warning and runs **without** auth (treats partial config as not-configured). Set both or neither.
+- Neither env var set → server runs without auth (current default — fine for stdio / single-user).
+
+**Step 4 — Connect a client**
+
+Acquire an access token for the scope:
+
+```bash
+TOKEN=$(az account get-access-token --resource $APP_URI --query accessToken -o tsv)
+```
+
+Then in Claude Code/Desktop config:
+
+```json
+{
+  "mcpServers": {
+    "aismartbuddy-prod": {
+      "url": "https://<your-fqdn>/sse",
+      "headers": {
+        "Authorization": "Bearer <paste-token-here>"
+      }
+    }
+  }
+}
+```
+
+Inside Claude Code, the `client_id` you'll see in `aismartbuddy://sessions` resources will be your Entra `oid` — every session is now scoped per-principal automatically.
+
+> **Note**: at the time of writing, the `streamable-http` transport is not wired in `__main__.py` (only `stdio` and `sse`). Streamable-HTTP is the modern recommendation for remote MCP and a small follow-up to add. Built-in Entra OAuth via `auth.py` works with SSE today.
 
 ---
 

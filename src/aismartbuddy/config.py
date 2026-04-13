@@ -47,6 +47,15 @@ class RuntimeConfig:
     ladybug_buffer_pool_size: int = 256 * 1024 * 1024  # 256MB
     ladybug_max_threads: int = 0  # 0 = auto-detect
 
+    # Microsoft Entra ID OAuth (optional). When BOTH tenant_id and audience
+    # are set, the server validates incoming Bearer tokens against the
+    # configured tenant. Requires the [entra] optional dep group installed.
+    # See src/aismartbuddy/auth.py.
+    entra_tenant_id: str | None = None
+    entra_audience: str | None = None
+    entra_required_scope: str | None = None
+    entra_resource_server_url: str | None = None  # public URL of this server
+
 
 # Module-level singleton — set by __main__.py before server starts
 runtime_config: RuntimeConfig = RuntimeConfig()

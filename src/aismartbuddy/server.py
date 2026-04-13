@@ -79,8 +79,72 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[None]:
     logger.info("Server shutdown complete")
 
 
-# Create the FastMCP server instance
-mcp = FastMCP(SERVER_NAME, lifespan=app_lifespan)
+def _maybe_build_entra_auth() -> tuple[object | None, object | None]:
+    """Return (token_verifier, AuthSettings) when Entra OAuth is configured.
+
+    Activated only when BOTH `entra_tenant_id` and `entra_audience` are
+    set in RuntimeConfig (via CLI flags or AISMARTBUDDY_ENTRA_* env vars).
+    Lazy-imports `aismartbuddy.auth` so users without the [entra] optional
+    dep group only hit ImportError when they actually try to enable OAuth
+    — and the error explains how to fix it.
+    """
+    rc = cfg.runtime_config
+    if not rc.entra_tenant_id and not rc.entra_audience:
+        return None, None  # OAuth disabled — normal startup
+    if not (rc.entra_tenant_id and rc.entra_audience):
+        logger.warning(
+            "Partial Entra OAuth config — both AISMARTBUDDY_ENTRA_TENANT "
+            "and AISMARTBUDDY_ENTRA_AUDIENCE must be set. Running without "
+            "auth."
+        )
+        return None, None
+
+    try:
+        from mcp.server.auth.settings import AuthSettings
+
+        from aismartbuddy.auth import EntraTokenVerifier
+    except ImportError as exc:
+        logger.error(
+            "Entra OAuth requested but the [entra] dependency group is not "
+            "installed. Reinstall with: `uv pip install aismartbuddy[entra]` "
+            "or `uv sync --extra entra`. Underlying error: %s",
+            exc,
+        )
+        # Fail closed — server starts but no tools are reachable since
+        # auth was requested but couldn't be wired.
+        raise SystemExit(1) from exc
+
+    verifier = EntraTokenVerifier(
+        tenant_id=rc.entra_tenant_id,
+        audience=rc.entra_audience,
+        required_scope=rc.entra_required_scope,
+    )
+    auth_settings = AuthSettings(
+        issuer_url=verifier.issuer,
+        resource_server_url=(
+            rc.entra_resource_server_url
+            or f"http://{rc.host}:{rc.port}"
+        ),
+        required_scopes=(
+            [rc.entra_required_scope] if rc.entra_required_scope else []
+        ),
+    )
+    logger.info(
+        "Entra OAuth enabled: tenant=%s audience=%s required_scope=%s",
+        rc.entra_tenant_id,
+        rc.entra_audience,
+        rc.entra_required_scope or "(none)",
+    )
+    return verifier, auth_settings
+
+
+# Create the FastMCP server instance, optionally with Entra OAuth wired in.
+_token_verifier, _auth_settings = _maybe_build_entra_auth()
+_mcp_kwargs: dict[str, object] = {"lifespan": app_lifespan}
+if _token_verifier is not None:
+    _mcp_kwargs["token_verifier"] = _token_verifier
+    _mcp_kwargs["auth"] = _auth_settings
+mcp = FastMCP(SERVER_NAME, **_mcp_kwargs)
 
 
 # ──────────────────────────────────────────────

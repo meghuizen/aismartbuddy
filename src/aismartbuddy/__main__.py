@@ -84,6 +84,26 @@ from aismartbuddy.config import (  # noqa: E402
     envvar="AISMARTBUDDY_DEFAULT_PROJECT_ID",
     help="Default project_id when no tool parameter provided.",
 )
+@click.option(
+    "--entra-tenant-id", type=str, default=None,
+    envvar="AISMARTBUDDY_ENTRA_TENANT",
+    help="Entra ID tenant ID. Set with --entra-audience to enable OAuth.",
+)
+@click.option(
+    "--entra-audience", type=str, default=None,
+    envvar="AISMARTBUDDY_ENTRA_AUDIENCE",
+    help="Expected token audience (e.g. 'api://<app-id-uri>').",
+)
+@click.option(
+    "--entra-required-scope", type=str, default=None,
+    envvar="AISMARTBUDDY_ENTRA_REQUIRED_SCOPE",
+    help="Required scope on the token (e.g. 'mcp.invoke').",
+)
+@click.option(
+    "--entra-resource-server-url", type=str, default=None,
+    envvar="AISMARTBUDDY_ENTRA_RESOURCE_SERVER_URL",
+    help="Public URL of this MCP server (for OAuth resource metadata).",
+)
 def main(
     transport: str,
     port: int,
@@ -99,6 +119,10 @@ def main(
     ladybug_threads: int,
     default_user_id: str,
     default_project_id: str,
+    entra_tenant_id: str | None,
+    entra_audience: str | None,
+    entra_required_scope: str | None,
+    entra_resource_server_url: str | None,
 ) -> None:
     """AISmartBuddy — MCP server with SQL and graph database capabilities."""
     # Store runtime config for server lifespan to read
@@ -119,6 +143,10 @@ def main(
         ladybug_max_threads=ladybug_threads,
         default_user_id=default_user_id,
         default_project_id=default_project_id,
+        entra_tenant_id=entra_tenant_id,
+        entra_audience=entra_audience,
+        entra_required_scope=entra_required_scope,
+        entra_resource_server_url=entra_resource_server_url,
     )
 
     # Print startup info to stderr (stdout is used by stdio transport)

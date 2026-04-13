@@ -33,8 +33,9 @@ uv run ruff format src/ tests/           # Format
 ## Architecture
 
 ```
-__main__.py (Click CLI) → server.py (FastMCP + lifespan)
+__main__.py (Click CLI) → server.py (FastMCP + lifespan + optional Entra auth)
   ├── identity.py (resolve_identity from ctx/params/env)
+  ├── auth.py (optional EntraTokenVerifier — activated via env vars)
   ├── youtube_client.py (shared YoutubeDL + http session)
   ├── tools/sql.py      → engines/duckdb_engine.py     ─┐
   ├── tools/graph.py    → engines/ladybug_engine.py     ├── session.py (SessionManager)
@@ -95,7 +96,29 @@ Sessions are bound to **(user_id, project_id)** at creation. This supports multi
 
 ## Authentication (optional)
 
-MCP Bearer token authentication is available for the `streamable-http` and `sse` transports (not stdio). It is **not configured by default** — enable by passing `token_verifier` and `auth` to the `FastMCP(...)` call in `server.py`:
+Two paths are supported:
+
+### 1. Microsoft Entra ID OAuth (built in)
+
+`src/aismartbuddy/auth.py` ships a ready-to-use `EntraTokenVerifier` that validates Bearer tokens against an Entra tenant's JWKS. Activate by setting both env vars / CLI flags:
+
+```bash
+uv pip install aismartbuddy[entra]   # adds pyjwt[crypto] + httpx
+export AISMARTBUDDY_ENTRA_TENANT="<tenant-guid>"
+export AISMARTBUDDY_ENTRA_AUDIENCE="api://<app-id-uri>"
+# Optional:
+export AISMARTBUDDY_ENTRA_REQUIRED_SCOPE="mcp.invoke"
+export AISMARTBUDDY_ENTRA_RESOURCE_SERVER_URL="https://your-host/"
+uvx --from git+https://github.com/meghuizen/aismartbuddy aismartbuddy --transport sse
+```
+
+When activated, `server.py:_maybe_build_entra_auth` constructs the verifier + `AuthSettings` and passes them to `FastMCP(...)`. `ctx.client_id` in tool calls becomes the Entra `oid` claim — automatically picked up by `identity.py:resolve_identity` so every session is bound to the authenticated principal. Without these env vars, the server starts unauthenticated (current default behaviour).
+
+If only one of the two required env vars is set, the server logs a warning and runs without auth (fail-open by design — partial config is treated as "not configured"). If `[entra]` extras aren't installed but the env vars are set, the server exits with a clear "install aismartbuddy[entra]" message (fail-closed for security).
+
+### 2. Generic Bearer token (write your own verifier)
+
+For non-Entra OAuth issuers, implement your own `TokenVerifier` subclass and pass it to `FastMCP(...)` like the Entra path does. The pattern in `auth.py` (JWKS fetch + cache + RS256 verify) is reusable.
 
 ```python
 from mcp.server.auth.provider import TokenVerifier
@@ -106,17 +129,9 @@ class MyVerifier(TokenVerifier):
         # Validate JWT, return AccessToken or None
         ...
 
-mcp = FastMCP(
-    SERVER_NAME,
-    lifespan=app_lifespan,
-    token_verifier=MyVerifier(),
-    auth=AuthSettings(
-        issuer_url="https://auth.example.com",
-        resource_server_url="https://your-mcp-server.example.com",
-        required_scopes=["read", "write"],
-    ),
-)
 ```
+
+`server.py:_maybe_build_entra_auth` shows the wiring pattern for any custom verifier (read RuntimeConfig, lazy-import the verifier class, return `(verifier, AuthSettings)` tuple). Replace `EntraTokenVerifier` with your own.
 
 When configured, `ctx.client_id` becomes the authoritative `user_id` — tool-level `user_id` parameters are ignored to prevent claim spoofing. Without configuration, `user_id` is taken from the tool parameter or the configured default, which is appropriate for single-tenant stdio use.
 

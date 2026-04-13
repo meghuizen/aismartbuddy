@@ -26,10 +26,15 @@ dependencies = [
 
 [package.optional-dependencies]
 dev = [
+    { name = "pyjwt", extra = ["crypto"] },
     { name = "pyright" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "ruff" },
+]
+entra = [
+    { name = "httpx" },
+    { name = "pyjwt", extra = ["crypto"] },
 ]
 
 [package.metadata]
@@ -37,10 +42,13 @@ requires-dist = [
     { name = "anyio", specifier = ">=4.8.0" },
     { name = "click", specifier = ">=8.1.8" },
     { name = "duckdb", specifier = ">=1.5.1" },
+    { name = "httpx", marker = "extra == 'entra'", specifier = ">=0.27" },
     { name = "lxml", specifier = ">=6.0.4" },
     { name = "mcp", specifier = ">=1.9.4" },
     { name = "polars", specifier = ">=1.0" },
     { name = "pyarrow", specifier = ">=17.0" },
+    { name = "pyjwt", extras = ["crypto"], marker = "extra == 'dev'", specifier = ">=2.9" },
+    { name = "pyjwt", extras = ["crypto"], marker = "extra == 'entra'", specifier = ">=2.9" },
     { name = "pyright", marker = "extra == 'dev'", specifier = ">=1.1" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24" },
@@ -54,7 +62,7 @@ requires-dist = [
     { name = "youtube-transcript-api", specifier = ">=1.2.4" },
     { name = "yt-dlp", specifier = ">=2026.3.17" },
 ]
-provides-extras = ["dev"]
+provides-extras = ["dev", "entra"]
 
 [[package]]
 name = "annotated-types"
