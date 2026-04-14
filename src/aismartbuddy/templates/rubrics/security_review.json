@@ -1,0 +1,15 @@
+{
+  "rubric_id": "security_review",
+  "description": "Security review of code or design — auth, validation, secrets, dependencies, attack surface.",
+  "dimensions": [
+    {"id": "authn_authz", "description": "Authentication and authorization correctness", "weight": 1.0, "required": true},
+    {"id": "input_validation", "description": "Input validation and sanitization", "weight": 1.0, "required": true},
+    {"id": "secrets", "description": "Secret handling, no hardcoded credentials, secure storage", "weight": 1.0, "required": true},
+    {"id": "dependencies", "description": "Third-party deps known-safe and minimal", "weight": 0.5, "required": false},
+    {"id": "attack_surface", "description": "Exposed endpoints, attack surface review", "weight": 0.7, "required": false}
+  ],
+  "severity_levels": ["critical", "high", "moderate", "low"],
+  "severity_deductions": {"critical": 4.0, "high": 2.0, "moderate": 1.0, "low": 0.3},
+  "pass_threshold": 8.0,
+  "scoring_strategy": "weighted_deduction"
+}

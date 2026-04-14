@@ -37,17 +37,22 @@ __main__.py (Click CLI) → server.py (FastMCP + lifespan + optional Entra auth)
   ├── identity.py (resolve_identity from ctx/params/env)
   ├── auth.py (optional EntraTokenVerifier — activated via env vars)
   ├── youtube_client.py (shared YoutubeDL + http session)
-  ├── tools/sql.py      → engines/duckdb_engine.py     ─┐
-  ├── tools/graph.py    → engines/ladybug_engine.py     ├── session.py (SessionManager)
-  ├── tools/think.py    → engines/thinking_engine.py    │
-  ├── tools/holon.py    → engines/thinking_engine.py    │
-  ├── tools/score.py    → engines/thinking_engine.py    │
-  ├── tools/youtube.py  → youtube_client.py + lxml XML cache
-  └── tools/meta.py                                     │
+  ├── tools/sql.py        → engines/duckdb_engine.py    ─┐
+  ├── tools/graph.py      → engines/ladybug_engine.py    ├── session.py (SessionManager)
+  ├── tools/think.py      → engines/thinking_engine.py   │
+  ├── tools/holon.py      → engines/thinking_engine.py   │
+  ├── tools/score.py      → engines/thinking_engine.py   │
+  ├── tools/iterate.py    → engines/thinking_engine.py   │   (ITERATE mode)
+  ├── tools/brainstorm.py → engines/thinking_engine.py   │   (DIVERGE mode)
+  ├── tools/refs.py       → engines/thinking_engine.py   │   (cross-record query)
+  ├── tools/infra.py      → session.py (parent-session facade for unified backends)
+  ├── tools/youtube.py    → youtube_client.py + lxml XML cache
+  ├── tools/meta.py       → suggest_database
+  └── tools/__init__.py   → validate_items, materialize_auto_graph (shared helpers)
       formatting.py (Arrow/Polars CSV + legacy csv.writer) ─┘
 ```
 
-- **server.py** — FastMCP instance with 49 tools, 5 prompts, 2 resources. Lifespan manages SessionManager + YouTubeClient init/cleanup.
+- **server.py** — FastMCP instance with ~55 tools, 5 prompts, 2 resources. Lifespan manages SessionManager + YouTubeClient init/cleanup.
 - **identity.py** — Multi-tenant identity resolution. `resolve_identity(ctx, user_id, project_id)` returns validated `(user_id, project_id)` tuple using priority: ctx.client_id (Bearer auth) → tool parameter → RuntimeConfig default → literal "default". Path-component validation prevents filesystem traversal.
 - **youtube_client.py** — Shared `YouTubeClient` dataclass (requests.Session + YoutubeDL) plus `parse_video_id()` helper that accepts raw 11-char IDs, `watch?v=`, `youtu.be/`, `embed/`, and `shorts/` URLs. Module-level singleton initialized in `app_lifespan` (best-effort — failure does not block server startup; the tool checks for `None` at call time). YoutubeDL uses a no-op logger (to bypass `no_warnings` being overridden by custom loggers) and skips dash/hls format manifests for 2-3× faster metadata-only extraction.
 - **session.py** — Thread-safe SessionManager singleton (uses `threading.Lock`). Maps session_id → engine. Supports "sql", "graph", and "think" session types. Auto-cleans expired sessions and stale pagination cursors.
@@ -57,13 +62,39 @@ __main__.py (Click CLI) → server.py (FastMCP + lifespan + optional Entra auth)
 
 ### Key patterns
 
-- Tools are named `sql_*`, `graph_*`, `think_*`, `holon_*`, `score_*`, plus a few standalone (`suggest_database`, `get_youtube_information`). 49 total tools: 7 SQL, 16 graph, 1 meta, 16 thinking (+ think_create_session), 5 holonic, 3 scoring, 1 YouTube.
+- Tools are named `sql_*`, `graph_*`, `think_*`, `holon_*`, `score_*`, plus a few standalone (`suggest_database`, `get_youtube_information`, `iterate`, `brainstorm`, `session_create`/`destroy`, `knowledge_batch`, `data_profile`/`anomalies`, `rubric_templates`, `think_refs_query`). ~55 tools total.
+
+### SCAFFOLD → ELABORATE → ASSESS framework
+
+A tool's value depends on **schema-structure × sequence-position**:
+
+- **SCAFFOLD** — call FIRST (reasoning not yet done). Schema FORCES structure. Tools: `think_model`, `think_science`, `think_decide`, `think_interfere`. Use the strict `items=[...]` form for a forcing function: each item must include id + per-tool required fields, server REJECTS lazy items.
+- **ELABORATE** — call MIDDLE. Flexible thinking, branching, navigation. Tools: `think_graph` (with `children=[...]`), `holon_*`, `think_argue` (with `chain=[...]`), `think_debug`, `brainstorm`, `iterate`, `think_refs_query`.
+- **ASSESS** — call LAST. Forcing function for honest self-critique. Tools: `score_rubric`, `score_evaluate` (+ `finding_batch`), `think_monitor` (with `items=[...]` for self-assessment).
+
+### The items[] forcing-function pattern
+
+For SCAFFOLD/ASSESS family, calling with `items=[{id, ...required_fields}, ...]` is the highest-quality form:
+
+- One round-trip → N validated outputs.
+- Each item passes the SAME per-item schema (e.g., `think_model` items require id/problem/steps/reasoning/conclusion).
+- Server REJECTS the whole batch on the first violation (fail-fast, no partial state) with the failing item index + missing field name.
+- Each item gets an addressable id you can later reference via `connects_to:` in another item or via `refs:` in any record. `think_refs_query(entity_id)` finds all records that reference an id.
+- The single-item form (no items[]) is preserved for backward-compat / mid-analysis use, but the description explicitly notes that's log-style ceremony — prefer items[] at analysis START.
+
+### Auto-graph pipeline (items[] + auto_graph=True)
+
+When a SCAFFOLD/ASSESS items[] call sets `auto_graph=True` AND the session has a graph backend (created via `session_create(backends=["think","graph"])`), the server materialises each item as a `KnowledgeNode` row in the graph backend. Each `connects_to: ["other_id"]` becomes a `DerivedFrom` edge. One round trip = N structured records + N KG nodes + all declared edges. Eliminates the manual KG construction phase.
+
+### Removed tools (don't use; not registered)
+
+`scaffold`, `hypothesize`, `self_assess` (functionality merged into `think_model`/`think_science`/`think_monitor` with items[] form). `think_collaborate`, `think_visualize`, `think_graph_validate`, `workflow`, `bridge`, `session_export`, `session_snapshot` (ceremony / out-of-scope features).
 - **`get_youtube_information(url_or_id, language="en", include_transcript=True, include_timestamps=True)`** — single-call tool returning title, description, available transcript languages, and the full timed transcript as Markdown. Accepts full URLs or raw 11-char video IDs. Results cached as lxml-built XML at `{OS_temp}/yt_{video_id}_{langcode}.xml` (OS handles cleanup). Cache version-stamped (`<video version="1">`); corrupt, vanished (TOCTOU), or older-version caches trigger silent refetch. `include_transcript=False` returns metadata only; `include_timestamps=False` strips `[MM:SS]` prefixes. Timestamps use `[MM:SS]` under 1 hour, `[H:MM:SS]` for longer videos.
 - **YouTube graceful degradation**: when transcript fetch fails (transcripts disabled, language not available, video still processing, rate limit, network blip) the tool returns a degraded response — full metadata + a structured `## Transcript` block containing a stable category code (`TRANSCRIPTS_DISABLED`, `TRANSCRIPT_LANGUAGE_NOT_AVAILABLE`, `TRANSCRIPT_TEMPORARILY_UNAVAILABLE`, `TRANSCRIPT_RATE_LIMITED`, `TRANSCRIPT_NETWORK_ERROR`, `TRANSCRIPT_UNKNOWN_ERROR`), the upstream reason, and an actionable hint. Header reads `cache=miss-degraded`. **Caching policy: only fully successful fetches are persisted** — degraded responses are never cached, so a subsequent call always re-attempts. Only metadata-fetch failure (yt-dlp itself failing) is terminal and raises `ValueError`.
 - **Annotation preset `_READONLY_OPEN`** (in `server.py`): for read-only tools that interact with EXTERNAL services (network calls). Sets `openWorldHint: True` per MCP spec so hosts know not to silently auto-approve. Used for `get_youtube_information`. The four presets are: `_DEFAULT` (closed-world, mutating), `_READONLY` (closed-world, idempotent), `_READONLY_OPEN` (open-world, idempotent — net calls), `_DESTRUCTIVE` (closed-world, destructive).
-- `think_graph` is the primary thinking tool — supports sequential chains, hierarchical decomposition, revision, synthesis, validation, and delegation. Also supports Socratic method as a usage pattern (branch into clarification/assumptions/evidence/perspectives/implications stages).
-- `think_model` provides 13 mental models: first_principles, opportunity_cost, error_propagation, rubber_duck, pareto_principle, assumptions_xray, fishbone, value_of_info, swot, pre_mortem, design_review, complexity, root_cause. Use pre_mortem before implementing, design_review before finalizing, root_cause for debugging.
-- All tools (ThoughtNode, HolonNode, EvaluationRecord) support `refs: list[str]` for cross-referencing outputs across tool groups.
+- `think_graph` is the primary ELABORATE tool — sequential chains, hierarchical decomposition (with `children=[...]` batch + optional `min_children`), revision, synthesis, delegation. Encourage SHORT thoughts (1-3 sentences) — branch instead of writing essays. Description says: "If a thought is becoming an essay, use action='branch' and split into children. Long stories collapse to noise."
+- `think_model` is the primary SCAFFOLD tool. 13 models: first_principles, opportunity_cost, error_propagation, rubber_duck, pareto_principle, assumptions_xray, fishbone, value_of_info, swot, pre_mortem, design_review, complexity, root_cause. Use pre_mortem before implementing, design_review before finalizing, root_cause for debugging. **Strongly prefer the `items=[...]` form at analysis start** — it forces per-item structure (id/problem/steps/reasoning/conclusion) and unlocks `auto_graph`.
+- All record types (ThoughtNode, HolonNode, EvaluationRecord) support `refs: list[str]`. The `think_refs_query(entity_id)` tool finds records that reference an id — use to compose across tool calls structurally rather than via text search.
 - `holon_*` tools model domains holonically — entities that are simultaneously wholes and parts. Multi-membership: holons participate in multiple holarchies. Bridge finds paths between distant holons across holarchies. Propagation leaves structural traces (stale projections).
 - Thinking tools (`think_*`) auto-create sessions on first call when `session_id` is omitted. Return compact text (not JSON) for token efficiency.
 - SQL import supports 6 formats: csv, tsv, txt (custom delimiter), json, jsonl, parquet (base64). Plus batch import via `sql_import_batch`.

@@ -65,6 +65,25 @@ class TestLadybugEngine:
         columns, rows = ladybug_engine.get_schema()
         assert len(rows) > 0
 
+    def test_get_statistics_uses_schema_name_column(self, ladybug_engine: LadybugEngine):
+        ladybug_engine.execute(
+            "CREATE NODE TABLE KnowledgeNode (id INT64 PRIMARY KEY, name STRING);"
+        )
+        ladybug_engine.execute(
+            "CREATE REL TABLE Supports (FROM KnowledgeNode TO KnowledgeNode, weight DOUBLE);"
+        )
+        ladybug_engine.execute("CREATE (:KnowledgeNode {id: 1, name: 'A'});")
+        ladybug_engine.execute("CREATE (:KnowledgeNode {id: 2, name: 'B'});")
+        ladybug_engine.execute(
+            "MATCH (a:KnowledgeNode {id: 1}), (b:KnowledgeNode {id: 2}) "
+            "CREATE (a)-[:Supports {weight: 1.0}]->(b);"
+        )
+
+        stats = ladybug_engine.get_statistics()
+
+        assert stats["node_tables"]["KnowledgeNode"] == 2
+        assert stats["rel_tables"]["Supports"] == 1
+
     def test_ddl_returns_empty(self, ladybug_engine: LadybugEngine):
         columns, rows = ladybug_engine.execute(
             "CREATE NODE TABLE Thing (id INT64 PRIMARY KEY);"
@@ -89,3 +108,54 @@ class TestLadybugEngine:
         names = [row[0] for row in rows]
         assert "Alice" in names
         assert "Bob" in names
+
+    def test_execute_windowed_middle_slice(self, ladybug_engine: LadybugEngine):
+        ladybug_engine.execute(
+            "CREATE NODE TABLE Item (id INT64 PRIMARY KEY, name STRING);"
+        )
+        for i in range(20):
+            ladybug_engine.execute(f"CREATE (:Item {{id: {i}, name: 'item_{i}'}});")
+
+        table, has_more = ladybug_engine.execute_windowed(
+            "MATCH (i:Item) RETURN i.id AS id ORDER BY id;",
+            offset=5,
+            limit=4,
+        )
+
+        assert table is not None
+        assert table.column("id").to_pylist() == [5, 6, 7, 8]
+        assert has_more is True
+
+    def test_execute_windowed_empty_after_end(self, ladybug_engine: LadybugEngine):
+        ladybug_engine.execute(
+            "CREATE NODE TABLE Item (id INT64 PRIMARY KEY, name STRING);"
+        )
+        for i in range(3):
+            ladybug_engine.execute(f"CREATE (:Item {{id: {i}, name: 'item_{i}'}});")
+
+        table, has_more = ladybug_engine.execute_windowed(
+            "MATCH (i:Item) RETURN i.id AS id ORDER BY id;",
+            offset=10,
+            limit=5,
+        )
+
+        assert table is not None
+        assert table.num_rows == 0
+        assert has_more is False
+
+    def test_execute_windowed_has_more_false_at_end(self, ladybug_engine: LadybugEngine):
+        ladybug_engine.execute(
+            "CREATE NODE TABLE Item (id INT64 PRIMARY KEY, name STRING);"
+        )
+        for i in range(5):
+            ladybug_engine.execute(f"CREATE (:Item {{id: {i}, name: 'item_{i}'}});")
+
+        table, has_more = ladybug_engine.execute_windowed(
+            "MATCH (i:Item) RETURN i.id AS id ORDER BY id;",
+            offset=3,
+            limit=2,
+        )
+
+        assert table is not None
+        assert table.column("id").to_pylist() == [3, 4]
+        assert has_more is False

@@ -1,0 +1,15 @@
+{
+  "rubric_id": "architecture_review",
+  "description": "Architecture review — boundaries, coupling, single responsibility, scalability, observability.",
+  "dimensions": [
+    {"id": "boundaries", "description": "Clear module/service boundaries", "weight": 1.0, "required": true},
+    {"id": "coupling", "description": "Loose coupling between components", "weight": 0.8, "required": true},
+    {"id": "responsibility", "description": "Single responsibility per component", "weight": 0.7, "required": false},
+    {"id": "scalability", "description": "Scaling characteristics understood", "weight": 0.6, "required": false},
+    {"id": "observability", "description": "Logging/metrics/tracing in place", "weight": 0.5, "required": false}
+  ],
+  "severity_levels": ["critical", "high", "moderate", "low"],
+  "severity_deductions": {"critical": 3.0, "high": 2.0, "moderate": 1.0, "low": 0.5},
+  "pass_threshold": 8.0,
+  "scoring_strategy": "weighted_deduction"
+}

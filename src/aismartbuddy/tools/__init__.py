@@ -15,6 +15,8 @@ Helpers here implement the multi-tenant execution contract:
 
 from __future__ import annotations
 
+import functools
+import logging
 from typing import TYPE_CHECKING, Any, Callable, TypeVar
 
 import anyio
@@ -26,6 +28,62 @@ if TYPE_CHECKING:
 
 T = TypeVar("T")
 
+# Response size guard thresholds (in bytes). Apply to tools returning
+# variable-length data (queries, holon views, summaries, exports).
+_SIZE_WARN_BYTES = 50 * 1024     # 50KB — log warn, return as-is
+_SIZE_ERROR_BYTES = 200 * 1024   # 200KB — log error, return as-is
+_SIZE_TRUNCATE_BYTES = 500 * 1024  # 500KB — truncate + append hint
+
+_logger = logging.getLogger("aismartbuddy.size_guard")
+
+
+def size_guarded(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Decorator: log/truncate oversized tool responses to protect transport.
+
+    Wraps an async tool function. Measures the UTF-8 byte size of the
+    returned string. Logs at warn/error thresholds; truncates at the hard
+    cap and appends an actionable hint to the response.
+
+    Wraps tools that return variable-length data: SQL/graph query tools,
+    holon_view, holon_query, holon_analyze, think_summarize, etc.
+    """
+    if not callable(fn):  # defensive: decorator misuse
+        return fn
+
+    @functools.wraps(fn)
+    async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        result = await fn(*args, **kwargs)
+        if not isinstance(result, str):
+            return result
+        size_bytes = len(result.encode("utf-8"))
+        tool_name = getattr(fn, "__name__", "?")
+        if size_bytes > _SIZE_TRUNCATE_BYTES:
+            _logger.error(
+                "Tool %s response %d bytes exceeds %d hard cap — truncating",
+                tool_name, size_bytes, _SIZE_TRUNCATE_BYTES,
+            )
+            # Truncate at byte boundary, decode tolerant
+            cut = result.encode("utf-8")[:_SIZE_TRUNCATE_BYTES]
+            prefix = cut.decode("utf-8", errors="ignore")
+            return (
+                f"{prefix}\n\n"
+                f"[Response truncated at {_SIZE_TRUNCATE_BYTES // 1024}KB. "
+                "Use pagination, scope via WHERE, or request a more specific query.]"
+            )
+        if size_bytes > _SIZE_ERROR_BYTES:
+            _logger.error(
+                "Tool %s response %d bytes exceeds %d threshold",
+                tool_name, size_bytes, _SIZE_ERROR_BYTES,
+            )
+        elif size_bytes > _SIZE_WARN_BYTES:
+            _logger.warning(
+                "Tool %s response %d bytes exceeds %d threshold",
+                tool_name, size_bytes, _SIZE_WARN_BYTES,
+            )
+        return result
+
+    return wrapper
+
 
 def get_session_manager() -> SessionManager:
     """Get the active SessionManager singleton. Raises if not initialized."""
@@ -36,16 +94,221 @@ def get_session_manager() -> SessionManager:
     return session_manager
 
 
-async def run_with_lock(info: SessionInfo, sync_fn: Callable[[], T]) -> T:
+def resolve_backend_session(session_id: str, backend: str):  # SessionInfo
+    """Resolve session_id (parent OR direct child) to backend SessionInfo.
+
+    Backwards-compatible helper for tool entry points: pass the user-provided
+    session_id and the backend type the tool needs. Works with both the new
+    parent_id facade and the existing direct child session_ids.
+    """
+    return get_session_manager().resolve_backend_session(session_id, backend)
+
+
+# ── Items[] forcing-function helpers ──────────────────────────────────
+
+
+def validate_items(
+    items: list[dict],
+    required: list[str],
+    *,
+    tool: str = "tool",
+    item_validators: dict[str, Callable[[Any], str | None]] | None = None,
+) -> None:
+    """Validate items[] payload against per-item required fields.
+
+    Each item must have all `required` field names with truthy values. Each
+    item must have a unique `id`. Optional `item_validators` is a dict from
+    field name → validator callable; the callable returns None on success or
+    an error message string. Raises ValueError on the FIRST violation
+    (fail-fast — no partial state).
+
+    Args:
+        items: list of dicts to validate.
+        required: field names that MUST be present and truthy on every item.
+        tool: name of the calling tool (for error messages).
+        item_validators: optional per-field extra checks (e.g. min length).
+    """
+    if not items:
+        raise ValueError(
+            f"{tool}.items must be a non-empty list — items[] is the "
+            "forcing-function contract; if you have nothing to decompose, "
+            "do not call this tool."
+        )
+    seen_ids: set[str] = set()
+    for i, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ValueError(f"{tool}.items[{i}] must be a dict")
+        if not item.get("id"):
+            raise ValueError(f"{tool}.items[{i}] missing 'id'")
+        if item["id"] in seen_ids:
+            raise ValueError(
+                f"{tool}.items[{i}] duplicate id '{item['id']}'"
+            )
+        seen_ids.add(item["id"])
+        for f in required:
+            v = item.get(f)
+            if v is None or v == "" or v == [] or v == {}:
+                raise ValueError(
+                    f"{tool}.items[{i}] ({item['id']}) "
+                    f"missing required '{f}' — strict items[] form rejects "
+                    "lazy submissions."
+                )
+        if item_validators:
+            for fname, check in item_validators.items():
+                if fname in item:
+                    err = check(item[fname])
+                    if err:
+                        raise ValueError(
+                            f"{tool}.items[{i}] ({item['id']}) "
+                            f"field '{fname}': {err}"
+                        )
+
+
+def collect_item_refs(item: dict) -> list[str]:
+    """Build the unified `refs` list for a record from an items[] dict.
+
+    Combines `connects_to` (the structural cross-ref the AI declares) and
+    `refs` (explicit reference list) into a single deduped list. Insertion
+    order preserved. This is the single-source-of-truth populator for the
+    `refs` field on every record produced by an items[] handler.
+    """
+    seen: dict[str, None] = {}
+    for key in ("connects_to", "refs"):
+        for r in item.get(key) or []:
+            if isinstance(r, str) and r and r not in seen:
+                seen[r] = None
+    return list(seen.keys())
+
+
+async def materialize_auto_graph(
+    parent_session_id: str,
+    items: list[dict],
+    *,
+    source_tag: str,
+    entity_type: str = "concept",
+    description_field: str = "conclusion",
+    edge_label: str = "DerivedFrom",
+) -> int:
+    """Materialise items[] outputs as KnowledgeNode rows + connects_to edges.
+
+    Requires the parent session (resolved via resolve_backend_session) to
+    have a 'graph' backend. Each item becomes a KnowledgeNode where:
+      - name = item['id']
+      - description = item.get(description_field, '')[:200]
+      - entity_type, source = passed-in tags
+    For each item, every entry in item.get('connects_to', []) becomes an
+    `edge_label` edge from this item's id to the referenced id.
+
+    Returns the number of KnowledgeNode rows created.
+
+    Raises ValueError if the session has no graph backend.
+    """
+    mgr = get_session_manager()
+    try:
+        graph_info = mgr.resolve_backend_session(parent_session_id, "graph")
+    except ValueError as e:
+        raise ValueError(
+            f"auto_graph requires a graph backend in this session. "
+            f"Create the session via session_create(backends=['think','graph']). "
+            f"Underlying: {e}"
+        ) from e
+
+    # Local import to keep cycle-free at module import time
+    from datetime import datetime, timezone
+
+    from aismartbuddy.tools.graph import escape_cypher_string
+
+    ts = datetime.now(timezone.utc).isoformat()
+
+    auto_graph_logger = logging.getLogger("aismartbuddy.auto_graph")
+
+    def _do() -> int:
+        with graph_info.lock:
+            try:
+                graph_info.engine.execute(
+                    "CREATE NODE TABLE IF NOT EXISTS KnowledgeNode ("
+                    "id SERIAL PRIMARY KEY, name STRING, description STRING, "
+                    "entity_type STRING, confidence DOUBLE, "
+                    "source STRING, created_at STRING);"
+                )
+            except Exception as e:
+                # Typically "already exists" from LadybugDB's idempotent
+                # DDL — safe to skip. Log at DEBUG so real DDL failures
+                # (connection, permission, syntax) remain traceable.
+                auto_graph_logger.debug(
+                    "CREATE NODE TABLE KnowledgeNode skipped: %s", e
+                )
+            try:
+                graph_info.engine.execute(
+                    f"CREATE REL TABLE IF NOT EXISTS {edge_label} ("
+                    "FROM KnowledgeNode TO KnowledgeNode, "
+                    "weight DOUBLE, justification STRING, "
+                    "source STRING, created_at STRING);"
+                )
+            except Exception as e:
+                auto_graph_logger.debug(
+                    "CREATE REL TABLE %s skipped: %s", edge_label, e
+                )
+
+            n = 0
+            for item in items:
+                eid = escape_cypher_string(item["id"])
+                desc_raw = str(item.get(description_field, ""))[:200]
+                desc = escape_cypher_string(desc_raw)
+                et = escape_cypher_string(entity_type)
+                src = escape_cypher_string(source_tag)
+                graph_info.engine.execute(
+                    f"CREATE (k:KnowledgeNode {{name: '{eid}', "
+                    f"description: '{desc}', entity_type: '{et}', "
+                    f"confidence: 1.0, source: '{src}', "
+                    f"created_at: '{ts}'}});"
+                )
+                n += 1
+
+            for item in items:
+                src_id = escape_cypher_string(item["id"])
+                for ref in item.get("connects_to") or []:
+                    tgt = escape_cypher_string(str(ref))
+                    try:
+                        graph_info.engine.execute(
+                            f"MATCH (a:KnowledgeNode {{name: '{src_id}'}}), "
+                            f"(b:KnowledgeNode {{name: '{tgt}'}}) "
+                            f"CREATE (a)-[:{edge_label} {{weight: 1.0, "
+                            f"justification: 'auto_graph', "
+                            f"source: '{escape_cypher_string(source_tag)}', "
+                            f"created_at: '{ts}'}}]->(b);"
+                        )
+                    except Exception:
+                        # Edge target may not exist if connects_to references
+                        # an external entity — silently skip rather than fail
+                        # the whole materialisation.
+                        pass
+            return n
+
+    return await anyio.to_thread.run_sync(_do)
+
+
+async def run_with_lock(
+    info: SessionInfo,
+    sync_fn: Callable[[], T],
+    abandon_on_cancel: bool = False,
+) -> T:
     """Run sync_fn in a worker thread while holding info.lock.
 
     Use this for any engine operation that needs per-session serialization.
     The lock is acquired INSIDE the worker thread (threading.Lock is sync).
+
+    If ``abandon_on_cancel`` is True (used when wrapped in a timeout scope),
+    cancellation abandons the thread instead of waiting for it. The thread
+    continues running but its result is discarded — only safe for idempotent
+    reads. Writes under abandon_on_cancel=True can produce partial state.
     """
     def _locked() -> T:
         with info.lock:
             return sync_fn()
-    return await anyio.to_thread.run_sync(_locked)
+    return await anyio.to_thread.run_sync(
+        _locked, abandon_on_cancel=abandon_on_cancel,
+    )
 
 
 async def execute_and_format(
@@ -57,17 +320,55 @@ async def execute_and_format(
     limit: int | None = None,
     paginate: bool = False,
     next_tool: str = "sql_query_next",
+    timeout_ms: int | None = None,
 ) -> str:
     """Shared query execution + formatting logic for SQL and graph tools.
 
     Handles Arrow path, pagination (cursor + offset/limit), and legacy fallback.
     Acquires info.lock for all engine operations (multi-agent safety).
+
+    If ``timeout_ms`` is provided, wraps execution in ``anyio.fail_after``.
+    On timeout, returns a graceful error string instead of raising.
     """
     effective_limit = limit if limit is not None else mgr.max_rows
 
+    abandon = timeout_ms is not None and timeout_ms > 0
+
+    async def _run() -> str:
+        return await _execute_inner(
+            info, mgr, query, output_format, offset, effective_limit,
+            paginate, next_tool, abandon_on_cancel=abandon,
+        )
+
+    if not abandon:
+        return await _run()
+
+    try:
+        with anyio.fail_after(timeout_ms / 1000.0):
+            return await _run()
+    except TimeoutError:
+        return (
+            f"Query timed out after {timeout_ms}ms. "
+            "Consider adding LIMIT, scoping via WHERE, or raising timeout_ms."
+        )
+
+
+async def _execute_inner(
+    info: SessionInfo,
+    mgr: SessionManager,
+    query: str,
+    output_format: str,
+    offset: int | None,
+    effective_limit: int,
+    paginate: bool,
+    next_tool: str,
+    abandon_on_cancel: bool = False,
+) -> str:
     if paginate:
         cursor_id, table = await run_with_lock(
-            info, lambda: info.engine.execute_paged(query, effective_limit)
+            info,
+            lambda: info.engine.execute_paged(query, effective_limit),
+            abandon_on_cancel=abandon_on_cancel,
         )
         if table is None:
             return "OK"
@@ -82,26 +383,41 @@ async def execute_and_format(
             table, effective_limit, mgr.max_chars, output_format, pagination_meta
         )
 
-    # Standard query — Arrow path with optional offset/limit
-    table = await run_with_lock(info, lambda: info.engine.execute_arrow(query))
+    # Standard query — windowed Arrow path. This avoids materializing the
+    # entire result set before slicing for the common non-paginated flow.
+    table, has_more = await run_with_lock(
+        info,
+        lambda: info.engine.execute_windowed(
+            query,
+            offset=offset or 0,
+            limit=effective_limit,
+        ),
+        abandon_on_cancel=abandon_on_cancel,
+    )
 
     if table is not None:
-        if offset is not None and offset > 0:
-            import polars as pl
-
-            df = pl.from_arrow(table)
-            total = df.height
-            df = df.slice(offset, effective_limit)
-            table = df.to_arrow()
-            end = offset + table.num_rows - 1
-            pagination_meta = f"# Page: rows {offset}-{end} of {total}"
-            return format_arrow_result(
-                table, effective_limit, mgr.max_chars, output_format, pagination_meta
-            )
-        return format_arrow_result(table, effective_limit, mgr.max_chars, output_format)
+        pagination_meta = None
+        if table.num_rows > 0 and ((offset or 0) > 0 or has_more):
+            start = offset or 0
+            end = start + table.num_rows - 1
+            parts = [f"# Page: rows {start}-{end}"]
+            if has_more:
+                parts.append("has_more: true")
+            pagination_meta = " | ".join(parts)
+        return format_arrow_result(
+            table,
+            effective_limit,
+            mgr.max_chars,
+            output_format,
+            pagination_meta,
+        )
 
     # Fallback to legacy tuple path
-    columns, rows = await run_with_lock(info, lambda: info.engine.execute(query))
+    columns, rows = await run_with_lock(
+        info,
+        lambda: info.engine.execute(query),
+        abandon_on_cancel=abandon_on_cancel,
+    )
     return format_result(columns, rows, effective_limit, mgr.max_chars, output_format)
 
 

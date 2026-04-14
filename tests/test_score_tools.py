@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import pytest
 
-from aismartbuddy.session import SessionManager
 from aismartbuddy.tools.score import (
     score_evaluate,
     score_gate,
@@ -33,15 +32,6 @@ PLAN_REVIEW_DIMS = [
     {"id": "integration", "description": "Modules connected?",
      "weight": 1.0, "required": False},
 ]
-
-
-@pytest.fixture
-def _init_session_manager(session_manager: SessionManager):
-    import aismartbuddy.session as session_mod
-
-    session_mod.session_manager = session_manager
-    yield
-    session_mod.session_manager = None
 
 
 @pytest.mark.usefixtures("_init_session_manager")

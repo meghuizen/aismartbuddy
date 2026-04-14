@@ -20,6 +20,8 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
 DEFAULT_USER_ID = "default"
 DEFAULT_PROJECT_ID = "default"
+DEFAULT_HOLON_TRUNCATE_CHARS = 60
+DEFAULT_HOLON_TRUNCATE_LONG = 80
 
 
 @dataclass
@@ -46,6 +48,12 @@ class RuntimeConfig:
     # LadybugDB engine tuning
     ladybug_buffer_pool_size: int = 256 * 1024 * 1024  # 256MB
     ladybug_max_threads: int = 0  # 0 = auto-detect
+
+    # Holon display truncation — how many chars of context/description to
+    # show in holon_view / holon_query output. Role_in_parent and projection
+    # stay hardcoded at 40 chars (those fields are short by convention).
+    holon_truncate_chars: int = DEFAULT_HOLON_TRUNCATE_CHARS
+    holon_truncate_long: int = DEFAULT_HOLON_TRUNCATE_LONG
 
     # Microsoft Entra ID OAuth (optional). When BOTH tenant_id and audience
     # are set, the server validates incoming Bearer tokens against the

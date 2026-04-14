@@ -8,6 +8,7 @@ finalization fails.
 
 from __future__ import annotations
 
+import json
 import uuid
 
 import anyio
@@ -28,7 +29,9 @@ from aismartbuddy.tools.think import (
 # ── Validation constants ─────────────────────────────────────
 
 _SCORE_RUBRIC_ACTIONS = frozenset({"create", "list"})
-_SCORE_EVALUATE_ACTIONS = frozenset({"start", "finding", "finalize"})
+_SCORE_EVALUATE_ACTIONS = frozenset(
+    {"start", "finding", "finding_batch", "finalize"}
+)
 _SCORE_GATE_ACTIONS = frozenset({"gate", "list"})
 _SCORING_STRATEGIES = frozenset({
     "weighted_deduction",
@@ -173,6 +176,81 @@ async def score_rubric(
 # ── Tool: score_evaluate ─────────────────────────────────────
 
 
+_TEMPLATES_DIR = (
+    __import__("pathlib").Path(__file__).parent.parent / "templates" / "rubrics"
+)
+_TEMPLATE_IDS = frozenset({
+    "security_review", "architecture_review", "code_review",
+    "research_quality", "hypothesis_strength", "documentation_completeness",
+})
+
+
+async def rubric_templates(
+    action: str,
+    template_id: str | None = None,
+    session_id: str | None = None,
+    ctx: Context | None = None,
+) -> str:
+    """List or load pre-built scoring rubrics.
+
+    Templates ship with the server: security_review, architecture_review,
+    code_review, research_quality, hypothesis_strength, documentation_completeness.
+    Loading a template is equivalent to calling score_rubric(action="create",
+    ...) with the template's pre-configured fields.
+
+    Args:
+        action: list | load.
+        template_id: Required for load.
+        session_id: Required for load — where to install the rubric.
+
+    Returns:
+        Template list or load confirmation.
+    """
+    import json
+
+    if action not in ("list", "load"):
+        raise ValueError(f"action must be list|load, got {action!r}")
+
+    if action == "list":
+        out = ["Available rubric templates:"]
+        for tid in sorted(_TEMPLATE_IDS):
+            path = _TEMPLATES_DIR / f"{tid}.json"
+            if path.exists():
+                try:
+                    payload = json.loads(path.read_text())
+                    out.append(f"- {tid}: {payload.get('description', '')}")
+                except Exception:
+                    out.append(f"- {tid}: (parse error)")
+        return "\n".join(out)
+
+    # load
+    if not template_id:
+        raise ValueError("template_id is required for load")
+    if template_id not in _TEMPLATE_IDS:
+        raise ValueError(
+            f"Unknown template '{template_id}'. "
+            f"Valid: {sorted(_TEMPLATE_IDS)}"
+        )
+    path = _TEMPLATES_DIR / f"{template_id}.json"
+    if not path.exists():
+        raise ValueError(f"Template file missing: {path}")
+    payload = json.loads(path.read_text())
+    return await score_rubric(
+        action="create",
+        session_id=session_id,
+        rubric_id=payload["rubric_id"],
+        description=payload.get("description"),
+        dimensions=payload["dimensions"],
+        severity_levels=payload.get("severity_levels"),
+        severity_deductions=payload.get("severity_deductions"),
+        pass_threshold=payload.get("pass_threshold", 9.0),
+        scale_min=payload.get("scale_min", 1),
+        scale_max=payload.get("scale_max", 10),
+        scoring_strategy=payload.get("scoring_strategy", "weighted_deduction"),
+        ctx=ctx,
+    )
+
+
 async def score_evaluate(
     action: str,
     session_id: str,
@@ -187,6 +265,7 @@ async def score_evaluate(
     recommendation: str | None = None,
     summary: str | None = None,
     dimensions_reviewed: list[str] | None = None,
+    findings: list[dict] | None = None,
 ) -> str:
     """Start an evaluation, submit findings, or finalize.
 
@@ -197,6 +276,11 @@ async def score_evaluate(
     Actions:
         start: Begin evaluation against a rubric. Returns eval ID.
         finding: Submit a single finding. Returns running score.
+        finding_batch: Submit N findings in one call. **WARNING**: this
+            loses the incremental self-assessment forcing function — all
+            findings are committed before any score is seen. Use only when
+            iterative scoring isn't feasible (e.g., bulk import). The output
+            includes a reminder to prefer action="finding" when possible.
         finalize: Close evaluation. Checks required dimensions.
 
     Args:
@@ -323,6 +407,97 @@ async def score_evaluate(
             f"Running score: {running}/{rubric.scale_max}"
             f" | Status: {threshold_status}\n"
             f"Dimension scores: {', '.join(dim_parts)}"
+        )
+
+    # ── finding_batch ────────────────────────────────────
+    if action == "finding_batch":
+        if not evaluation_id:
+            raise ValueError("evaluation_id is required for finding_batch")
+        if not findings:
+            raise ValueError("findings list must be non-empty")
+        ev = engine.get_evaluation(evaluation_id)
+        if ev is None:
+            raise ValueError(f"Evaluation '{evaluation_id}' not found")
+        if ev.status != "active":
+            raise ValueError(
+                f"Evaluation '{evaluation_id}' is {ev.status}, not active"
+            )
+        rubric = engine.get_rubric(ev.rubric_id)
+        if rubric is None:
+            raise ValueError(f"Rubric '{ev.rubric_id}' not found")
+        dim_ids = {d["id"] for d in rubric.dimensions}
+
+        # Validate all findings up-front
+        for i, f in enumerate(findings):
+            if not f.get("dimension"):
+                raise ValueError(
+                    f"findings[{i}] missing 'dimension'"
+                )
+            if f["dimension"] not in dim_ids:
+                raise ValueError(
+                    f"findings[{i}].dimension '{f['dimension']}' "
+                    f"not in rubric. Valid: {', '.join(sorted(dim_ids))}"
+                )
+            if not f.get("severity"):
+                raise ValueError(f"findings[{i}] missing 'severity'")
+            if f["severity"] not in rubric.severity_levels:
+                raise ValueError(
+                    f"findings[{i}].severity '{f['severity']}' not in rubric. "
+                    f"Valid: {', '.join(rubric.severity_levels)}"
+                )
+            if not f.get("description"):
+                raise ValueError(f"findings[{i}] missing 'description'")
+
+        # Apply sequentially under the engine RLock; collect running scores
+        running_scores: list[float] = []
+        finding_ids: list[str] = []
+        result_rows: list[str] = []
+        with engine.state_lock:
+            for f in findings:
+                fr = FindingRecord(
+                    id="",
+                    dimension=f["dimension"],
+                    severity=f["severity"],
+                    blocking=bool(f.get("blocking", False)),
+                    description=f["description"],
+                    evidence=list(f.get("evidence") or []),
+                    recommendation=f.get("recommendation", "") or "",
+                )
+                rs = engine.apply_finding(evaluation_id, fr)
+                running_scores.append(rs)
+                finding_ids.append(fr.id)
+                result_rows.append(
+                    json.dumps(
+                        {
+                            "finding_id": fr.id,
+                            "running_score": rs,
+                            "dimension_score": ev.dimension_scores.get(
+                                f["dimension"], rubric.scale_max
+                            ),
+                        },
+                        separators=(",", ":"),
+                    )
+                )
+
+        running_str = " → ".join(f"{s}" for s in running_scores)
+        final_running = running_scores[-1]
+        threshold_status = (
+            "above_threshold"
+            if final_running >= rubric.pass_threshold
+            else "below_threshold"
+        )
+        return (
+            f"Session: {session_id} | Eval: {evaluation_id}"
+            f" | Batch: {len(findings)} findings applied\n"
+            f"Results: [{', '.join(result_rows)}]\n"
+            f"Running scores: {running_str}\n"
+            f"Final: {final_running}/{rubric.scale_max}"
+            f" (threshold {rubric.pass_threshold}) | {threshold_status}\n"
+            f"Finding IDs: {', '.join(finding_ids)}\n"
+            "⚠ finding_batch loses the incremental self-assessment "
+            "forcing function. Each finding was committed before seeing "
+            'its running score. Prefer action="finding" for iterative '
+            "scoring when feasible."
         )
 
     # ── finalize ─────────────────────────────────────────

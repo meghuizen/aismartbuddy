@@ -1,0 +1,15 @@
+{
+  "rubric_id": "documentation_completeness",
+  "description": "Documentation completeness — coverage, accuracy, examples, audience fit, navigation.",
+  "dimensions": [
+    {"id": "coverage", "description": "All public APIs and behaviors documented", "weight": 1.0, "required": true},
+    {"id": "accuracy", "description": "Docs match actual behavior", "weight": 1.0, "required": true},
+    {"id": "examples", "description": "Worked examples for non-trivial flows", "weight": 0.7, "required": false},
+    {"id": "audience", "description": "Audience and prerequisites stated", "weight": 0.4, "required": false},
+    {"id": "navigation", "description": "Cross-links / TOC / search work", "weight": 0.5, "required": false}
+  ],
+  "severity_levels": ["critical", "high", "moderate", "low"],
+  "severity_deductions": {"critical": 3.0, "high": 2.0, "moderate": 1.0, "low": 0.3},
+  "pass_threshold": 7.5,
+  "scoring_strategy": "weighted_deduction"
+}

@@ -10,6 +10,8 @@ load_dotenv()
 
 from aismartbuddy.config import (  # noqa: E402
     DEFAULT_CURSOR_TIMEOUT,
+    DEFAULT_HOLON_TRUNCATE_CHARS,
+    DEFAULT_HOLON_TRUNCATE_LONG,
     DEFAULT_HOST,
     DEFAULT_MAX_CHARS,
     DEFAULT_MAX_ROWS,
@@ -85,6 +87,18 @@ from aismartbuddy.config import (  # noqa: E402
     help="Default project_id when no tool parameter provided.",
 )
 @click.option(
+    "--holon-truncate-chars", type=click.IntRange(min=1),
+    default=DEFAULT_HOLON_TRUNCATE_CHARS,
+    envvar="AISMARTBUDDY_HOLON_TRUNCATE_CHARS",
+    help="Default chars for holon context/description display truncation.",
+)
+@click.option(
+    "--holon-truncate-long", type=click.IntRange(min=1),
+    default=DEFAULT_HOLON_TRUNCATE_LONG,
+    envvar="AISMARTBUDDY_HOLON_TRUNCATE_LONG",
+    help="Long-form chars for holon context display (zoom_in children).",
+)
+@click.option(
     "--entra-tenant-id", type=str, default=None,
     envvar="AISMARTBUDDY_ENTRA_TENANT",
     help="Entra ID tenant ID. Set with --entra-audience to enable OAuth.",
@@ -119,6 +133,8 @@ def main(
     ladybug_threads: int,
     default_user_id: str,
     default_project_id: str,
+    holon_truncate_chars: int,
+    holon_truncate_long: int,
     entra_tenant_id: str | None,
     entra_audience: str | None,
     entra_required_scope: str | None,
@@ -143,6 +159,8 @@ def main(
         ladybug_max_threads=ladybug_threads,
         default_user_id=default_user_id,
         default_project_id=default_project_id,
+        holon_truncate_chars=holon_truncate_chars,
+        holon_truncate_long=holon_truncate_long,
         entra_tenant_id=entra_tenant_id,
         entra_audience=entra_audience,
         entra_required_scope=entra_required_scope,

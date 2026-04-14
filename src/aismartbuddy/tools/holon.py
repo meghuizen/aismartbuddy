@@ -14,18 +14,35 @@ from typing import TYPE_CHECKING
 import anyio
 from mcp.server.fastmcp import Context as _MCPContext
 
+from aismartbuddy import config as cfg
 from aismartbuddy.engines.thinking_engine import HolonNode
 
 if TYPE_CHECKING:
     from aismartbuddy.engines.thinking_engine import ThinkingEngine
     from aismartbuddy.session import SessionInfo
 
+from aismartbuddy.tools import size_guarded
 from aismartbuddy.tools.think import (
     _engine,
     _get_or_create_think_session,
     _require_think_session,
     _validate_enum,
 )
+
+# ── Display truncation helpers ───────────────────────────────
+# Runtime-configurable via RuntimeConfig.holon_display_truncate_{chars,long}
+# (CLI: --holon-truncate-chars / --holon-truncate-long). Defaults: 60 / 80.
+
+
+def _trunc(s: str) -> str:
+    """Truncate to display chars (default 60) for inline context/description."""
+    return s[: max(1, cfg.runtime_config.holon_truncate_chars)]
+
+
+def _trunc_long(s: str) -> str:
+    """Truncate to long display chars (default 80) for primary content."""
+    return s[: max(1, cfg.runtime_config.holon_truncate_long)]
+
 
 # ── Validation constants ─────────────────────────────────────
 
@@ -127,8 +144,8 @@ def _holon_summary_line(node: HolonNode, holarchy_id: str) -> str:
 
 
 async def holon_create(
-    name: str,
-    description: str,
+    name: str = "",
+    description: str = "",
     session_id: str | None = None,
     holarchy_id: str | None = None,
     parent_id: str | None = None,
@@ -137,20 +154,27 @@ async def holon_create(
     rules: list[str] | None = None,
     properties: list[str] | None = None,
     projection: str = "",
+    holons: list[dict] | None = None,
     ctx: _MCPContext | None = None,
 ) -> str:
     """Create a holon — an entity that is both a whole and a part.
 
-    If parent_id is None, creates a new holarchy with this holon
-    as root. If parent_id is given, adds this holon as a child in
-    the specified holarchy.
+    Single mode: omit `holons`. Provide name + description (+ optional
+    parent_id, holarchy_id, role_in_parent, context, rules, properties,
+    projection). If parent_id is None, creates a new holarchy with this
+    holon as root.
+
+    Batch mode: pass `holons=[{ref, name, description, parent_ref, ...}, ...]`
+    to create N holons atomically in one call. parent_ref may reference
+    another holon in the batch (by its temp ref) or an existing holon_id.
+    All-or-nothing: validation failures abort the whole batch.
 
     To add an existing holon to a second holarchy, use holon_update
     with action="join_holarchy".
 
     Args:
-        name: Human-readable label.
-        description: What this holon IS (as a whole).
+        name: Human-readable label (single mode).
+        description: What this holon IS (single mode).
         session_id: Thinking session ID. Omit to auto-create.
         holarchy_id: Which holarchy. Auto-created for root holons.
         parent_id: Parent holon ID. None = root of new holarchy.
@@ -159,9 +183,13 @@ async def holon_create(
         rules: Internal constraints.
         properties: Observable properties.
         projection: What this holon exposes upward in this holarchy.
+        holons: Batch mode — list of dicts. Each: {ref, name, description,
+            parent_ref?, holarchy_id?, role_in_parent?, context?, rules?,
+            properties?, projection?}. Topologically resolved server-side.
 
     Returns:
-        Compact status with holon position.
+        Single mode: compact status with holon position.
+        Batch mode: ref→id mapping for all created holons.
     """
     _, info = await anyio.to_thread.run_sync(
         lambda: _get_or_create_think_session(session_id, ctx)
@@ -169,6 +197,31 @@ async def holon_create(
     engine = _engine(info)
     sid = info.session_id
 
+    # ── Batch path ─────────────────────────────────────
+    if holons is not None:
+        if not holons:
+            raise ValueError("holons batch must be non-empty")
+        default_hid = holarchy_id or uuid.uuid4().hex[:10]
+        ref_to_id = engine.add_holons_batch(holons, default_hid)
+        # Discover holarchies actually created
+        hids_used: set[str] = set()
+        for hid_val in [
+            item.get("holarchy_id") or default_hid for item in holons
+        ]:
+            hids_used.add(hid_val)
+        ref_lines = ", ".join(f"{r}={i}" for r, i in ref_to_id.items())
+        return (
+            f"Session: {sid} | Batch: {len(ref_to_id)} holons created\n"
+            f"Holarchies: {', '.join(sorted(hids_used))}\n"
+            f"Refs: {ref_lines}\n"
+            "Status: created"
+        )
+
+    # ── Single mode (existing behavior) ────────────────
+    if not name:
+        raise ValueError("Single-mode holon_create requires 'name'")
+    if not description:
+        raise ValueError("Single-mode holon_create requires 'description'")
     hid = holarchy_id or uuid.uuid4().hex[:10]
     nid = uuid.uuid4().hex[:10]
     level = 0
@@ -320,7 +373,7 @@ def _holon_update_locked(
         node.context = content
         return (
             f"Session: {session_id} | Holon: {holon_id}\n"
-            f"Context updated: {content[:80]}"
+            f"Context updated: {_trunc_long(content)}"
         )
 
     if action == "rules":
@@ -338,7 +391,7 @@ def _holon_update_locked(
         node.description = content
         return (
             f"Session: {session_id} | Holon: {holon_id}\n"
-            f"Description updated: {content[:80]}"
+            f"Description updated: {_trunc_long(content)}"
         )
 
     if action == "properties":
@@ -362,7 +415,7 @@ def _holon_update_locked(
         node.stale_projections.discard(holarchy_id)
         return (
             f"Session: {session_id} | Holon: {holon_id}\n"
-            f"Projection in {holarchy_id} updated: {content[:80]}"
+            f"Projection in {holarchy_id} updated: {_trunc_long(content)}"
         )
 
     if action == "join_holarchy":
@@ -406,6 +459,7 @@ def _holon_update_locked(
 # ── Tool: holon_view ────────────────────────────────────────
 
 
+@size_guarded
 async def holon_view(
     session_id: str,
     holon_id: str,
@@ -506,7 +560,7 @@ async def holon_view(
         for i, child in enumerate(shown_children):
             lines.append(f"  {i+1}. {_holon_summary_line(child, hid)}")
             if child.context:
-                lines.append(f"     Context: {child.context[:80]}")
+                lines.append(f"     Context: {_trunc_long(child.context)}")
         if omitted_children:
             lines.append(
                 f"  ... {omitted_children} more"
@@ -540,7 +594,7 @@ async def holon_view(
         for sib in siblings:
             lines.append(f"  - {_holon_summary_line(sib, hid)}")
             if sib.context:
-                lines.append(f"    Context: {sib.context[:60]}")
+                lines.append(f"    Context: {_trunc(sib.context)}")
         lines.append(
             "\n### Synthesis prompt:"
             " Given what you learned at the child level,"
@@ -566,9 +620,9 @@ async def holon_view(
         for sib in shown_siblings:
             lines.append(f"  - {_holon_summary_line(sib, hid)}")
             if sib.description:
-                lines.append(f"    Description: {sib.description[:60]}")
+                lines.append(f"    Description: {_trunc(sib.description)}")
             if sib.context:
-                lines.append(f"    Context: {sib.context[:60]}")
+                lines.append(f"    Context: {_trunc(sib.context)}")
         if omitted_siblings:
             lines.append(
                 f"  ... {omitted_siblings} more"
@@ -601,7 +655,7 @@ async def holon_view(
             f"{indent}{anc.name} (L{lvl}){marker}"
         )
         if anc.context and anc.id != holon_id:
-            lines.append(f"{indent}  Context: {anc.context[:60]}")
+            lines.append(f"{indent}  Context: {_trunc(anc.context)}")
 
     if len(descendants) > 1:
         desc_list = [d for d in descendants if d.id != holon_id]
@@ -638,6 +692,7 @@ async def holon_view(
 # ── Tool: holon_analyze ──────────────────────────────────────
 
 
+@size_guarded
 async def holon_analyze(
     session_id: str,
     action: str,
@@ -848,7 +903,7 @@ async def holon_analyze(
         return (
             f"Session: {session_id} | Propagated UP in {hid}\n"
             f"Type: {propagation_type}\n"
-            f"Insight: {insight[:80]}\n"
+            f"Insight: {_trunc_long(insight)}\n"
             f"Affected ({len(affected)}): "
             + " → ".join(affected)
         )
@@ -890,7 +945,7 @@ async def holon_analyze(
         return (
             f"Session: {session_id} | Propagated DOWN in {hid}\n"
             f"Type: {propagation_type}\n"
-            f"Directive: {insight[:80]}\n"
+            f"Directive: {_trunc_long(insight)}\n"
             f"Affected ({len(affected)}): {', '.join(affected)}"
         )
 
@@ -986,10 +1041,10 @@ async def holon_analyze(
                 marker = " [END]"
             lines.append(
                 f"  {i+1}. {node.name}{marker}"
-                f" — {node.description[:60]}"
+                f" — {_trunc(node.description)}"
             )
             if node.context:
-                lines.append(f"     Context: {node.context[:60]}")
+                lines.append(f"     Context: {_trunc(node.context)}")
         return "\n".join(lines)
 
     # ── feedback_loops ───────────────────────────────────
@@ -1101,8 +1156,8 @@ def _analyze_feedback_loops(
                 loops.append({
                     "holon_a": a.name,
                     "holon_b": b.name,
-                    "a_context": a.context[:60],
-                    "b_context": b.context[:60],
+                    "a_context": _trunc(a.context),
+                    "b_context": _trunc(b.context),
                 })
 
     lines = [
@@ -1173,6 +1228,7 @@ def _analyze_leverage_points(
 # ── Tool: holon_query ────────────────────────────────────────
 
 
+@size_guarded
 async def holon_query(
     session_id: str,
     question: str,
@@ -1237,7 +1293,7 @@ async def holon_query(
         lines.append(f"Lenses: {len(vantage.analytical_lenses)}")
         for lens in vantage.analytical_lenses:
             lines.append(
-                f"  {lens['name']}: {lens['findings'][:60]}"
+                f"  {lens['name']}: {_trunc(lens['findings'])}"
             )
 
     # Gather scope — collect visible nodes for stale scan
@@ -1268,7 +1324,7 @@ async def holon_query(
             indent = "  " * (int(lvl) if isinstance(lvl, int) else 0)
             lines.append(f"{indent}{node.name} (L{lvl})")
             if node.context:
-                lines.append(f"{indent}  Context: {node.context[:60]}")
+                lines.append(f"{indent}  Context: {_trunc(node.context)}")
 
     else:  # holarchy
         root_id = engine.holon_holarchies.get(hid)
@@ -1287,7 +1343,7 @@ async def holon_query(
                 lines.append(f"{indent}{node.name} (L{lvl}){marker}")
                 if node.context:
                     lines.append(
-                        f"{indent}  Context: {node.context[:60]}"
+                        f"{indent}  Context: {_trunc(node.context)}"
                     )
 
     # Stale projections — scoped to visible nodes only

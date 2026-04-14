@@ -1,0 +1,15 @@
+{
+  "rubric_id": "research_quality",
+  "description": "Research output quality — sourcing, methodology, falsifiability, novelty, completeness.",
+  "dimensions": [
+    {"id": "sourcing", "description": "Claims backed by cited evidence", "weight": 1.0, "required": true},
+    {"id": "methodology", "description": "Sound methodology, reproducible steps", "weight": 1.0, "required": true},
+    {"id": "falsifiability", "description": "Hypotheses are testable", "weight": 0.8, "required": false},
+    {"id": "novelty", "description": "New insight beyond known facts", "weight": 0.6, "required": false},
+    {"id": "completeness", "description": "Major counterexamples considered", "weight": 0.7, "required": false}
+  ],
+  "severity_levels": ["critical", "high", "moderate", "low"],
+  "severity_deductions": {"critical": 3.0, "high": 2.0, "moderate": 1.0, "low": 0.5},
+  "pass_threshold": 7.5,
+  "scoring_strategy": "weighted_deduction"
+}

@@ -17,33 +17,44 @@ from aismartbuddy.tools import (
     fetch_next_and_format,
     get_session_manager,
     run_with_lock,
+    size_guarded,
 )
 
 logger = logging.getLogger("aismartbuddy.tools.graph")
 
 
 def _require_graph_session(session_id: str):
-    """Validate and return a graph session."""
+    """Validate and return a graph session.
+
+    Accepts a direct graph session_id OR a parent session_id whose backends
+    include "graph".
+    """
     mgr = get_session_manager()
-    info = mgr.get_session(session_id)
-    if info.session_type != "graph":
-        raise ValueError(f"Session '{session_id}' is a {info.session_type} session, not graph.")
+    info = mgr.resolve_backend_session(session_id, "graph")
     return mgr, info
 
 
 def _require_graph_session_pair(session_id_a: str, session_id_b: str):
     """Validate and return two graph sessions for comparison tools."""
     mgr = get_session_manager()
-    info_a = mgr.get_session(session_id_a)
-    info_b = mgr.get_session(session_id_b)
-    if info_a.session_type != "graph" or info_b.session_type != "graph":
-        raise ValueError("Both sessions must be graph sessions.")
+    info_a = mgr.resolve_backend_session(session_id_a, "graph")
+    info_b = mgr.resolve_backend_session(session_id_b, "graph")
     return mgr, info_a, info_b
 
 
-def _escape_cypher_string(value: str) -> str:
-    """Escape a string value for safe interpolation into Cypher single-quoted strings."""
+def escape_cypher_string(value: str) -> str:
+    """Escape a string value for safe interpolation into Cypher single-quoted strings.
+
+    Public so other tool modules (auto_graph helper) can reuse without
+    reaching into a private name. Keep `_escape_cypher_string` alias for
+    in-module callers that already use it.
+    """
     return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+# Module-internal alias preserved for existing callers in graph.py and
+# tools that imported the underscored form.
+_escape_cypher_string = escape_cypher_string
 
 
 def _validate_id(name: str, label: str = "identifier") -> str:
@@ -100,6 +111,7 @@ async def graph_query(
     offset: int | None = None,
     limit: int | None = None,
     paginate: bool = False,
+    timeout_ms: int = 10000,
 ) -> str:
     """Execute a Cypher query against a graph session.
 
@@ -114,6 +126,10 @@ async def graph_query(
     - paginate=True for cursor-based sequential paging (most efficient for full scans)
       Returns first page + cursor_id; use graph_query_next to get subsequent pages.
 
+    Timeout: execution is bounded by ``timeout_ms`` (default 10s). On timeout,
+    returns a graceful error string instead of hanging. Set ``timeout_ms=0``
+    to disable the timeout (not recommended for interactive use).
+
     Common error: missing semicolon at end of Cypher statement.
 
     Example: graph_query(session_id, "MATCH (n:Person) RETURN n.name LIMIT 10;")
@@ -127,14 +143,17 @@ async def graph_query(
         offset: Skip this many rows from the start (for random-access paging).
         limit: Return at most this many rows (overrides server max_rows).
         paginate: If True, use cursor-based paging. Returns first page + cursor_id.
+        timeout_ms: Hard deadline in milliseconds (default 10000 = 10s).
+            0 disables the timeout.
 
     Returns:
-        Query results in the chosen format.
+        Query results in the chosen format, or a timeout error message.
     """
     mgr, info = _require_graph_session(session_id)
     return await execute_and_format(
         info, mgr, query, output_format, offset, limit, paginate,
         next_tool="graph_query_next",
+        timeout_ms=timeout_ms if timeout_ms > 0 else None,
     )
 
 
@@ -233,6 +252,7 @@ async def graph_query_next(session_id: str, cursor_id: str) -> str:
 # ── Analytical graph tools ───────────────────────────────────────
 
 
+@size_guarded
 async def graph_statistics(session_id: str) -> str:
     """Get a complete overview of the graph in one call.
 
@@ -680,10 +700,16 @@ async def graph_cross_reference(
 # ── Knowledge Graph Tools ─────────────────────────────────────────
 
 _ENTITY_TYPES = {"concept", "entity", "fact", "evidence", "question", "insight"}
+_ENTITY_TYPE_ALIASES = {"hypothesis": "question"}
 _RELATION_TYPES = {
     "supports", "contradicts", "refines", "causes", "prevents",
     "requires", "part_of", "similar_to", "derived_from",
 }
+
+
+def _normalize_entity_type(entity_type: str) -> str:
+    """Map user-facing aliases onto the persisted KnowledgeNode taxonomy."""
+    return _ENTITY_TYPE_ALIASES.get(entity_type, entity_type)
 
 
 async def graph_knowledge_add(
@@ -705,6 +731,7 @@ async def graph_knowledge_add(
         session_id: Session token from graph_create_session.
         entity: Name/label of the knowledge entity.
         entity_type: One of: concept, entity, fact, evidence, question, insight.
+            Alias accepted: hypothesis -> question.
         properties: Optional dict of additional properties (stored as description).
         confidence: Confidence score 0.0 to 1.0 (default 1.0).
         source: Provenance — who/what added this (default "ai").
@@ -714,6 +741,7 @@ async def graph_knowledge_add(
     """
     mgr, info = _require_graph_session(session_id)
 
+    entity_type = _normalize_entity_type(entity_type)
     if entity_type not in _ENTITY_TYPES:
         raise ValueError(
             f"Invalid entity_type: '{entity_type}'. "
@@ -843,7 +871,164 @@ async def graph_knowledge_relate(
     )
 
 
-async def graph_knowledge_infer(session_id: str, inference_type: str) -> str:
+async def knowledge_batch(
+    session_id: str,
+    nodes: list[dict] | None = None,
+    relations: list[dict] | None = None,
+) -> str:
+    """Bulk-create knowledge graph nodes and relations in one call.
+
+    Use INSTEAD of multiple sequential graph_knowledge_add /
+    graph_knowledge_relate calls when adding 3+ items. Same per-item
+    validation as the single-item tools — invalid items abort the batch.
+
+    Two-phase: nodes are created first (so relations can match), then
+    relations. All operations execute under a single session lock —
+    other agents on the same session serialize.
+
+    Args:
+        session_id: Session token from graph_create_session.
+        nodes: List of node dicts. Each: {entity, entity_type?, confidence?,
+            properties?, source?}. entity is required;
+            entity_type defaults to "concept", confidence to 1.0, source to "ai".
+            Alias accepted: hypothesis -> question.
+        relations: List of relation dicts. Each: {from_name, to_name, relation,
+            weight?, justification?, source?}. relation must be in the standard
+            relation set (supports/contradicts/refines/causes/prevents/requires/
+            part_of/similar_to/derived_from).
+
+    Returns:
+        Counts of nodes/relations created plus any per-item errors.
+    """
+    from datetime import datetime, timezone
+
+    mgr, info = _require_graph_session(session_id)
+    nodes = nodes or []
+    relations = relations or []
+    if not nodes and not relations:
+        raise ValueError(
+            "knowledge_batch requires at least one node or relation"
+        )
+
+    # Phase 0: validate all items up front (fail-fast per plan)
+    for i, n in enumerate(nodes):
+        if not n.get("entity"):
+            raise ValueError(f"nodes[{i}] missing 'entity'")
+        et = _normalize_entity_type(n.get("entity_type", "concept"))
+        if et not in _ENTITY_TYPES:
+            raise ValueError(
+                f"nodes[{i}] invalid entity_type '{et}'. "
+                f"Options: {', '.join(sorted(_ENTITY_TYPES))}"
+            )
+    for i, r in enumerate(relations):
+        if not r.get("from_name") or not r.get("to_name"):
+            raise ValueError(
+                f"relations[{i}] missing 'from_name' or 'to_name'"
+            )
+        rel = r.get("relation")
+        if rel not in _RELATION_TYPES:
+            raise ValueError(
+                f"relations[{i}] invalid relation '{rel}'. "
+                f"Options: {', '.join(sorted(_RELATION_TYPES))}"
+            )
+
+    ts = datetime.now(timezone.utc).isoformat()
+
+    # Phase 1: ensure KnowledgeNode table + insert all nodes
+    def _insert_nodes() -> int:
+        try:
+            info.engine.execute(
+                "CREATE NODE TABLE IF NOT EXISTS KnowledgeNode ("
+                "id SERIAL PRIMARY KEY, name STRING, description STRING, "
+                "entity_type STRING, confidence DOUBLE, "
+                "source STRING, created_at STRING);"
+            )
+        except Exception:
+            pass
+        count = 0
+        for n in nodes:
+            entity = _escape_cypher_string(n["entity"])
+            etype = _escape_cypher_string(
+                _normalize_entity_type(n.get("entity_type", "concept"))
+            )
+            conf = max(0.0, min(1.0, float(n.get("confidence", 1.0))))
+            src = _escape_cypher_string(n.get("source", "ai"))
+            props = _escape_cypher_string(
+                str(n["properties"]) if n.get("properties") else ""
+            )
+            info.engine.execute(
+                f"CREATE (n:KnowledgeNode {{"
+                f"name: '{entity}', description: '{props}', "
+                f"entity_type: '{etype}', confidence: {conf}, "
+                f"source: '{src}', created_at: '{ts}'"
+                f"}});"
+            )
+            count += 1
+        return count
+
+    # Phase 2: ensure rel tables + insert all relations
+    def _insert_relations() -> tuple[int, list[str]]:
+        count = 0
+        errors: list[str] = []
+        for i, r in enumerate(relations):
+            relation = r["relation"]
+            rel_table = relation.capitalize().replace("_", "")
+            _validate_id(rel_table, "relation_table")
+            try:
+                info.engine.execute(
+                    f"CREATE REL TABLE IF NOT EXISTS {rel_table} ("
+                    f"FROM KnowledgeNode TO KnowledgeNode, "
+                    f"weight DOUBLE, justification STRING, "
+                    f"source STRING, created_at STRING);"
+                )
+            except Exception:
+                pass
+            from_n = _escape_cypher_string(r["from_name"])
+            to_n = _escape_cypher_string(r["to_name"])
+            weight = max(0.0, min(1.0, float(r.get("weight", 1.0))))
+            just = _escape_cypher_string(r.get("justification", ""))
+            src = _escape_cypher_string(r.get("source", "ai"))
+            try:
+                info.engine.execute(
+                    f"MATCH (a:KnowledgeNode {{name: '{from_n}'}}), "
+                    f"(b:KnowledgeNode {{name: '{to_n}'}}) "
+                    f"CREATE (a)-[:{rel_table} {{"
+                    f"weight: {weight}, justification: '{just}', "
+                    f"source: '{src}', created_at: '{ts}'"
+                    f"}}]->(b);"
+                )
+                count += 1
+            except Exception as e:
+                errors.append(f"relations[{i}]: {e}")
+        return count, errors
+
+    # Atomic: both phases run inside one lock acquisition so concurrent
+    # agents cannot observe nodes-without-relations.
+    def _insert_all() -> tuple[int, int, list[str]]:
+        n = _insert_nodes()
+        r, errs = _insert_relations()
+        return n, r, errs
+
+    n_count, r_count, r_errors = await run_with_lock(info, _insert_all)
+
+    parts = [
+        f"Session: {session_id}",
+        f"Nodes added: {n_count}",
+        f"Relations added: {r_count}",
+    ]
+    out = " | ".join(parts)
+    if r_errors:
+        out += "\nRelation errors:\n  " + "\n  ".join(r_errors)
+    return out
+
+
+@size_guarded
+async def graph_knowledge_infer(
+    session_id: str,
+    inference_type: str,
+    max_depth: int = 5,
+    min_nodes_override: int = 10,
+) -> str:
     """Run inference-like analytical queries on a knowledge graph.
 
     Finds patterns, contradictions, gaps, and chains in the knowledge.
@@ -855,11 +1040,34 @@ async def graph_knowledge_infer(session_id: str, inference_type: str) -> str:
             - "gaps" — high-degree nodes with low avg edge confidence
             - "chains" — transitive support chains (A supports B, B supports C)
             - "clusters" — groups of tightly connected nodes
+        max_depth: For chains, bounds the transitive search depth (default 5,
+            clamped to [2, 10]). Lower values terminate faster on large graphs;
+            higher values find longer support chains.
 
     Returns:
         Inference results.
     """
     mgr, info = _require_graph_session(session_id)
+    # Bound max_depth to prevent runaway transitive closure
+    max_depth = max(2, min(max_depth, 10))
+
+    # Early-return if graph is too small to yield meaningful inference
+    try:
+        cols, rows = await run_with_lock(
+            info,
+            lambda: info.engine.execute(
+                "MATCH (n:KnowledgeNode) RETURN count(n) AS c;"
+            ),
+        )
+        node_count = int(rows[0][0]) if rows else 0
+    except Exception:
+        node_count = 0
+    if node_count < min_nodes_override:
+        return (
+            f"Graph has {node_count} nodes. Minimum {min_nodes_override} "
+            f"recommended for meaningful {inference_type}. Add more knowledge "
+            "before inferring (use knowledge_batch for bulk-add)."
+        )
 
     if inference_type == "contradictions":
         # Find nodes connected by both Supports and Contradicts
@@ -907,9 +1115,9 @@ async def graph_knowledge_infer(session_id: str, inference_type: str) -> str:
         return "\n".join(lines)
 
     elif inference_type == "chains":
-        # Find transitive support chains up to 3 hops
+        # Find transitive support chains up to max_depth hops
         cypher = (
-            "MATCH (a:KnowledgeNode)-[:Supports*2..3]->(b:KnowledgeNode) "
+            f"MATCH (a:KnowledgeNode)-[:Supports*2..{max_depth}]->(b:KnowledgeNode) "
             "RETURN a.name AS chain_start, b.name AS chain_end "
             "LIMIT 20;"
         )
@@ -948,6 +1156,7 @@ async def graph_knowledge_infer(session_id: str, inference_type: str) -> str:
         )
 
 
+@size_guarded
 async def graph_knowledge_summary(session_id: str) -> str:
     """Get a comprehensive knowledge graph summary in one call.
 

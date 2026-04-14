@@ -78,19 +78,33 @@ class ThoughtNode:
 
 @dataclass
 class ModelRecord:
-    """Application of a mental model to a problem."""
+    """Application of a mental model to a problem.
+
+    record_id is the addressable id when this record was produced via
+    think_model(items=[...]) — it's the caller's item id. Empty for
+    single-item backward-compat calls.
+
+    refs holds the unified cross-reference list — populated from
+    items[].connects_to and items[].refs so think_refs_query can find
+    this record by any referenced entity_id.
+    """
 
     model_name: str
     problem: str
     steps: list[str] = field(default_factory=list)
     reasoning: str = ""
     conclusion: str = ""
+    record_id: str = ""
+    refs: list[str] = field(default_factory=list)
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 @dataclass
 class DecisionRecord:
-    """State for a multi-stage decision analysis."""
+    """State for a multi-stage decision analysis.
+
+    refs holds unified cross-references when produced via think_decide(items=[...]).
+    """
 
     decision_id: str
     statement: str
@@ -101,18 +115,26 @@ class DecisionRecord:
     criteria: list[dict] = field(default_factory=list)
     evaluations: list[dict] = field(default_factory=list)
     recommendation: str = ""
+    refs: list[str] = field(default_factory=list)
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 @dataclass
 class DebugRecord:
-    """Application of a debugging approach to an issue."""
+    """Application of a debugging approach to an issue.
+
+    record_id is the addressable id when this record was produced via
+    think_debug(items=[...]) — it's the caller's item id. Empty for
+    single-item backward-compat calls.
+    """
 
     approach_name: str
     issue: str
     steps: list[str] = field(default_factory=list)
     findings: str = ""
     resolution: str = ""
+    record_id: str = ""
+    refs: list[str] = field(default_factory=list)
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -135,25 +157,11 @@ class ArgRecord:
 
 
 @dataclass
-class CollabRecord:
-    """State for a collaborative reasoning session."""
-
-    session_id: str
-    topic: str
-    personas: list[dict] = field(default_factory=list)
-    contributions: list[dict] = field(default_factory=list)
-    stage: str = "problem-definition"
-    iteration: int = 0
-    active_persona_id: str = ""
-    consensus_points: list[str] = field(default_factory=list)
-    disagreements: list[dict] = field(default_factory=list)
-    open_questions: list[str] = field(default_factory=list)
-    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-
-
-@dataclass
 class InquiryRecord:
-    """State for a scientific method inquiry."""
+    """State for a scientific method inquiry.
+
+    refs holds unified cross-references when produced via think_science(items=[...]).
+    """
 
     inquiry_id: str
     stage: str = "observation"
@@ -164,12 +172,16 @@ class InquiryRecord:
     experiment: dict | None = None
     analysis: str = ""
     conclusion: str = ""
+    refs: list[str] = field(default_factory=list)
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 @dataclass
 class MonitorRecord:
-    """State for metacognitive monitoring."""
+    """State for metacognitive monitoring.
+
+    refs holds unified cross-references when produced via think_monitor(items=[...]).
+    """
 
     monitoring_id: str
     task: str
@@ -182,17 +194,7 @@ class MonitorRecord:
     uncertainty_areas: list[str] = field(default_factory=list)
     recommended_approach: str = ""
     suggested_assessments: list[str] = field(default_factory=list)
-    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-
-
-@dataclass
-class DiagramRecord:
-    """State for a visual reasoning diagram."""
-
-    diagram_id: str
-    diagram_type: str = "graph"
-    elements: list[dict] = field(default_factory=list)
-    operations_log: list[dict] = field(default_factory=list)
+    refs: list[str] = field(default_factory=list)
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -251,6 +253,31 @@ MAX_HOLARCHIES = 30
 
 
 @dataclass
+class IterationRecord:
+    """Tracks one ITERATE-mode build-test-learn loop.
+
+    Lightweight by design — 3 fields per attempt (approach/result/learning).
+    Optional metric_value enables ratcheting (Phase 5 / M5 — defer logic
+    there but the storage shape is set up here).
+    """
+
+    iteration_id: str
+    goal: str
+    attempts: list[dict] = field(default_factory=list)
+    conclusion: str = ""
+    is_complete: bool = False
+    # Metric ratcheting (M5)
+    metric_name: str | None = None
+    best_metric: float | None = None
+    metric_history: list[float] = field(default_factory=list)
+    # When higher metric is better. Set when first metric is recorded.
+    higher_is_better: bool = True
+    created_at: datetime = field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+
+
+@dataclass
 class FindingRecord:
     """A single finding in a scored evaluation."""
 
@@ -302,6 +329,27 @@ class EvaluationRecord:
     finalized_at: datetime | None = None
 
 
+@dataclass
+class ArtifactRecord:
+    """Unified V2 reasoning artifact stored in session memory."""
+
+    id: str
+    kind: str
+    mode: str
+    phase: str
+    status: str = "active"
+    model_name: str = ""
+    domain_tags: list[str] = field(default_factory=list)
+    content: dict = field(default_factory=dict)
+    refs: list[str] = field(default_factory=list)
+    connects_to: list[str] = field(default_factory=list)
+    supports: list[str] = field(default_factory=list)
+    contradicts: list[str] = field(default_factory=list)
+    derived_from: list[str] = field(default_factory=list)
+    confidence: float | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
 MAX_RUBRICS = 100
 MAX_EVALUATIONS = 100
 
@@ -332,21 +380,28 @@ class ThinkingEngine:
         self.decisions: dict[str, DecisionRecord] = {}
         self.debugs: list[DebugRecord] = []
         self.args: dict[str, list[ArgRecord]] = {}  # keyed by first argument_id
-        self.collaborations: dict[str, CollabRecord] = {}
         self.inquiries: dict[str, InquiryRecord] = {}
         self.monitors: dict[str, MonitorRecord] = {}
-        self.diagrams: dict[str, DiagramRecord] = {}
         self.interferences: dict[str, InterferenceRecord] = {}
         self.holon_nodes: dict[str, HolonNode] = {}
         self.holon_holarchies: dict[str, str] = {}  # holarchy_id → root_id
         self.rubrics: dict[str, RubricRecord] = {}
         self.evaluations: dict[str, EvaluationRecord] = {}
+        self.iterations: dict[str, IterationRecord] = {}
+        self.artifacts: dict[str, ArtifactRecord] = {}
+        self._artifact_ids_by_kind: dict[str, set[str]] = {}
+        self._artifact_ids_by_phase: dict[str, set[str]] = {}
+        self._artifact_ids_by_mode: dict[str, set[str]] = {}
+        self._artifact_ids_by_ref: dict[str, set[str]] = {}
+        self._artifact_order: list[str] = []
 
     @property
     def state_lock(self):
         """Expose the internal RLock so tool-layer code can hold it during
         multi-step read-modify-write sequences on engine-owned dataclasses
-        (e.g. holon_update, propagate_up/down, think_graph_validate).
+        (e.g. holon_update, propagate_up/down, and the items[] batch paths
+        in think_model / think_science / think_monitor / think_decide /
+        think_debug).
 
         Use as `with engine.state_lock:`. Prefer `@_synchronized` engine
         methods for single-step mutations; use this only when the tool
@@ -366,15 +421,20 @@ class ThinkingEngine:
         self.decisions.clear()
         self.debugs.clear()
         self.args.clear()
-        self.collaborations.clear()
         self.inquiries.clear()
         self.monitors.clear()
-        self.diagrams.clear()
         self.interferences.clear()
         self.holon_nodes.clear()
         self.holon_holarchies.clear()
         self.rubrics.clear()
         self.evaluations.clear()
+        self.iterations.clear()
+        self.artifacts.clear()
+        self._artifact_ids_by_kind.clear()
+        self._artifact_ids_by_phase.clear()
+        self._artifact_ids_by_mode.clear()
+        self._artifact_ids_by_ref.clear()
+        self._artifact_order.clear()
 
     # ── Thought graph ──────────────────────────────────────
 
@@ -391,6 +451,53 @@ class ThinkingEngine:
             parent = self.thought_nodes[node.parent_id]
             if node.id not in parent.children:
                 parent.children.append(node.id)
+
+    @_synchronized
+    def add_node_with_children(
+        self,
+        parent_node: ThoughtNode,
+        child_specs: list[dict],
+    ) -> tuple[str, list[str]]:
+        """Atomically add a parent node and N children in one lock acquisition.
+
+        Each child_spec must contain 'thought' (str). Optional 'metadata' (dict)
+        and 'action' (str, defaults to parent's action).
+
+        Returns (parent_id, child_ids) in submission order.
+        """
+        import uuid as _uuid
+
+        # Insert parent first so child.parent_id resolves
+        self._cleanup_graph_memory()
+        self.thought_nodes[parent_node.id] = parent_node
+        if parent_node.parent_id is None:
+            self.thought_trees[parent_node.tree_id] = parent_node.id
+        elif parent_node.parent_id in self.thought_nodes:
+            grandparent = self.thought_nodes[parent_node.parent_id]
+            if parent_node.id not in grandparent.children:
+                grandparent.children.append(parent_node.id)
+
+        child_ids: list[str] = []
+        for spec in child_specs:
+            content = spec.get("thought", "")
+            if not content:
+                raise ValueError(
+                    "Each child must include a non-empty 'thought' field"
+                )
+            cid = _uuid.uuid4().hex[:10]
+            child = ThoughtNode(
+                id=cid,
+                tree_id=parent_node.tree_id,
+                content=content,
+                action=spec.get("action", "think"),
+                parent_id=parent_node.id,
+                depth=parent_node.depth + 1,
+                metadata=spec.get("metadata") or {},
+            )
+            self.thought_nodes[cid] = child
+            parent_node.children.append(cid)
+            child_ids.append(cid)
+        return parent_node.id, child_ids
 
     def get_node(self, node_id: str) -> ThoughtNode | None:
         return self.thought_nodes.get(node_id)
@@ -452,6 +559,118 @@ class ThinkingEngine:
     def get_node_count(self) -> int:
         return len(self.thought_nodes)
 
+    # ── Unified artifacts ───────────────────────────────
+
+    @_synchronized
+    def upsert_artifact(self, record: ArtifactRecord) -> None:
+        existing = self.artifacts.get(record.id)
+        if existing is not None:
+            self._deindex_artifact(existing)
+        else:
+            self._artifact_order.append(record.id)
+        self.artifacts[record.id] = record
+        self._index_artifact(record)
+
+    @_synchronized
+    def get_artifact(self, artifact_id: str) -> ArtifactRecord | None:
+        return self.artifacts.get(artifact_id)
+
+    def _artifact_related_refs(self, record: ArtifactRecord) -> set[str]:
+        return set(
+            record.refs
+            + record.connects_to
+            + record.supports
+            + record.contradicts
+            + record.derived_from
+        )
+
+    def _index_artifact(self, record: ArtifactRecord) -> None:
+        self._artifact_ids_by_kind.setdefault(record.kind, set()).add(record.id)
+        self._artifact_ids_by_phase.setdefault(record.phase, set()).add(record.id)
+        self._artifact_ids_by_mode.setdefault(record.mode, set()).add(record.id)
+        for ref in self._artifact_related_refs(record):
+            self._artifact_ids_by_ref.setdefault(ref, set()).add(record.id)
+
+    def _deindex_artifact(self, record: ArtifactRecord) -> None:
+        buckets = (
+            (self._artifact_ids_by_kind, record.kind),
+            (self._artifact_ids_by_phase, record.phase),
+            (self._artifact_ids_by_mode, record.mode),
+        )
+        for bucket_map, key in buckets:
+            ids = bucket_map.get(key)
+            if ids is None:
+                continue
+            ids.discard(record.id)
+            if not ids:
+                bucket_map.pop(key, None)
+        for ref in self._artifact_related_refs(record):
+            ids = self._artifact_ids_by_ref.get(ref)
+            if ids is None:
+                continue
+            ids.discard(record.id)
+            if not ids:
+                self._artifact_ids_by_ref.pop(ref, None)
+
+    @_synchronized
+    def iter_artifact_ids(self, *, reverse: bool = True) -> list[str]:
+        ids = list(self._artifact_order)
+        if reverse:
+            ids.reverse()
+        return ids
+
+    @_synchronized
+    def recent_artifacts(self, limit: int) -> list[ArtifactRecord]:
+        out: list[ArtifactRecord] = []
+        for artifact_id in reversed(self._artifact_order):
+            artifact = self.artifacts.get(artifact_id)
+            if artifact is not None:
+                out.append(artifact)
+            if len(out) >= limit:
+                break
+        return out
+
+    @_synchronized
+    def list_artifacts(
+        self,
+        *,
+        kind: str | None = None,
+        phase: str | None = None,
+        mode: str | None = None,
+        ref: str | None = None,
+        status: str | None = None,
+    ) -> list[ArtifactRecord]:
+        filters: list[set[str]] = []
+        if kind:
+            filters.append(set(self._artifact_ids_by_kind.get(kind, set())))
+        if phase:
+            filters.append(set(self._artifact_ids_by_phase.get(phase, set())))
+        if mode:
+            filters.append(set(self._artifact_ids_by_mode.get(mode, set())))
+        if ref:
+            filters.append(set(self._artifact_ids_by_ref.get(ref, set())))
+
+        candidate_ids: set[str] | None = None
+        for ids in filters:
+            if candidate_ids is None:
+                candidate_ids = ids
+            else:
+                candidate_ids &= ids
+            if not candidate_ids:
+                return []
+
+        ordered: list[ArtifactRecord] = []
+        for artifact_id in reversed(self._artifact_order):
+            if candidate_ids is not None and artifact_id not in candidate_ids:
+                continue
+            artifact = self.artifacts.get(artifact_id)
+            if artifact is None:
+                continue
+            if status is not None and artifact.status != status:
+                continue
+            ordered.append(artifact)
+        return ordered
+
     # ── Mental models ────────────────────────────────────
 
     @_synchronized
@@ -482,15 +701,6 @@ class ThinkingEngine:
     def get_arg_chain(self, chain_id: str) -> list[ArgRecord]:
         return self.args.get(chain_id, [])
 
-    # ── Collaborative reasoning ──────────────────────────
-
-    @_synchronized
-    def upsert_collaboration(self, record: CollabRecord) -> None:
-        self.collaborations[record.session_id] = record
-
-    def get_collaboration(self, session_id: str) -> CollabRecord | None:
-        return self.collaborations.get(session_id)
-
     # ── Scientific method ────────────────────────────────
 
     @_synchronized
@@ -508,20 +718,6 @@ class ThinkingEngine:
 
     def get_monitor(self, monitoring_id: str) -> MonitorRecord | None:
         return self.monitors.get(monitoring_id)
-
-    # ── Visual reasoning ─────────────────────────────────
-
-    @_synchronized
-    def upsert_diagram(self, record: DiagramRecord) -> None:
-        self.diagrams[record.diagram_id] = record
-
-    def get_diagram(self, diagram_id: str) -> DiagramRecord | None:
-        return self.diagrams.get(diagram_id)
-
-    @_synchronized
-    def delete_diagram(self, diagram_id: str) -> bool:
-        """Remove a diagram. Returns True if it existed."""
-        return self.diagrams.pop(diagram_id, None) is not None
 
     # ── Interference Protocol ────────────────────────────
 
@@ -549,6 +745,145 @@ class ThinkingEngine:
                 children = parent.children_by_holarchy.setdefault(hid, [])
                 if node.id not in children:
                     children.append(node.id)
+
+    @_synchronized
+    def add_holons_batch(
+        self,
+        items: list[dict],
+        default_holarchy_id: str,
+    ) -> dict[str, str]:
+        """Atomically create N holons with parent_ref resolution.
+
+        Each item must have:
+            ref: str — temp reference (must be unique within batch)
+            name: str
+            description: str
+        Optional:
+            parent_ref: str | None — either another item's ref OR an
+                existing holon_id. None = root of holarchy.
+            role_in_parent: str
+            context: str
+            rules: list[str]
+            properties: list[str]
+            projection: str
+            holarchy_id: str — overrides default_holarchy_id
+
+        Returns: {ref: holon_id} mapping for all created holons.
+
+        Raises ValueError on: duplicate refs, unresolvable parent_ref,
+        missing required fields, cycles in parent_ref graph.
+        """
+        import uuid as _uuid
+
+        # Phase 1: validate refs are unique + required fields present
+        refs_seen: set[str] = set()
+        for item in items:
+            ref = item.get("ref")
+            if not ref:
+                raise ValueError("Each holon in batch must have a 'ref' field")
+            if ref in refs_seen:
+                raise ValueError(f"Duplicate ref '{ref}' in batch")
+            refs_seen.add(ref)
+            if not item.get("name"):
+                raise ValueError(f"Holon ref='{ref}' missing 'name'")
+            if not item.get("description"):
+                raise ValueError(f"Holon ref='{ref}' missing 'description'")
+
+        # Phase 2: assign uuid IDs + topological sort
+        ref_to_id: dict[str, str] = {ref: _uuid.uuid4().hex[:10] for ref in refs_seen}
+
+        # Build dependency graph: ref -> parent_ref (or None for resolved/external)
+        depends_on: dict[str, str | None] = {}
+        for item in items:
+            ref = item["ref"]
+            pref = item.get("parent_ref")
+            # parent_ref may be (a) None, (b) another item's ref, (c) existing holon_id
+            if pref and pref in refs_seen:
+                depends_on[ref] = pref
+            else:
+                depends_on[ref] = None  # external or root — no batch dependency
+
+        # Topological order: process roots/externals first
+        ordered: list[str] = []
+        visited: set[str] = set()
+        temp_mark: set[str] = set()
+
+        def _visit(r: str) -> None:
+            if r in visited:
+                return
+            if r in temp_mark:
+                raise ValueError(
+                    f"Cycle detected in parent_ref graph at '{r}'"
+                )
+            temp_mark.add(r)
+            dep = depends_on.get(r)
+            if dep is not None:
+                _visit(dep)
+            temp_mark.discard(r)
+            visited.add(r)
+            ordered.append(r)
+
+        for r in refs_seen:
+            _visit(r)
+
+        # Phase 3: create holons in topological order
+        self._cleanup_holon_memory()
+        items_by_ref = {item["ref"]: item for item in items}
+        for ref in ordered:
+            item = items_by_ref[ref]
+            hid = item.get("holarchy_id") or default_holarchy_id
+            pref = item.get("parent_ref")
+            parent_id: str | None
+            level = 0
+            if pref:
+                # Resolve to existing or batch-allocated id
+                parent_id = ref_to_id.get(pref) or pref
+                parent = self.holon_nodes.get(parent_id)
+                if parent is None:
+                    raise ValueError(
+                        f"parent_ref '{pref}' for ref='{ref}' "
+                        "did not resolve to an existing or batched holon"
+                    )
+                # Infer holarchy from parent if not set
+                if not item.get("holarchy_id"):
+                    if parent.memberships:
+                        hid = parent.memberships[0]["holarchy_id"]
+                pm = next(
+                    (m for m in parent.memberships if m["holarchy_id"] == hid),
+                    None,
+                )
+                if pm:
+                    level = pm["level"] + 1
+            else:
+                parent_id = None
+
+            nid = ref_to_id[ref]
+            projection = item.get("projection", "")
+            node = HolonNode(
+                id=nid,
+                name=item["name"],
+                description=item["description"],
+                context=item.get("context", ""),
+                rules=item.get("rules") or [],
+                properties=item.get("properties") or [],
+                memberships=[{
+                    "holarchy_id": hid,
+                    "parent_id": parent_id,
+                    "role_in_parent": item.get("role_in_parent", ""),
+                    "level": level,
+                }],
+                projections={hid: projection} if projection else {},
+            )
+            self.holon_nodes[nid] = node
+            if parent_id is None:
+                self.holon_holarchies[hid] = nid
+            elif parent_id in self.holon_nodes:
+                parent = self.holon_nodes[parent_id]
+                children = parent.children_by_holarchy.setdefault(hid, [])
+                if nid not in children:
+                    children.append(nid)
+
+        return ref_to_id
 
     @_synchronized
     def join_holarchy(
@@ -978,8 +1313,24 @@ class ThinkingEngine:
 
     # ── Summary ──────────────────────────────────────────
 
-    def get_summary(self) -> str:
-        """Return a token-optimized summary of all thinking activity."""
+    def get_summary(self, max_items_per_category: int = 20) -> str:
+        """Return a token-optimized summary of all thinking activity.
+
+        Args:
+            max_items_per_category: Cap on items shown per category.
+                Excess items collapse to "... (N more)" footer. Prevents
+                huge responses on sessions with hundreds of items.
+        """
+        cap = max(1, max_items_per_category)
+
+        def _append_items(lines, items, render):
+            shown = list(items)[:cap]
+            for it in shown:
+                lines.append(render(it))
+            omitted = len(list(items)) - len(shown)
+            if omitted > 0:
+                lines.append(f"- ... ({omitted} more)")
+
         lines: list[str] = ["## Thinking Session Summary"]
 
         # Thought Graphs
@@ -987,7 +1338,8 @@ class ThinkingEngine:
             n_trees = len(self.thought_trees)
             n_nodes = len(self.thought_nodes)
             lines.append(f"\n### Thought Graphs: {n_trees} trees, {n_nodes} nodes")
-            for tid, root_id in self.thought_trees.items():
+            tree_items = list(self.thought_trees.items())
+            for tid, root_id in tree_items[:cap]:
                 root = self.thought_nodes.get(root_id)
                 if root:
                     subtree = self.get_subtree_nodes(root_id)
@@ -1003,51 +1355,63 @@ class ThinkingEngine:
                     if delegated:
                         line += f", {delegated} delegated"
                     lines.append(line)
+            if len(tree_items) > cap:
+                lines.append(f"- ... ({len(tree_items) - cap} more)")
 
         # Models
         if self.models:
             lines.append(f"\n### Mental Models: {len(self.models)} applied")
-            for m in self.models:
-                conclusion_preview = m.conclusion[:100] if m.conclusion else "(no conclusion)"
-                lines.append(f"- {m.model_name}: {conclusion_preview}")
+            _append_items(
+                lines, self.models,
+                lambda m: (
+                    f"- {m.model_name}: "
+                    f"{m.conclusion[:100] if m.conclusion else '(no conclusion)'}"
+                ),
+            )
 
         # Decisions
         if self.decisions:
             lines.append(f"\n### Decisions: {len(self.decisions)}")
-            for d in self.decisions.values():
-                rec_preview = d.recommendation[:100] if d.recommendation else f"stage={d.stage}"
-                lines.append(f"- {d.decision_id}: {rec_preview}")
+            _append_items(
+                lines, self.decisions.values(),
+                lambda d: (
+                    f"- {d.decision_id}: "
+                    f"{d.recommendation[:100] if d.recommendation else f'stage={d.stage}'}"
+                ),
+            )
 
         # Debugs
         if self.debugs:
             lines.append(f"\n### Debugging: {len(self.debugs)} approaches")
-            for d in self.debugs:
-                res_preview = d.resolution[:100] if d.resolution else "(in progress)"
-                lines.append(f"- {d.approach_name} on '{d.issue[:60]}': {res_preview}")
+            _append_items(
+                lines, self.debugs,
+                lambda d: (
+                    f"- {d.approach_name} on "
+                    f"'{d.issue[:60]}': "
+                    f"{d.resolution[:100] if d.resolution else '(in progress)'}"
+                ),
+            )
 
         # Arguments
         if self.args:
             total_args = sum(len(chain) for chain in self.args.values())
             lines.append(f"\n### Argumentation: {len(self.args)} chains, {total_args} arguments")
 
-        # Collaborations
-        if self.collaborations:
-            lines.append(f"\n### Collaborations: {len(self.collaborations)}")
-            for c in self.collaborations.values():
-                lines.append(
-                    f"- {c.topic[:60]}: {len(c.contributions)} contributions, stage={c.stage}"
-                )
-
         # Inquiries
         if self.inquiries:
             lines.append(f"\n### Scientific Inquiries: {len(self.inquiries)}")
-            for inq in self.inquiries.values():
-                lines.append(f"- {inq.inquiry_id}: stage={inq.stage}, iter={inq.iteration}")
+            _append_items(
+                lines, self.inquiries.values(),
+                lambda inq: (
+                    f"- {inq.inquiry_id}: stage={inq.stage}, iter={inq.iteration}"
+                ),
+            )
 
         # Monitors
         if self.monitors:
             lines.append(f"\n### Metacognitive Monitors: {len(self.monitors)}")
-            for mon in self.monitors.values():
+
+            def _mon(mon):  # type: ignore[no-untyped-def]
                 mon_line = (
                     f"- {mon.task[:60]}: confidence={mon.overall_confidence:.2f}, "
                     f"stage={mon.stage}"
@@ -1056,23 +1420,17 @@ class ThinkingEngine:
                     domain = mon.knowledge_assessment.get("domain", "?")
                     level = mon.knowledge_assessment.get("knowledgeLevel", "?")
                     mon_line += f", knowledge={domain}({level})"
-                lines.append(mon_line)
+                return mon_line
 
-        # Diagrams
-        if self.diagrams:
-            lines.append(f"\n### Diagrams: {len(self.diagrams)}")
-            for diag in self.diagrams.values():
-                lines.append(
-                    f"- {diag.diagram_id} ({diag.diagram_type}): "
-                    f"{len(diag.elements)} elements"
-                )
+            _append_items(lines, self.monitors.values(), _mon)
 
         # Interference Protocols
         if self.interferences:
             lines.append(
                 f"\n### Interference Protocols: {len(self.interferences)}"
             )
-            for ip in self.interferences.values():
+
+            def _ip(ip):  # type: ignore[no-untyped-def]
                 ip_line = (
                     f"- {ip.protocol_id}: phase={ip.phase}, "
                     f"iter={ip.iteration}, domain={ip.target_domain[:40]}"
@@ -1083,7 +1441,9 @@ class ThinkingEngine:
                     f", sources={len(ip.source_laws)}, "
                     f"fragments={len(ip.fragments)}"
                 )
-                lines.append(ip_line)
+                return ip_line
+
+            _append_items(lines, self.interferences.values(), _ip)
 
         # Holonic Workspaces
         if self.holon_nodes:

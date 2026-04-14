@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 import duckdb
 import pyarrow as pa
 
-from aismartbuddy.engines import BaseEngine
+from aismartbuddy.engines import BaseEngine, _empty_table_from_schema
 
 logger = logging.getLogger("aismartbuddy.engines.duckdb")
 
@@ -77,7 +77,7 @@ class DuckDBEngine(BaseEngine):
         """Execute a SQL statement and return results as an Arrow Table.
 
         Returns None for DDL/DML that produces no result set.
-        Uses DuckDB's native fetch_arrow_table(), sliced to max_rows to prevent OOM.
+        Uses DuckDB's native to_arrow_table(), sliced to max_rows to prevent OOM.
         """
         conn = self._require_conn()
         result = conn.execute(sql)
@@ -85,10 +85,75 @@ class DuckDBEngine(BaseEngine):
         if result.description is None:
             return None
 
-        table = result.fetch_arrow_table()
+        table = result.to_arrow_table()
         if table.num_rows > self._max_rows:
             table = table.slice(0, self._max_rows)
         return table
+
+    def execute_windowed(
+        self,
+        query: str,
+        offset: int = 0,
+        limit: int | None = None,
+    ) -> tuple[pa.Table | None, bool]:
+        """Execute a SQL query and stream only the requested result window.
+
+        This avoids materializing the full result set for the common
+        non-paginated query path and for offset/limit windows.
+        """
+        conn = self._require_conn()
+        size = limit or self._max_rows
+        result = conn.execute(query)
+
+        if result.description is None:
+            return None, False
+
+        reader = result.to_arrow_reader(batch_size=max(size, 1024))
+        schema = reader.schema
+        remaining_offset = max(0, offset)
+        remaining_limit = max(0, size)
+
+        if remaining_limit == 0:
+            return _empty_table_from_schema(schema), True
+
+        batches: list[pa.RecordBatch] = []
+        has_more = False
+
+        while remaining_limit > 0:
+            try:
+                batch = reader.read_next_batch()
+            except StopIteration:
+                break
+
+            batch_rows = batch.num_rows
+            if remaining_offset >= batch_rows:
+                remaining_offset -= batch_rows
+                continue
+
+            start = remaining_offset
+            available = batch_rows - start
+            take = min(available, remaining_limit)
+            batches.append(batch.slice(start, take))
+            remaining_limit -= take
+            remaining_offset = 0
+
+            if start + take < batch_rows:
+                has_more = True
+                break
+
+            if remaining_limit == 0:
+                try:
+                    next_batch = reader.read_next_batch()
+                except StopIteration:
+                    has_more = False
+                else:
+                    has_more = next_batch.num_rows > 0
+                break
+
+        if not batches:
+            return _empty_table_from_schema(schema), False
+
+        return pa.Table.from_batches(batches, schema=schema), has_more
 
     def execute_paged(
         self, query: str, page_size: int | None = None

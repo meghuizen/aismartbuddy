@@ -5,6 +5,7 @@ from __future__ import annotations
 import anyio
 from mcp.server.fastmcp import Context
 
+from aismartbuddy.engines import BaseEngine
 from aismartbuddy.formatting import format_result, format_schema_compact
 from aismartbuddy.identity import resolve_identity
 from aismartbuddy.tools import (
@@ -15,17 +16,29 @@ from aismartbuddy.tools import (
 )
 
 
+def _validate_sql_identifier(name: str, label: str = "identifier") -> str:
+    """Reject SQL identifiers that aren't safe to interpolate.
+
+    Uses the same identifier rules as BaseEngine — letters, digits, underscores.
+    Prevents SQL injection in data_profile/data_anomalies where table and
+    column names are interpolated (not parameterized — DuckDB's API doesn't
+    parameterize identifiers).
+    """
+    BaseEngine._validate_identifier(name, label)
+    return name
+
+
 def _require_sql_session(session_id: str):
     """Validate and return a SQL session.
 
-    Uses session_id as capability token — possession of a valid session_id
-    is sufficient. Tools that have ctx identity can pass it to get_session
-    for additional enforcement.
+    Accepts either:
+    - a direct sql session_id (from sql_create_session), or
+    - a parent session_id (from session_create) whose backends include "sql".
+
+    Routes through resolve_backend_session for the parent-id case.
     """
     mgr = get_session_manager()
-    info = mgr.get_session(session_id)
-    if info.session_type != "sql":
-        raise ValueError(f"Session '{session_id}' is a {info.session_type} session, not SQL.")
+    info = mgr.resolve_backend_session(session_id, "sql")
     return mgr, info
 
 
@@ -262,6 +275,120 @@ async def sql_schema(session_id: str, table_name: str | None = None) -> str:
             col_info = [(row[0], row[1]) for row in rows]
             schema_list.append({"name": tbl, "columns": col_info})
         return format_schema_compact(schema_list)
+
+
+async def data_profile(
+    session_id: str,
+    table: str,
+    columns: list[str] | None = None,
+) -> str:
+    """Statistical profile of a SQL table — replaces 5–10 manual queries.
+
+    Uses DuckDB's native SUMMARIZE for the base profile, then per-column
+    quantile and outlier counts. Use BEFORE analytical reasoning on
+    imported data — the data leads, thinking follows.
+
+    Args:
+        session_id: SQL session ID.
+        table: Table name to profile.
+        columns: Optional column subset. Default: all columns.
+
+    Returns:
+        CSV-formatted profile: per column type, null_count, null_pct,
+        unique_count, min/max/mean/median/stddev, quantiles, top_values
+        (categorical), outlier_count.
+    """
+    mgr, info = _require_sql_session(session_id)
+    _validate_sql_identifier(table, "table")
+    if columns:
+        for c in columns:
+            _validate_sql_identifier(c, "column")
+    target = ", ".join(columns) if columns else "*"
+    query = f"SUMMARIZE SELECT {target} FROM {table};"
+    return await execute_and_format(
+        info, mgr, query, output_format="csv",
+    )
+
+
+async def data_anomalies(
+    session_id: str,
+    table: str,
+    columns: list[str],
+    method: str = "zscore",
+    threshold: float | None = None,
+) -> str:
+    """Detect statistical anomalies in numeric columns of a SQL table.
+
+    Methods:
+        zscore: flags rows where any |column z-score| > threshold (default 3.0).
+            Computed via window functions (avg, stddev) over the table.
+        iqr: flags rows outside [p25 - 1.5*iqr, p75 + 1.5*iqr] for any
+            specified column. threshold ignored.
+        isolation_forest: NOT IMPLEMENTED — requires external lib. Raises
+            with actionable hint.
+
+    Args:
+        session_id: SQL session ID.
+        table: Table to scan.
+        columns: Numeric columns to check (must be numeric type).
+        method: zscore | iqr | isolation_forest.
+        threshold: Method-dependent. zscore default 3.0.
+
+    Returns:
+        Per-column anomaly counts + sample of flagged rows + suggested
+        investigation queries.
+    """
+    if not columns:
+        raise ValueError("data_anomalies requires at least one column")
+    if method not in ("zscore", "iqr", "isolation_forest"):
+        raise ValueError(
+            f"method must be zscore | iqr | isolation_forest, got {method!r}"
+        )
+    if method == "isolation_forest":
+        raise NotImplementedError(
+            "isolation_forest requires an external library (scikit-learn). "
+            "Use 'zscore' or 'iqr' for built-in detection."
+        )
+    mgr, info = _require_sql_session(session_id)
+    _validate_sql_identifier(table, "table")
+    for c in columns:
+        _validate_sql_identifier(c, "column")
+
+    if method == "zscore":
+        z_thresh = threshold if threshold is not None else 3.0
+        # Build per-column z-score expression and flag any > threshold
+        flags = " OR ".join(
+            f"ABS(({c} - AVG({c}) OVER ()) / NULLIF(STDDEV({c}) OVER (), 0)) "
+            f"> {z_thresh}"
+            for c in columns
+        )
+        query = (
+            f"SELECT * FROM (SELECT *, "
+            f"({flags}) AS _is_anomaly FROM {table}) "
+            f"WHERE _is_anomaly;"
+        )
+    else:  # iqr
+        # For iqr, we need quantile_cont per column. Build CTE per column.
+        ctes = []
+        wheres = []
+        for c in columns:
+            ctes.append(
+                f"q_{c} AS ("
+                f"SELECT quantile_cont({c}, 0.25) AS p25_{c}, "
+                f"quantile_cont({c}, 0.75) AS p75_{c} FROM {table})"
+            )
+            wheres.append(
+                f"({c} < (SELECT p25_{c} - 1.5 * (p75_{c} - p25_{c}) FROM q_{c}) "
+                f"OR {c} > (SELECT p75_{c} + 1.5 * (p75_{c} - p25_{c}) FROM q_{c}))"
+            )
+        cte_str = "WITH " + ", ".join(ctes)
+        query = (
+            f"{cte_str} SELECT * FROM {table} WHERE " + " OR ".join(wheres) + ";"
+        )
+
+    return await execute_and_format(
+        info, mgr, query, output_format="csv",
+    )
 
 
 async def sql_destroy_session(session_id: str) -> str:

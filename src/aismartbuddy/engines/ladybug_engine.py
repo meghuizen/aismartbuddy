@@ -7,7 +7,7 @@ import logging
 import pyarrow as pa
 import real_ladybug as lb
 
-from aismartbuddy.engines import BaseEngine
+from aismartbuddy.engines import BaseEngine, tuples_to_arrow
 
 logger = logging.getLogger("aismartbuddy.engines.ladybug")
 
@@ -115,6 +115,47 @@ class LadybugEngine(BaseEngine):
             table = table.slice(0, self._max_rows)
         return table
 
+    def execute_windowed(
+        self,
+        query: str,
+        offset: int = 0,
+        limit: int | None = None,
+    ) -> tuple[pa.Table | None, bool]:
+        """Execute a Cypher query and return only the requested result window.
+
+        LadybugDB does not expose a streaming Arrow reader, so this uses the
+        row iterator (`has_next` / `get_next`) to skip the requested offset,
+        collect only the requested rows, and detect `has_more` with one
+        additional row read.
+        """
+        conn = self._require_conn()
+        raw = conn.execute(query)
+        result = self._extract_result(raw)
+        if result is None:
+            return None, False
+
+        try:
+            columns = result.get_column_names()
+        except (AttributeError, RuntimeError):
+            return None, False
+
+        remaining_offset = max(0, offset)
+        remaining_limit = max(0, limit or self._max_rows)
+
+        while remaining_offset > 0 and result.has_next():
+            result.get_next()
+            remaining_offset -= 1
+
+        if remaining_limit == 0:
+            return tuples_to_arrow(columns, []), result.has_next()
+
+        rows: list[tuple] = []
+        while result.has_next() and len(rows) < remaining_limit:
+            rows.append(tuple(result.get_next()))
+
+        has_more = result.has_next()
+        return tuples_to_arrow(columns, rows), has_more
+
     # Pagination: LadybugDB uses inherited BaseEngine.execute_paged() and
     # BaseEngine.fetch_next_page() which materialize via Polars iter_slices.
     # No streaming Arrow reader available, so the base implementation is optimal.
@@ -205,12 +246,21 @@ class LadybugEngine(BaseEngine):
         if not schema_rows:
             return {"node_tables": {}, "rel_tables": {}, "total_nodes": 0, "total_edges": 0}
 
+        # Ladybug's show_tables() currently returns:
+        #   (id, name, type, database name, comment)
+        # but older/alternate builds may omit the leading id column. Resolve
+        # by column name first so counting logic does not accidentally treat
+        # the numeric id as a table label.
+        col_lookup = {str(name).strip().lower(): idx for idx, name in enumerate(schema_cols)}
+        name_idx = col_lookup.get("name", 0)
+        type_idx = col_lookup.get("type", 1 if len(schema_cols) > 1 else 0)
+
         node_tables: dict[str, int] = {}
         rel_tables: dict[str, int] = {}
 
         for row in schema_rows:
-            table_name = str(row[0]) if row else ""
-            table_type = str(row[1]) if len(row) > 1 else ""
+            table_name = str(row[name_idx]) if len(row) > name_idx else ""
+            table_type = str(row[type_idx]) if len(row) > type_idx else ""
 
             if not table_name:
                 continue

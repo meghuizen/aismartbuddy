@@ -53,6 +53,37 @@ class BaseEngine(ABC):
             return None
         return tuples_to_arrow(columns, rows)
 
+    def execute_windowed(
+        self,
+        query: str,
+        offset: int = 0,
+        limit: int | None = None,
+    ) -> tuple[pa.Table | None, bool]:
+        """Execute a query and return only the requested result window.
+
+        Returns `(table, has_more)` where `has_more` indicates whether rows remain
+        beyond the returned window. Subclasses can override this with native
+        streaming support; the default implementation materializes via
+        `execute_arrow()` and slices afterward.
+        """
+        size = limit or self._max_rows
+        table = self.execute_arrow(query)
+        if table is None:
+            return None, False
+
+        total_rows = table.num_rows
+        start = max(0, offset)
+        if start >= total_rows:
+            return _empty_table_from_schema(table.schema), False
+
+        length = max(0, size)
+        if length == 0:
+            return _empty_table_from_schema(table.schema), start < total_rows
+
+        window = table.slice(start, length)
+        has_more = start + window.num_rows < total_rows
+        return window, has_more
+
     def execute_paged(
         self, query: str, page_size: int | None = None
     ) -> tuple[str, pa.Table | None]:
@@ -186,3 +217,12 @@ def tuples_to_arrow(columns: list[str], rows: list[tuple]) -> pa.Table:
     col_data = list(zip(*rows))
     arrays = [pa.array(list(col)) for col in col_data]
     return pa.table(dict(zip(unique_cols, arrays)))
+
+
+def _empty_table_from_schema(schema: pa.Schema) -> pa.Table:
+    """Create an empty Arrow table that preserves the provided schema."""
+    arrays = {
+        field.name: pa.array([], type=field.type)
+        for field in schema
+    }
+    return pa.table(arrays, schema=schema)

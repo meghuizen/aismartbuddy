@@ -1,0 +1,15 @@
+{
+  "rubric_id": "code_review",
+  "description": "Code review — correctness, readability, tests, error handling, performance.",
+  "dimensions": [
+    {"id": "correctness", "description": "Code does what it claims to do", "weight": 1.0, "required": true},
+    {"id": "readability", "description": "Names, structure, comments are clear", "weight": 0.7, "required": false},
+    {"id": "tests", "description": "Adequate test coverage for new behavior", "weight": 0.8, "required": true},
+    {"id": "error_handling", "description": "Failures handled or surfaced explicitly", "weight": 0.7, "required": true},
+    {"id": "performance", "description": "No obvious performance regressions", "weight": 0.4, "required": false}
+  ],
+  "severity_levels": ["critical", "high", "moderate", "low"],
+  "severity_deductions": {"critical": 3.0, "high": 2.0, "moderate": 1.0, "low": 0.3},
+  "pass_threshold": 8.5,
+  "scoring_strategy": "weighted_deduction"
+}

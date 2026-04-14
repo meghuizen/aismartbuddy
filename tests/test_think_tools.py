@@ -8,10 +8,8 @@ from aismartbuddy.engines.thinking_engine import (
     MAX_NODES,
     MAX_TREES,
     ArgRecord,
-    CollabRecord,
     DebugRecord,
     DecisionRecord,
-    DiagramRecord,
     InquiryRecord,
     ModelRecord,
     MonitorRecord,
@@ -21,20 +19,17 @@ from aismartbuddy.engines.thinking_engine import (
 from aismartbuddy.session import SessionManager
 from aismartbuddy.tools.think import (
     think_argue,
-    think_collaborate,
     think_debug,
     think_decide,
     think_destroy_session,
     think_graph,
     think_graph_delegate,
-    think_graph_validate,
     think_interfere,
     think_interfere_state,
     think_model,
     think_monitor,
     think_science,
     think_summarize,
-    think_visualize,
 )
 
 # ── ThinkingEngine unit tests ────────────────────────────────
@@ -173,12 +168,6 @@ class TestThinkingEngine:
         )
         assert len(engine.get_arg_chain("chain1")) == 2
 
-    def test_collaboration(self, engine: ThinkingEngine):
-        engine.upsert_collaboration(CollabRecord(
-            session_id="c1", topic="Design review"
-        ))
-        assert engine.get_collaboration("c1") is not None
-
     def test_inquiry(self, engine: ThinkingEngine):
         engine.upsert_inquiry(InquiryRecord(
             inquiry_id="i1", stage="observation"
@@ -190,13 +179,6 @@ class TestThinkingEngine:
             monitoring_id="m1", task="Test task"
         ))
         assert engine.get_monitor("m1").task == "Test task"
-
-    def test_diagram(self, engine: ThinkingEngine):
-        engine.upsert_diagram(DiagramRecord(
-            diagram_id="d1", diagram_type="flowchart",
-            elements=[{"id": "n1", "type": "node", "properties": {}}],
-        ))
-        assert engine.get_diagram("d1") is not None
 
     def test_summary_empty(self, engine: ThinkingEngine):
         assert "Empty thinking session" in engine.get_summary()
@@ -252,16 +234,6 @@ class TestThinkSessionIntegration:
 
 
 # ── Tool-level integration tests (async) ─────────────────────
-
-
-@pytest.fixture
-def _init_session_manager(session_manager: SessionManager):
-    """Wire up the module-level singleton so tools can find it."""
-    import aismartbuddy.session as session_mod
-
-    session_mod.session_manager = session_manager
-    yield
-    session_mod.session_manager = None
 
 
 def _extract_field(result: str, prefix: str) -> str:
@@ -392,84 +364,6 @@ class TestThoughtGraph:
         )
         assert "Status: added" in r2
 
-    @pytest.mark.anyio
-    async def test_validate_dependencies(self):
-        r1 = await think_graph(thought="Task A")
-        sid = _extract_field(r1, "Session:")
-        node_a = _extract_field(r1, "Node:")
-
-        r2 = await think_graph(
-            thought="Task B", session_id=sid, depends_on=[node_a],
-        )
-        node_b = _extract_field(r2, "Node:")
-
-        r = await think_graph_validate(
-            session_id=sid, target_id=node_b,
-            check_type="dependencies", result="pass",
-            details="All dependencies exist and are acyclic.",
-        )
-        assert "dependencies = pass" in r
-
-
-@pytest.mark.usefixtures("_init_session_manager")
-class TestThoughtGraphValidate:
-    @pytest.mark.anyio
-    async def test_validate_coverage(self):
-        r1 = await think_graph(thought="Root problem")
-        sid = _extract_field(r1, "Session:")
-        nid = _extract_field(r1, "Node:")
-
-        r = await think_graph_validate(
-            session_id=sid, target_id=nid,
-            check_type="coverage", result="pass",
-            details="Children cover all aspects of the problem.",
-        )
-        assert "Validation: coverage = pass" in r
-        assert "Total checks on node: 1" in r
-
-    @pytest.mark.anyio
-    async def test_validate_multiple_checks(self):
-        r1 = await think_graph(thought="Root")
-        sid = _extract_field(r1, "Session:")
-        nid = _extract_field(r1, "Node:")
-
-        await think_graph_validate(
-            session_id=sid, target_id=nid,
-            check_type="coverage", result="pass", details="OK",
-        )
-        r = await think_graph_validate(
-            session_id=sid, target_id=nid,
-            check_type="gaps", result="warning",
-            details="Missing edge case analysis.",
-            suggestions=["Add error handling branch"],
-        )
-        assert "Total checks on node: 2" in r
-
-    @pytest.mark.anyio
-    async def test_invalid_check_type(self):
-        r1 = await think_graph(thought="Root")
-        sid = _extract_field(r1, "Session:")
-        nid = _extract_field(r1, "Node:")
-
-        with pytest.raises(ValueError, match="Invalid check_type"):
-            await think_graph_validate(
-                session_id=sid, target_id=nid,
-                check_type="vibes", result="pass", details="nope",
-            )
-
-    @pytest.mark.anyio
-    async def test_invalid_result(self):
-        r1 = await think_graph(thought="Root")
-        sid = _extract_field(r1, "Session:")
-        nid = _extract_field(r1, "Node:")
-
-        with pytest.raises(ValueError, match="Invalid result"):
-            await think_graph_validate(
-                session_id=sid, target_id=nid,
-                check_type="coverage", result="maybe", details="hmm",
-            )
-
-
 @pytest.mark.usefixtures("_init_session_manager")
 class TestThoughtGraphDelegate:
     @pytest.mark.anyio
@@ -587,6 +481,53 @@ class TestThinkDecideTool:
                 decision_id="x", iteration=0, next_stage_needed=False,
             )
 
+    # ── items[] strict batch form ────────────────────────────
+
+    @pytest.mark.anyio
+    async def test_items_batch(self):
+        r = await think_decide(items=[
+            {
+                "id": "d1",
+                "decision_statement": "Adopt new build tool?",
+                "options": [
+                    {"name": "keep", "description": "stay with maven"},
+                    {"name": "switch", "description": "move to bazel"},
+                ],
+                "criteria": [{"name": "speed", "weight": 0.7}],
+                "recommendation": "switch — bazel is 3x faster",
+            },
+        ])
+        assert "Decisions: 1" in r and "d1" in r
+
+    @pytest.mark.anyio
+    async def test_items_options_too_few_rejected(self):
+        with pytest.raises(ValueError, match="at least 2 options"):
+            await think_decide(items=[
+                {
+                    "id": "x",
+                    "decision_statement": "test",
+                    "options": [{"name": "only", "description": "one"}],
+                    "criteria": [{"name": "c", "weight": 1.0}],
+                    "recommendation": "r",
+                },
+            ])
+
+    @pytest.mark.anyio
+    async def test_items_criteria_missing_weight_rejected(self):
+        with pytest.raises(ValueError, match="missing 'weight'"):
+            await think_decide(items=[
+                {
+                    "id": "x",
+                    "decision_statement": "test",
+                    "options": [
+                        {"name": "a", "description": "a"},
+                        {"name": "b", "description": "b"},
+                    ],
+                    "criteria": [{"name": "c"}],
+                    "recommendation": "r",
+                },
+            ])
+
 
 @pytest.mark.usefixtures("_init_session_manager")
 class TestThinkModelTool:
@@ -689,6 +630,106 @@ class TestThinkModelTool:
         assert "Root Cause" in result
         assert "Why" in result
 
+    # ── items[] strict batch form ────────────────────────────
+
+    @pytest.mark.anyio
+    async def test_items_batch_three(self):
+        items = [
+            {
+                "id": f"p{i}", "problem": f"sub-problem {i}",
+                "steps": [f"step {i}.1"], "reasoning": "because",
+                "conclusion": f"therefore {i}",
+            }
+            for i in range(3)
+        ]
+        r = await think_model(model_name="first_principles", items=items)
+        assert "Items: 3" in r
+        for i in range(3):
+            assert f"p{i}" in r
+
+    @pytest.mark.anyio
+    async def test_items_missing_required_rejected(self):
+        with pytest.raises(ValueError, match="missing required 'reasoning'"):
+            await think_model(
+                model_name="first_principles",
+                items=[{
+                    "id": "x", "problem": "p", "steps": ["s"],
+                    "conclusion": "c",
+                }],
+            )
+
+    @pytest.mark.anyio
+    async def test_items_empty_steps_rejected(self):
+        with pytest.raises(ValueError, match="missing required 'steps'"):
+            await think_model(
+                model_name="first_principles",
+                items=[{
+                    "id": "x", "problem": "p", "steps": [],
+                    "reasoning": "r", "conclusion": "c",
+                }],
+            )
+
+    @pytest.mark.anyio
+    async def test_items_duplicate_id_rejected(self):
+        with pytest.raises(ValueError, match="duplicate id 'dup'"):
+            await think_model(
+                model_name="first_principles",
+                items=[
+                    {
+                        "id": "dup", "problem": "p1", "steps": ["s"],
+                        "reasoning": "r", "conclusion": "c",
+                    },
+                    {
+                        "id": "dup", "problem": "p2", "steps": ["s"],
+                        "reasoning": "r", "conclusion": "c",
+                    },
+                ],
+            )
+
+    @pytest.mark.anyio
+    async def test_items_auto_graph_requires_session(self):
+        with pytest.raises(ValueError, match="explicit unified session_id"):
+            await think_model(
+                model_name="first_principles",
+                items=[{
+                    "id": "x", "problem": "p", "steps": ["s"],
+                    "reasoning": "r", "conclusion": "c",
+                }],
+                auto_graph=True,
+            )
+
+    @pytest.mark.anyio
+    async def test_items_auto_graph_with_unified_session(self):
+        from aismartbuddy.tools.infra import session_create
+
+        r1 = await session_create(backends=["think", "graph"])
+        sid = ""
+        for line in r1.split("\n"):
+            line = line.strip()
+            if line.startswith("session_id:"):
+                sid = line[len("session_id:"):].strip()
+                break
+        assert sid
+
+        r2 = await think_model(
+            model_name="first_principles",
+            session_id=sid,
+            auto_graph=True,
+            items=[
+                {
+                    "id": "concept_a", "problem": "P A", "steps": ["s1"],
+                    "reasoning": "because", "conclusion": "therefore A",
+                },
+                {
+                    "id": "concept_b", "problem": "P B", "steps": ["s1"],
+                    "reasoning": "because", "conclusion": "therefore B",
+                    "connects_to": ["concept_a"],
+                },
+            ],
+        )
+        assert "Items: 2" in r2
+        assert "Graph nodes created: 2" in r2
+
 
 @pytest.mark.usefixtures("_init_session_manager")
 class TestThinkDebugTool:
@@ -704,6 +745,32 @@ class TestThinkDebugTool:
     async def test_invalid_approach(self):
         with pytest.raises(ValueError, match="Invalid approach_name"):
             await think_debug(approach_name="magic", issue="test")
+
+    # ── items[] strict batch form ────────────────────────────
+
+    @pytest.mark.anyio
+    async def test_items_batch(self):
+        r = await think_debug(items=[
+            {
+                "id": "bug1", "approach": "binary_search",
+                "issue": "auth fails on token refresh",
+                "steps": ["bisect commits"],
+                "findings": "regression in commit abc",
+                "resolution": "revert abc, retry",
+            },
+        ])
+        assert "Debugs: 1" in r and "bug1" in r
+
+    @pytest.mark.anyio
+    async def test_items_invalid_approach_rejected(self):
+        with pytest.raises(ValueError, match="invalid"):
+            await think_debug(items=[
+                {
+                    "id": "x", "approach": "magic",
+                    "issue": "i", "steps": ["s"],
+                    "findings": "f", "resolution": "r",
+                },
+            ])
 
 
 @pytest.mark.usefixtures("_init_session_manager")
@@ -727,27 +794,25 @@ class TestThinkArgueTool:
             )
 
 
-@pytest.mark.usefixtures("_init_session_manager")
-class TestThinkCollaborateTool:
-    @pytest.mark.anyio
-    async def test_collaboration(self):
-        result = await think_collaborate(
-            topic="API design review",
-            personas=[{
-                "id": "arch", "name": "Architect",
-                "expertise": ["API"], "background": "10y",
-                "perspective": "Clean", "biases": [],
-                "communication": {"style": "technical", "tone": "analytical"},
-            }],
-            contributions=[{
-                "personaId": "arch", "content": "Surface too large.",
-                "type": "concern", "confidence": 0.8,
-            }],
-            stage="critique", active_persona_id="arch",
-            collaboration_id="r-1", iteration=1,
-            next_contribution_needed=True,
-        )
-        assert "Collab: r-1" in result
+def _good_hyp_item(id_: str = "h1") -> dict:
+    return {
+        "id": id_,
+        "observation": "X correlates with Y in 80% of trials.",
+        "question": "Does X cause Y?",
+        "hypothesis": {
+            "statement": "X causes Y via mechanism M",
+            "variables": [
+                {"name": "X", "role": "independent"},
+                {"name": "Y", "role": "dependent"},
+            ],
+            "assumptions": ["M is reproducible across labs"],
+            "confidence": 0.6,
+            "falsifiability": (
+                "If suppressing X with antagonist Z still produces Y in "
+                ">50% of trials, the hypothesis is falsified."
+            ),
+        },
+    }
 
 
 @pytest.mark.usefixtures("_init_session_manager")
@@ -760,6 +825,38 @@ class TestThinkScienceTool:
             hypothesis={"statement": "Index will fix it", "variables": []},
         )
         assert "Inquiry: perf-test" in result
+
+    @pytest.mark.anyio
+    async def test_items_batch(self):
+        items = [_good_hyp_item(f"h{i}") for i in range(3)]
+        r = await think_science(items=items)
+        assert "Hypotheses: 3" in r
+        for i in range(3):
+            assert f"h{i}" in r
+
+    @pytest.mark.anyio
+    async def test_items_short_falsifiability_rejected(self):
+        bad = _good_hyp_item()
+        bad["hypothesis"]["falsifiability"] = "N/A"
+        with pytest.raises(ValueError, match="≥ 20 chars"):
+            await think_science(items=[bad])
+
+    @pytest.mark.anyio
+    async def test_items_invalid_variable_role_rejected(self):
+        bad = _good_hyp_item()
+        bad["hypothesis"]["variables"][0]["role"] = "guess"
+        with pytest.raises(
+            ValueError,
+            match="independent.dependent.controlled",
+        ):
+            await think_science(items=[bad])
+
+    @pytest.mark.anyio
+    async def test_items_empty_assumptions_rejected(self):
+        bad = _good_hyp_item()
+        bad["hypothesis"]["assumptions"] = []
+        with pytest.raises(ValueError, match="assumptions"):
+            await think_science(items=[bad])
 
 
 @pytest.mark.usefixtures("_init_session_manager")
@@ -803,33 +900,204 @@ class TestThinkMonitorTool:
                 },
             )
 
+    # ── items[] strict batch form ────────────────────────────
+
+    GOOD_K = {
+        "domain": "RNA biology",
+        "level": "familiar",
+        "confidence": 0.6,
+        "limitations": [
+            "No hands-on lab experience",
+            "Recent literature beyond cutoff is unknown",
+        ],
+    }
+    GOOD_CLAIMS = [
+        {
+            "claim": "rRNA is the most abundant RNA",
+            "status": "fact", "confidence": 0.95, "evidence": "textbook",
+        },
+        {
+            "claim": "X causes Y",
+            "status": "speculation", "confidence": 0.4,
+            "evidence": "weak correlation",
+        },
+    ]
+
+    @pytest.mark.anyio
+    async def test_items_basic(self):
+        r = await think_monitor(items=[
+            {
+                "id": "a1", "task": "Analyze RNA pathways",
+                "knowledge": self.GOOD_K, "claims": self.GOOD_CLAIMS,
+            },
+        ])
+        assert "Assessments: 1" in r
+        assert "a1" in r
+
+    @pytest.mark.anyio
+    async def test_items_empty_limitations_rejected(self):
+        bad_k = {**self.GOOD_K, "limitations": []}
+        with pytest.raises(ValueError, match="non-empty"):
+            await think_monitor(items=[
+                {
+                    "id": "x", "task": "t",
+                    "knowledge": bad_k, "claims": self.GOOD_CLAIMS,
+                },
+            ])
+
+    @pytest.mark.anyio
+    async def test_items_invalid_level_rejected(self):
+        bad_k = {**self.GOOD_K, "level": "wizard"}
+        with pytest.raises(ValueError, match="level must be one of"):
+            await think_monitor(items=[
+                {
+                    "id": "x", "task": "t",
+                    "knowledge": bad_k, "claims": self.GOOD_CLAIMS,
+                },
+            ])
+
+    @pytest.mark.anyio
+    async def test_items_invalid_claim_status_rejected(self):
+        bad_claims = [
+            {"claim": "c", "status": "guess", "confidence": 0.5,
+             "evidence": "e"},
+        ]
+        with pytest.raises(ValueError, match="status must be one of"):
+            await think_monitor(items=[
+                {
+                    "id": "x", "task": "t",
+                    "knowledge": self.GOOD_K, "claims": bad_claims,
+                },
+            ])
+
 
 @pytest.mark.usefixtures("_init_session_manager")
-class TestThinkVisualizeTool:
-    @pytest.mark.anyio
-    async def test_create_diagram(self):
-        result = await think_visualize(
-            operation="create", diagram_id="arch",
-            diagram_type="flowchart", iteration=1,
-            next_operation_needed=True,
-            elements=[{"id": "n1", "type": "node", "properties": {}}],
-        )
-        assert "Diagram: arch" in result
+class TestThinkGraphBatch:
+    """think_graph(children=[...]) creates parent + N children atomically."""
 
     @pytest.mark.anyio
-    async def test_delete_diagram(self):
-        r1 = await think_visualize(
-            operation="create", diagram_id="tmp",
-            diagram_type="graph", iteration=1,
-            next_operation_needed=True,
+    async def test_branch_with_three_children(self):
+        r = await think_graph(
+            thought="IPM vs GO coherence",
+            action="branch",
+            children=[
+                {"thought": "TENSION 1: scoping"},
+                {"thought": "TENSION 2: interaction"},
+                {"thought": "TENSION 3: inheritance"},
+            ],
         )
-        sid = _extract_field(r1, "Session:")
-        r2 = await think_visualize(
-            operation="delete", diagram_id="tmp",
-            diagram_type="graph", iteration=2,
-            next_operation_needed=False, session_id=sid,
+        assert "Batch: 3 children created" in r
+        # All three children IDs returned
+        children_line = next(
+            (ln for ln in r.split("\n") if ln.startswith("Children: ")), ""
         )
-        assert "Deleted" in r2
+        cids = [c.strip() for c in children_line[len("Children: "):].split(",")]
+        assert len(cids) == 3
+        # Each ID is a 10-char hex
+        for cid in cids:
+            assert len(cid) == 10
+
+    @pytest.mark.anyio
+    async def test_empty_children_field_rejected(self):
+        with pytest.raises(ValueError, match="non-empty 'thought'"):
+            await think_graph(
+                thought="parent",
+                children=[{"thought": ""}],
+            )
+
+    @pytest.mark.anyio
+    async def test_expected_children_warning_on_synthesize_mismatch(self):
+        # Create branch with expected_children=4
+        r = await think_graph(
+            thought="branch root",
+            action="branch",
+            expected_children=4,
+        )
+        sid = _extract_field(r, "Session:")
+        parent_id = _extract_field(r, "Node:")
+        # Add only 2 children
+        await think_graph(
+            thought="child A", parent_id=parent_id, session_id=sid,
+        )
+        await think_graph(
+            thought="child B", parent_id=parent_id, session_id=sid,
+        )
+        # Synthesize — should warn about 2 != 4
+        synth = await think_graph(
+            thought="synth conclusion",
+            action="synthesize",
+            parent_id=parent_id,
+            session_id=sid,
+        )
+        assert "expected 4 children" in synth
+        assert "found 3" in synth  # 2 + the synthesize itself = 3
+
+
+@pytest.mark.usefixtures("_init_session_manager")
+class TestThinkArgueChain:
+    """think_argue(chain=[...]) submits full dialectic in one call."""
+
+    @pytest.mark.anyio
+    async def test_thesis_antithesis_synthesis_chain(self):
+        from aismartbuddy.tools.think import think_argue
+
+        r = await think_argue(
+            chain=[
+                {
+                    "type": "thesis",
+                    "claim": "X is good",
+                    "premises": ["evidence A"],
+                    "conclusion": "Adopt X",
+                    "confidence": 0.7,
+                },
+                {
+                    "type": "antithesis",
+                    "claim": "X is bad",
+                    "premises": ["evidence B"],
+                    "conclusion": "Reject X",
+                    "confidence": 0.6,
+                    "responds_to_index": 0,
+                },
+                {
+                    "type": "synthesis",
+                    "claim": "Adopt X with caveat",
+                    "premises": ["combine A and B"],
+                    "conclusion": "Adopt X under condition Y",
+                    "confidence": 0.8,
+                    "responds_to_index": 1,
+                },
+            ],
+        )
+        assert "Batch: 3 arguments" in r
+        assert "Chain: " in r
+
+    @pytest.mark.anyio
+    async def test_chain_responds_to_invalid_index_rejected(self):
+        from aismartbuddy.tools.think import think_argue
+
+        with pytest.raises(ValueError, match="must reference a prior"):
+            await think_argue(
+                chain=[
+                    {
+                        "type": "thesis", "claim": "c", "premises": ["p"],
+                        "conclusion": "x", "responds_to_index": 5,
+                    },
+                ],
+            )
+
+    @pytest.mark.anyio
+    async def test_chain_missing_premises_rejected(self):
+        from aismartbuddy.tools.think import think_argue
+
+        with pytest.raises(ValueError, match="premises"):
+            await think_argue(
+                chain=[
+                    {
+                        "type": "thesis", "claim": "c",
+                        "conclusion": "x",
+                    },
+                ],
+            )
 
 
 @pytest.mark.usefixtures("_init_session_manager")
@@ -846,8 +1114,34 @@ class TestThinkSummarizeTool:
         self, session_manager: SessionManager
     ):
         info = session_manager.create_session("sql")
-        with pytest.raises(ValueError, match="not a thinking session"):
+        with pytest.raises(ValueError, match="not think"):
             await think_summarize(info.session_id)
+
+    @pytest.mark.anyio
+    async def test_summarize_caps_items_per_category(self):
+        """Creating >cap thought trees collapses excess to '... (N more)'."""
+        from aismartbuddy.tools.think import think_graph
+
+        r = await think_graph(thought="Tree 0", action="branch")
+        sid = _extract_field(r, "Session:")
+        # Create 25 more branch trees so we exceed the cap of 5
+        for i in range(1, 26):
+            await think_graph(
+                thought=f"Tree {i}", action="branch", session_id=sid,
+            )
+        summary = await think_summarize(sid, max_items_per_category=5)
+        assert "Thought Graphs" in summary
+        # Count lines inside Thought Graphs section beginning with "- "
+        sections = summary.split("\n\n")
+        graphs_section = next(
+            (s for s in sections if "Thought Graphs" in s), ""
+        )
+        item_lines = [
+            ln for ln in graphs_section.split("\n") if ln.startswith("- ")
+        ]
+        # 5 shown + 1 "... (N more)" footer = 6 total
+        assert len(item_lines) <= 6, item_lines
+        assert any("more)" in ln for ln in item_lines)
 
 
 @pytest.mark.usefixtures("_init_session_manager")
@@ -864,7 +1158,7 @@ class TestThinkDestroyTool:
         self, session_manager: SessionManager
     ):
         info = session_manager.create_session("sql")
-        with pytest.raises(ValueError, match="not a thinking session"):
+        with pytest.raises(ValueError, match="not think"):
             await think_destroy_session(info.session_id)
 
 
@@ -1091,3 +1385,49 @@ class TestInterferenceProtocol:
         )
         state2 = await think_interfere_state(session_id=sid, protocol_id=pid2)
         assert "Frame for A only" not in state2
+
+
+@pytest.mark.usefixtures("_init_session_manager")
+class TestThinkGraphMinChildren:
+    @pytest.mark.anyio
+    async def test_below_min_children_rejected(self):
+        with pytest.raises(ValueError, match="min_children=5"):
+            await think_graph(
+                thought="root", action="branch",
+                children=[{"thought": "c1"}, {"thought": "c2"}],
+                min_children=5,
+            )
+
+    @pytest.mark.anyio
+    async def test_at_min_children_succeeds(self):
+        r = await think_graph(
+            thought="root", action="branch",
+            children=[{"thought": f"c{i}"} for i in range(5)],
+            min_children=5,
+        )
+        assert "Batch: 5 children created" in r
+
+
+@pytest.mark.usefixtures("_init_session_manager")
+class TestThinkRefsQuery:
+    @pytest.mark.anyio
+    async def test_returns_no_refs_for_unknown_id(self):
+        from aismartbuddy.tools.refs import think_refs_query
+
+        r = await think_refs_query(entity_id="nonexistent_id_xyz")
+        assert "Total refs: 0" in r
+        assert "No records reference this id" in r
+
+    @pytest.mark.anyio
+    async def test_finds_thought_node_with_ref(self):
+        from aismartbuddy.tools.refs import think_refs_query
+
+        r1 = await think_graph(
+            thought="leaf", refs=["scaffold_item_42"],
+        )
+        sid = _extract_field(r1, "Session:")
+        r = await think_refs_query(
+            entity_id="scaffold_item_42", session_id=sid,
+        )
+        assert "Total refs: 1" in r
+        assert "thought_nodes" in r

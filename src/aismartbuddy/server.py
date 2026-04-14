@@ -24,9 +24,7 @@ async def _periodic_cleanup(interval: int = 300) -> None:
         await anyio.sleep(interval)
         try:
             if session_mod.session_manager is not None:
-                count = await anyio.to_thread.run_sync(
-                    session_mod.session_manager.cleanup_expired
-                )
+                count = await anyio.to_thread.run_sync(session_mod.session_manager.cleanup_expired)
                 if count > 0:
                     logger.info("Periodic cleanup removed %d expired sessions", count)
         except Exception:
@@ -60,9 +58,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[None]:
     try:
         yt_mod.youtube_client = yt_mod.YouTubeClient.create()
     except Exception:
-        logger.exception(
-            "YouTubeClient init failed; get_youtube_information will be unavailable"
-        )
+        logger.exception("YouTubeClient init failed; get_youtube_information will be unavailable")
         yt_mod.youtube_client = None
 
     async with anyio.create_task_group() as tg:
@@ -121,13 +117,8 @@ def _maybe_build_entra_auth() -> tuple[object | None, object | None]:
     )
     auth_settings = AuthSettings(
         issuer_url=verifier.issuer,
-        resource_server_url=(
-            rc.entra_resource_server_url
-            or f"http://{rc.host}:{rc.port}"
-        ),
-        required_scopes=(
-            [rc.entra_required_scope] if rc.entra_required_scope else []
-        ),
+        resource_server_url=(rc.entra_resource_server_url or f"http://{rc.host}:{rc.port}"),
+        required_scopes=([rc.entra_required_scope] if rc.entra_required_scope else []),
     )
     logger.info(
         "Entra OAuth enabled: tenant=%s audience=%s required_scope=%s",
@@ -168,6 +159,7 @@ from aismartbuddy.tools.graph import (  # noqa: E402
     graph_query_next,
     graph_schema,
     graph_statistics,
+    knowledge_batch,
 )
 from aismartbuddy.tools.holon import (  # noqa: E402
     holon_analyze,
@@ -176,13 +168,44 @@ from aismartbuddy.tools.holon import (  # noqa: E402
     holon_update,
     holon_view,
 )
+from aismartbuddy.tools.infra import (  # noqa: E402
+    session_create,
+    session_destroy,
+)
+from aismartbuddy.tools.iterate import iterate  # noqa: E402
 from aismartbuddy.tools.meta import suggest_database  # noqa: E402
+from aismartbuddy.tools.refs import think_refs_query  # noqa: E402
+from aismartbuddy.tools.reasoning_v2 import (  # noqa: E402
+    argue,
+    compare_models,
+    extract_findings_from_graph,
+    extract_findings_from_sql,
+    hypothesize,
+    mine_patterns,
+    model_system,
+    reason_get,
+    reason_graph,
+    reason_index,
+    reason_refs,
+    reason_trace,
+    scaffold,
+    self_assess,
+    session_export,
+    session_resume,
+    synthesize_conclusion,
+    test_interventions,
+    workflow_validate,
+)
+from aismartbuddy.tools.brainstorm import brainstorm  # noqa: E402
 from aismartbuddy.tools.score import (  # noqa: E402
+    rubric_templates,
     score_evaluate,
     score_gate,
     score_rubric,
 )
 from aismartbuddy.tools.sql import (  # noqa: E402
+    data_anomalies,
+    data_profile,
     sql_create_session,
     sql_destroy_session,
     sql_import,
@@ -193,43 +216,48 @@ from aismartbuddy.tools.sql import (  # noqa: E402
 )
 from aismartbuddy.tools.think import (  # noqa: E402
     think_argue,
-    think_collaborate,
     think_create_session,
     think_debug,
     think_decide,
     think_destroy_session,
     think_graph,
     think_graph_delegate,
-    think_graph_validate,
     think_interfere,
     think_interfere_state,
     think_model,
     think_monitor,
     think_science,
     think_summarize,
-    think_visualize,
 )
 from aismartbuddy.tools.youtube import get_youtube_information  # noqa: E402
 
 # Annotation presets
 _DEFAULT = {
-    "readOnlyHint": False, "destructiveHint": False,
-    "idempotentHint": False, "openWorldHint": False,
+    "readOnlyHint": False,
+    "destructiveHint": False,
+    "idempotentHint": False,
+    "openWorldHint": False,
 }
 _READONLY = {
-    "readOnlyHint": True, "destructiveHint": False,
-    "idempotentHint": True, "openWorldHint": False,
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": False,
 }
 # For read-only tools that interact with EXTERNAL services (network calls).
 # Per MCP spec, openWorldHint=True signals to hosts that the tool may
 # produce side-effects beyond the local server (rate limiting, IP exposure).
 _READONLY_OPEN = {
-    "readOnlyHint": True, "destructiveHint": False,
-    "idempotentHint": True, "openWorldHint": True,
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": True,
 }
 _DESTRUCTIVE = {
-    "readOnlyHint": False, "destructiveHint": True,
-    "idempotentHint": False, "openWorldHint": False,
+    "readOnlyHint": False,
+    "destructiveHint": True,
+    "idempotentHint": False,
+    "openWorldHint": False,
 }
 
 # (function, name, title, annotations)
@@ -240,6 +268,8 @@ _TOOLS: list[tuple] = [
     (sql_import, "sql_import", "Import Data into SQL Table", _DEFAULT),
     (sql_import_batch, "sql_import_batch", "Import Multiple Data Chunks into SQL Table", _DEFAULT),
     (sql_schema, "sql_schema", "Get SQL Database Schema", _READONLY),
+    (data_profile, "data_profile", "Statistical Data Profile (EXPLORE)", _READONLY),
+    (data_anomalies, "data_anomalies", "Detect Statistical Anomalies (EXPLORE)", _READONLY),
     (sql_destroy_session, "sql_destroy_session", "Destroy SQL Session", _DESTRUCTIVE),
     (graph_create_session, "graph_create_session", "Create Graph Session", _DEFAULT),
     (graph_query, "graph_query", "Execute Cypher Query", _DEFAULT),
@@ -255,33 +285,63 @@ _TOOLS: list[tuple] = [
     (graph_cross_reference, "graph_cross_reference", "Cross-Reference Graph Nodes", _READONLY),
     (graph_knowledge_add, "graph_knowledge_add", "Add Knowledge Entity", _DEFAULT),
     (graph_knowledge_relate, "graph_knowledge_relate", "Add Knowledge Relationship", _DEFAULT),
+    (knowledge_batch, "knowledge_batch", "Bulk Add Knowledge Nodes and Relations", _DEFAULT),
     (graph_knowledge_infer, "graph_knowledge_infer", "Run Knowledge Inference", _READONLY),
     (graph_knowledge_summary, "graph_knowledge_summary", "Knowledge Graph Summary", _READONLY),
     (suggest_database, "suggest_database", "Suggest SQL or Graph Database", _READONLY),
+    # Unified multi-backend sessions (facade over single-backend children).
+    # Required for auto_graph (which materialises items[] into KnowledgeNode
+    # rows when both think + graph backends are present).
+    (session_create, "session_create", "Create Unified Multi-Backend Session", _DEFAULT),
+    (session_destroy, "session_destroy", "Destroy Unified Session", _DESTRUCTIVE),
     (
         get_youtube_information,
         "get_youtube_information",
         "Get YouTube Video Information",
         _READONLY_OPEN,
     ),
-    # Thinking tools (Layer 1 — ephemeral, in-memory)
+    # Primary thinking surface
     (think_create_session, "think_create_session", "Create Thinking Session", _DEFAULT),
-    (think_graph, "think_graph", "Thought Graph", _DEFAULT),
-    (think_graph_validate, "think_graph_validate", "Validate Thought Graph", _DEFAULT),
-    (think_graph_delegate, "think_graph_delegate", "Delegate Thought Subtree", _DEFAULT),
-    (think_decide, "think_decide", "Structured Decision Analysis", _DEFAULT),
-    (think_model, "think_model", "Apply Mental Model", _DEFAULT),
-    (think_debug, "think_debug", "Systematic Debugging Approach", _DEFAULT),
-    (think_argue, "think_argue", "Structured Argumentation", _DEFAULT),
-    (think_collaborate, "think_collaborate", "Collaborative Reasoning", _DEFAULT),
-    (think_science, "think_science", "Scientific Method Inquiry", _DEFAULT),
-    (think_monitor, "think_monitor", "Metacognitive Monitoring", _DEFAULT),
-    (think_visualize, "think_visualize", "Visual Reasoning", _DEFAULT),
-    (think_summarize, "think_summarize", "Thinking Session Summary", _READONLY),
     (think_destroy_session, "think_destroy_session", "Destroy Thinking Session", _DESTRUCTIVE),
-    # Interference Protocol (structured novelty generation)
+    (think_graph, "think_graph", "Thought Graph", _DEFAULT),
+    (think_graph_delegate, "think_graph_delegate", "Thought Graph Delegation", _DEFAULT),
+    (think_decide, "think_decide", "Decision Framework", _DEFAULT),
+    (think_model, "think_model", "Mental Model Analysis", _DEFAULT),
+    (think_debug, "think_debug", "Systematic Debugging", _DEFAULT),
+    (think_argue, "think_argue", "Structured Argumentation", _DEFAULT),
+    (think_science, "think_science", "Scientific Method Inquiry", _DEFAULT),
+    (think_monitor, "think_monitor", "Knowledge Boundary Assessment", _DEFAULT),
+    (think_summarize, "think_summarize", "Summarize Thinking Session", _READONLY),
     (think_interfere, "think_interfere", "Interference Protocol", _DEFAULT),
     (think_interfere_state, "think_interfere_state", "Interference Protocol State", _READONLY),
+    (think_refs_query, "think_refs_query", "Find Cross-References by Entity ID", _READONLY),
+    # V2 reasoning surface
+    (scaffold, "scaffold", "Scaffold Structured Analysis", _DEFAULT),
+    (hypothesize, "hypothesize", "Generate Structured Hypotheses", _DEFAULT),
+    (argue, "argue", "Structured Argument Chain", _DEFAULT),
+    (self_assess, "self_assess", "Knowledge Boundary Assessment", _DEFAULT),
+    (brainstorm, "brainstorm", "Brainstorm (DIVERGE)", _DEFAULT),
+    (iterate, "iterate", "Iterate (ITERATE)", _DEFAULT),
+    (reason_graph, "reason_graph", "Reason Graph", _DEFAULT),
+    (model_system, "model_system", "Model Multi-Scale System", _DEFAULT),
+    (mine_patterns, "mine_patterns", "Mine Structured Patterns", _DEFAULT),
+    (test_interventions, "test_interventions", "Test Interventions", _DEFAULT),
+    (compare_models, "compare_models", "Compare Models", _DEFAULT),
+    (reason_trace, "reason_trace", "Grounded Reason Trace", _DEFAULT),
+    (synthesize_conclusion, "synthesize_conclusion", "Synthesize Grounded Conclusion", _DEFAULT),
+    (reason_index, "reason_index", "Reason Artifact Index", _READONLY),
+    (reason_get, "reason_get", "Get Reason Artifact", _READONLY),
+    (reason_refs, "reason_refs", "Find Reason References", _READONLY),
+    (extract_findings_from_sql, "extract_findings_from_sql", "Extract Findings From SQL", _DEFAULT),
+    (
+        extract_findings_from_graph,
+        "extract_findings_from_graph",
+        "Extract Findings From Graph",
+        _DEFAULT,
+    ),
+    (session_resume, "session_resume", "Resume Structured Reasoning Session", _READONLY),
+    (session_export, "session_export", "Export Structured Reasoning Session", _READONLY),
+    (workflow_validate, "workflow_validate", "Validate Workflow Coverage", _READONLY),
     # Holonic workspace (multi-level domain modeling)
     (holon_create, "holon_create", "Create Holon", _DEFAULT),
     (holon_update, "holon_update", "Update Holon", _DEFAULT),
@@ -292,6 +352,7 @@ _TOOLS: list[tuple] = [
     (score_rubric, "score_rubric", "Scoring Rubric", _DEFAULT),
     (score_evaluate, "score_evaluate", "Evaluate with Score", _DEFAULT),
     (score_gate, "score_gate", "Scoring Gate Check", _READONLY),
+    (rubric_templates, "rubric_templates", "List/Load Pre-built Rubrics", _DEFAULT),
 ]
 
 for func, name, title, annot in _TOOLS:
@@ -364,53 +425,39 @@ Single-call tool to ingest a YouTube video's metadata and transcript.
 - For long videos: write the response to a file via your filesystem tool
     before processing, to avoid burning context on the inline transcript.
 
-## Thinking Sessions (Structured Reasoning)
-In-memory sessions for structured AI reasoning. Auto-created on first tool call.
+## Structured Thinking
+Primary surface for analysis:
+- think_create_session(project_id="analysis") → standalone think session
+- session_create(backends=["think","graph","sql"], mode="analyze") → parent session
+- think_model(items=[...]) → structured scaffold with a named mental model
+- think_science(items=[...]) → observation/question/hypothesis/experiment chain
+- think_decide(items=[...]) → explicit options/criteria/recommendation
+- think_graph(...) → concise thought graph nodes; branch instead of writing essays
+- think_argue(chain=[...]) → thesis/antithesis/synthesis chains
+- think_monitor(items=[...]) → last-step calibration of claims and limitations
+- think_interfere(...) → structured novelty generation via interference protocol
+- think_refs_query(entity_id, session_id) → find records that cite an entity id
+- think_summarize(session_id) → token-optimized summary of the session
 
-### Thought Graph (progressive complexity)
-- think_graph(thought="...") → new root node (simple sequential start)
-- think_graph(thought="...", parent_id="<prev>") → chain thoughts sequentially
-- think_graph(thought="...", action="branch", parent_id="...") → decompose into sub-problems
-- think_graph(thought="...", action="synthesize", parent_id="...") → combine children's findings
-- think_graph(thought="...", action="revise", node_id="...") → update with history
-- think_graph_validate(session_id, target_id, check_type, result, details) → structural validation
-- think_graph_delegate(session_id, node_id, action="package") → delegate to subagent
-- think_graph_delegate(session_id, node_id, action="receive", result="...") → receive results
+Legacy V2 reasoning tools are still available for compatibility:
+- scaffold / hypothesize / self_assess / reason_graph / model_system
+- mine_patterns / test_interventions / compare_models / reason_trace
+- synthesize_conclusion / reason_index / reason_get / reason_refs
+- session_resume / workflow_validate
 
-### Other Thinking Tools
-- think_decide(decision_statement, options, analysis_type, stage, ...) → multi-criteria decisions
-- think_model(model_name, problem) → 13 models: first_principles, assumptions_xray,
-    fishbone, value_of_info, swot, pre_mortem, design_review, complexity, root_cause, ...
-- think_debug(approach_name, issue) → debugging approaches (binary_search, divide_conquer, etc.)
-- think_argue(claim, premises, conclusion, argument_type, ...) → dialectical reasoning
-- think_collaborate(topic, personas, contributions, stage, ...) → multi-perspective analysis
-- think_science(stage, inquiry_id, iteration, ...) → scientific method
-- think_monitor(task, stage, overall_confidence, ...) → metacognitive self-monitoring
-- think_visualize(operation, diagram_id, diagram_type, ...) → visual reasoning
+### Explore / Diverge / Iterate
+- data_profile(session_id, table) → profile tabular data first
+- data_anomalies(session_id, table, columns, method) → anomaly scan
+- brainstorm(topic, ideas=[...]) → divergence without convergence
+- iterate(action=...) → build-test-learn attempts with optional metrics
+- think_debug(items=[...]) → structured debugging loops
 
-### Interference Protocol (Structured Novelty Generation)
-- think_interfere(action="set_domain", target_domain="...") → start protocol
-- think_interfere(action="add_source", protocol_id, source_domain, law, isomorphism)
-- think_interfere(action="add_fragment", protocol_id, fragment)
-- think_interfere(action="crystallize", protocol_id, name, properties)
-- think_interfere(action="stress_test", protocol_id, audit_type, audit_result)
-- think_interfere_state(session_id, protocol_id) → full state query
-
-### Utility
-- think_summarize(session_id) → token-optimized summary of all thinking
-- think_destroy_session(session_id) → free memory
-
-Sessions auto-create: omit session_id on first call, pass returned ID to subsequent calls.
-
-### Socratic Method (think_graph pattern)
-Use think_graph to do Socratic inquiry on any claim:
-  1. think_graph(thought="Claim: ...", action="branch") -> root
-  2. think_graph(thought="CLARIFICATION: What do we mean?", parent_id=root)
-  3. think_graph(thought="ASSUMPTIONS: What must be true?", parent_id=root)
-  4. think_graph(thought="EVIDENCE: What supports/contradicts?", parent_id=root)
-  5. think_graph(thought="PERSPECTIVES: Other viewpoints?", parent_id=root)
-  6. think_graph(thought="IMPLICATIONS: What follows?", parent_id=root)
-  7. think_graph(thought="Synthesis", action="synthesize", parent_id=root)
+### Retrieval
+- reason_index(session_id, ...) → list stored artifacts
+- reason_get(session_id, artifact_id) → fetch one artifact with links
+- reason_refs(session_id, artifact_id) → inbound references
+- session_resume(session_id) → compact operational context
+- workflow_validate(session_id) → coverage / sequencing check
 
 ## Holonic Workspace (Multi-Level Domain Modeling)
 Model domains where entities are simultaneously wholes and parts.
@@ -441,30 +488,30 @@ Separate AI judgment from scoring. AI submits findings; server computes scores.
 ## When to Use Each Tool (Methodology)
 
 ### Before designing:
-- think_model(assumptions_xray) on key claims you're about to build on
+- think_model(model_name="assumptions_xray", items=[...]) on key claims
 - holon_create to model the domain at multiple levels
 
 ### Before finalizing a design:
-- think_model(pre_mortem): "Assume this failed — what went wrong?"
-- think_model(design_review): "What breaks this? State machine gaps?"
-- think_model(complexity): "Is this over-engineered?"
+- think_model(model_name="pre_mortem", items=[...])
+- think_model(model_name="design_review", items=[...])
+- think_model(model_name="complexity", items=[...])
 
 ### Before implementing:
 - score_rubric + score_evaluate to define quality criteria upfront
-- think_graph with depends_on for task ordering
+- think_graph for concise task ordering and dependencies
 
 ### During investigation:
 - holon_analyze(bridge) to find causal chains between distant concepts
 - holon_analyze(coherence) to check if two findings are consistent
-- think_model(fishbone) to categorize causes you might be missing
+- think_model(model_name="fishbone", items=[...]) to categorize causes
 
 ### After implementation:
 - score_evaluate(finding) for each issue found during review
 - score_gate to check pass/fail programmatically
 
 ### Cross-referencing:
-All tools accept refs: list[str] to link outputs across tools.
-Example: a scoring finding can reference a thought graph node ID.
+All reasoning tools accept refs/connects_to so artifacts stay linked.
+Example: a thought can reference a scaffold item id, then think_refs_query can retrieve the backlinks.
 
 ## Token Efficiency
 SQL results default to CSV format (2-3x fewer tokens than JSON).

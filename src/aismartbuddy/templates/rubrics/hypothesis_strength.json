@@ -1,0 +1,15 @@
+{
+  "rubric_id": "hypothesis_strength",
+  "description": "Strength of a hypothesis — falsifiability, specificity, mechanism, alternatives, evidence.",
+  "dimensions": [
+    {"id": "falsifiability", "description": "Specific observation that disproves it", "weight": 1.0, "required": true},
+    {"id": "specificity", "description": "Variables and conditions named precisely", "weight": 0.8, "required": true},
+    {"id": "mechanism", "description": "Plausible causal mechanism", "weight": 0.7, "required": false},
+    {"id": "alternatives", "description": "Considered competing hypotheses", "weight": 0.7, "required": false},
+    {"id": "evidence", "description": "Initial supporting evidence cited", "weight": 0.5, "required": false}
+  ],
+  "severity_levels": ["critical", "high", "moderate", "low"],
+  "severity_deductions": {"critical": 3.0, "high": 2.0, "moderate": 1.0, "low": 0.3},
+  "pass_threshold": 7.5,
+  "scoring_strategy": "weighted_deduction"
+}

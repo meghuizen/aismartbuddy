@@ -9,7 +9,6 @@ from aismartbuddy.engines.thinking_engine import (
     HolonNode,
     ThinkingEngine,
 )
-from aismartbuddy.session import SessionManager
 from aismartbuddy.tools.holon import (
     holon_analyze,
     holon_create,
@@ -201,15 +200,6 @@ class TestHolonEngine:
 
 
 # ── Tool-level tests ─────────────────────────────────────────
-
-
-@pytest.fixture
-def _init_session_manager(session_manager: SessionManager):
-    import aismartbuddy.session as session_mod
-
-    session_mod.session_manager = session_manager
-    yield
-    session_mod.session_manager = None
 
 
 @pytest.mark.usefixtures("_init_session_manager")
@@ -720,3 +710,216 @@ class TestPathophysiologyCase:
             ),
         )
         assert "vulnerability" in lens_result
+
+
+@pytest.mark.usefixtures("_init_session_manager")
+class TestHolonCreateBatch:
+    """holon_create(holons=[...]) batch creates with parent_ref resolution."""
+
+    @pytest.mark.anyio
+    async def test_batch_resolves_parent_refs(self):
+        r = await holon_create(
+            holons=[
+                {"ref": "root", "name": "Root", "description": "the root"},
+                {
+                    "ref": "child_a", "name": "Child A",
+                    "description": "first child", "parent_ref": "root",
+                    "role_in_parent": "first",
+                },
+                {
+                    "ref": "child_b", "name": "Child B",
+                    "description": "second child", "parent_ref": "root",
+                },
+                {
+                    "ref": "grandchild", "name": "GC",
+                    "description": "grandchild", "parent_ref": "child_a",
+                },
+            ],
+        )
+        assert "Batch: 4 holons created" in r
+        assert "root=" in r
+        assert "child_a=" in r
+        assert "child_b=" in r
+        assert "grandchild=" in r
+
+    @pytest.mark.anyio
+    async def test_batch_empty_rejected(self):
+        with pytest.raises(ValueError, match="non-empty"):
+            await holon_create(holons=[])
+
+    @pytest.mark.anyio
+    async def test_batch_duplicate_ref_rejected(self):
+        with pytest.raises(ValueError, match="Duplicate ref"):
+            await holon_create(
+                holons=[
+                    {"ref": "x", "name": "X", "description": "x1"},
+                    {"ref": "x", "name": "X2", "description": "x2"},
+                ],
+            )
+
+    @pytest.mark.anyio
+    async def test_batch_missing_name_rejected(self):
+        with pytest.raises(ValueError, match="missing 'name'"):
+            await holon_create(
+                holons=[{"ref": "x", "description": "no name"}],
+            )
+
+    @pytest.mark.anyio
+    async def test_batch_unknown_parent_ref_rejected(self):
+        with pytest.raises(ValueError, match="did not resolve"):
+            await holon_create(
+                holons=[
+                    {
+                        "ref": "x", "name": "X", "description": "x",
+                        "parent_ref": "nonexistent_id",
+                    },
+                ],
+            )
+
+    @pytest.mark.anyio
+    async def test_batch_parent_ref_to_existing_holon(self):
+        # Create a root holon in single mode first
+        r1 = await holon_create(name="Root", description="single root")
+        sid = _extract(r1, "Session:")
+        root_id = _extract(r1, "Holon:")
+        # Now batch-add children referencing the existing root
+        r2 = await holon_create(
+            session_id=sid,
+            holons=[
+                {
+                    "ref": "c1", "name": "C1", "description": "c1",
+                    "parent_ref": root_id,
+                },
+                {
+                    "ref": "c2", "name": "C2", "description": "c2",
+                    "parent_ref": root_id,
+                },
+            ],
+        )
+        assert "Batch: 2 holons created" in r2
+
+    @pytest.mark.anyio
+    async def test_batch_cycle_detected(self):
+        with pytest.raises(ValueError, match="Cycle detected"):
+            await holon_create(
+                holons=[
+                    {
+                        "ref": "a", "name": "A", "description": "a",
+                        "parent_ref": "b",
+                    },
+                    {
+                        "ref": "b", "name": "B", "description": "b",
+                        "parent_ref": "a",
+                    },
+                ],
+            )
+
+
+@pytest.mark.usefixtures("_init_session_manager")
+class TestHolonDisplayTruncateConfig:
+    """RuntimeConfig.holon_truncate_chars controls display truncation."""
+
+    def _child_ctx_value(self, view: str, char: str) -> str:
+        """Return the payload after 'Context: ' from the Children section."""
+        lines = view.split("\n")
+        in_children = False
+        for line in lines:
+            if line.startswith("### Children"):
+                in_children = True
+                continue
+            if in_children and "Context:" in line and char in line:
+                _, _, payload = line.partition("Context:")
+                return payload.strip()
+        return ""
+
+    @pytest.mark.anyio
+    async def test_truncate_long_default_80(self):
+        long_ctx = "a" * 200
+        r = await holon_create(
+            name="Root", description="root",
+            context="root-ctx-short",
+        )
+        hid = _extract(r, "Holarchy:")
+        root_id = _extract(r, "Holon:")
+        sid = _extract(r, "Session:")
+        await holon_create(
+            name="Child", description="child",
+            parent_id=root_id, holarchy_id=hid, context=long_ctx,
+            session_id=sid,
+        )
+        view = await holon_view(session_id=sid, holon_id=root_id, action="zoom_in")
+        # zoom_in uses _trunc_long for child context (default 80)
+        ctx_value = self._child_ctx_value(view, "a")
+        assert ctx_value, f"no child context line in {view!r}"
+        assert ctx_value == "a" * 80, f"expected 80 a's, got {len(ctx_value)}"
+
+    @pytest.mark.anyio
+    async def test_truncate_long_configurable_to_30(self):
+        import aismartbuddy.config as cfg
+
+        original_long = cfg.runtime_config.holon_truncate_long
+        try:
+            cfg.runtime_config.holon_truncate_long = 30
+            long_ctx = "x" * 200
+            r = await holon_create(
+                name="Root", description="root",
+                context="root-short",
+            )
+            hid = _extract(r, "Holarchy:")
+            root_id = _extract(r, "Holon:")
+            sid = _extract(r, "Session:")
+            await holon_create(
+                name="Child", description="child",
+                parent_id=root_id, holarchy_id=hid, context=long_ctx,
+                session_id=sid,
+            )
+            view = await holon_view(session_id=sid, holon_id=root_id, action="zoom_in")
+            ctx_value = self._child_ctx_value(view, "x")
+            assert ctx_value == "x" * 30, f"expected 30 x's, got {len(ctx_value)}"
+        finally:
+            cfg.runtime_config.holon_truncate_long = original_long
+
+    @pytest.mark.anyio
+    async def test_truncate_chars_configurable_in_cross_level(self):
+        import aismartbuddy.config as cfg
+
+        original_chars = cfg.runtime_config.holon_truncate_chars
+        try:
+            cfg.runtime_config.holon_truncate_chars = 25
+            long_ctx = "y" * 200
+            r = await holon_create(
+                name="Root", description="root",
+                context=long_ctx,
+            )
+            hid = _extract(r, "Holarchy:")
+            root_id = _extract(r, "Holon:")
+            sid = _extract(r, "Session:")
+            await holon_create(
+                name="Child", description="child",
+                parent_id=root_id, holarchy_id=hid, context=long_ctx,
+                session_id=sid,
+            )
+            # cross_level on child displays ancestor context via _trunc (chars)
+            # we need a holon deeper so an ancestor shows
+            gc_r = await holon_create(
+                name="Grandchild", description="grandchild",
+                parent_id=root_id, holarchy_id=hid, context="gc",
+                session_id=sid,
+            )
+            gc_id = _extract(gc_r, "Holon:")
+            view = await holon_view(
+                session_id=sid, holon_id=gc_id, action="cross_level",
+            )
+            # Ancestry section prints Context: truncated at chars (25)
+            for line in view.split("\n"):
+                if "Context:" in line and "y" in line:
+                    _, _, payload = line.partition("Context:")
+                    stripped = payload.strip()
+                    assert stripped == "y" * 25, (
+                        f"expected 25 y's, got {len(stripped)}"
+                    )
+                    break
+            else:
+                raise AssertionError(f"no ancestor context line in {view!r}")
+        finally:
+            cfg.runtime_config.holon_truncate_chars = original_chars

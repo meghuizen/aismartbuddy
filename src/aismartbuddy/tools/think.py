@@ -20,10 +20,8 @@ from mcp.server.fastmcp import Context as _MCPContext
 
 from aismartbuddy.engines.thinking_engine import (
     ArgRecord,
-    CollabRecord,
     DebugRecord,
     DecisionRecord,
-    DiagramRecord,
     InquiryRecord,
     InterferenceRecord,
     ModelRecord,
@@ -32,7 +30,7 @@ from aismartbuddy.engines.thinking_engine import (
     ThoughtNode,
 )
 from aismartbuddy.identity import resolve_identity
-from aismartbuddy.tools import get_session_manager
+from aismartbuddy.tools import get_session_manager, size_guarded
 
 if TYPE_CHECKING:
     from aismartbuddy.session import SessionInfo, SessionManager
@@ -72,15 +70,6 @@ _ARGUMENT_TYPES = frozenset({
     "rebuttal",
 })
 
-_COLLAB_STAGES = frozenset({
-    "problem-definition",
-    "ideation",
-    "critique",
-    "integration",
-    "decision",
-    "reflection",
-})
-
 _SCIENCE_STAGES = frozenset({
     "observation",
     "question",
@@ -98,6 +87,9 @@ _MONITOR_STAGES = frozenset({
     "monitoring",
     "evaluation",
     "reflection",
+    # items[] strict-form records use this stage value for one-shot
+    # self-assessment (distinct from the iterative monitoring stages above).
+    "self-assess",
 })
 
 _DECISION_STAGES = frozenset({
@@ -115,23 +107,6 @@ _DECISION_TYPES = frozenset({
     "maximin",
     "minimax-regret",
     "satisficing",
-})
-
-_DIAGRAM_TYPES = frozenset({
-    "graph",
-    "flowchart",
-    "stateDiagram",
-    "conceptMap",
-    "treeDiagram",
-    "custom",
-})
-
-_DIAGRAM_OPS = frozenset({
-    "create",
-    "update",
-    "delete",
-    "transform",
-    "observe",
 })
 
 _KNOWLEDGE_LEVELS = frozenset({
@@ -160,23 +135,22 @@ def _get_or_create_think_session(
 ) -> tuple[SessionManager, SessionInfo]:
     """Return an existing think session or auto-create one.
 
-    If session_id is provided, validates it's a "think" session. Identity
-    of the caller is NOT re-checked (session_id acts as capability).
+    If session_id is provided, accepts either a direct think session_id OR
+    a parent session_id whose backends include "think". Identity of the
+    caller is NOT re-checked (session_id acts as capability).
 
     If None/empty, resolves caller identity via `resolve_identity(ctx, ...)`
-    and creates a new think session bound to (user_id, project_id). This
-    means: under Bearer auth the session is bound to ctx.client_id; under
-    stdio it falls back to the configured default.
+    and creates a NEW standalone think session. Auto-creation does NOT happen
+    inside an existing parent — if you want a think backend in a parent,
+    pass backends=['think', ...] to session_create up front.
     """
     mgr = get_session_manager()
     if session_id:
-        info = mgr.get_session(session_id)
-        if info.session_type != "think":
-            raise ValueError(
-                f"Session '{session_id}' is a {info.session_type} session, not a thinking session."
-            )
+        # resolve_backend_session handles both parent-id and direct-child
+        # cases; raises if the parent has no think backend.
+        info = mgr.resolve_backend_session(session_id, "think")
         return mgr, info
-    # Auto-create with caller-scoped identity
+    # Auto-create with caller-scoped identity (standalone think session)
     user_id, project_id = resolve_identity(ctx, None, None)
     info = mgr.create_session("think", user_id, project_id)
     return mgr, info
@@ -261,6 +235,9 @@ async def think_graph(
     depends_on: list[str] | None = None,
     refs: list[str] | None = None,
     metadata: dict | None = None,
+    children: list[dict] | None = None,
+    expected_children: int | None = None,
+    min_children: int | None = None,
     ctx: _MCPContext | None = None,
 ) -> str:
     """Thought graph — structured thinking with progressive complexity.
@@ -268,6 +245,11 @@ async def think_graph(
     Every thought is a node in a graph. Supports simple sequential chains,
     hierarchical tree decomposition, multi-tree forests, revision with
     history, and synthesis.
+
+    KEEP THOUGHTS CONCISE. One thought = one move (a claim, an observation,
+    a sub-goal, a conclusion). Aim for 1–3 sentences per node, not paragraphs.
+    If a thought is becoming an essay, use action="branch" and split into
+    children. Long stories collapse to noise; short nodes stay queryable.
 
     For simple sequential thinking (like a chain of thoughts):
         think_graph(thought="First insight")  → creates root
@@ -300,6 +282,13 @@ async def think_graph(
         tree_id: Optionally assign to existing tree (ignored when
             parent_id is set — tree is inferred from parent).
         metadata: Flexible context bag for additional data.
+        children: Optional list of child specs to create atomically with the
+            parent in one call (one round trip instead of N+1). Each child:
+            {thought: str, metadata?: dict, action?: str}. Returns parent_id +
+            child_ids[]. Use with action="branch" for decomposition batching.
+        expected_children: Planning horizon — declare how many children you
+            intend to create. When action="synthesize" runs later, the tool
+            warns if the actual count differs.
 
     Returns:
         Compact status with node position and tree structure.
@@ -347,7 +336,11 @@ async def think_graph(
     else:
         effective_tree_id = tree_id or uuid.uuid4().hex[:10]
 
-    node = ThoughtNode(
+    parent_meta = metadata or {}
+    if expected_children is not None:
+        parent_meta = {**parent_meta, "expected_children": int(expected_children)}
+
+    parent_node = ThoughtNode(
         id=nid,
         tree_id=effective_tree_id,
         content=thought,
@@ -356,9 +349,35 @@ async def think_graph(
         depends_on=depends_on or [],
         refs=refs or [],
         depth=depth,
-        metadata=metadata or {},
+        metadata=parent_meta,
     )
-    engine.add_node(node)
+
+    # ── Batch path: parent + children atomically ─────────
+    child_ids: list[str] = []
+    if children:
+        if min_children is not None and len(children) < min_children:
+            raise ValueError(
+                f"think_graph(action='{action}', children=[...]) received "
+                f"{len(children)} children but min_children={min_children}. "
+                "Quantity-before-convergence rule rejects below threshold."
+            )
+        _, child_ids = engine.add_node_with_children(parent_node, children)
+    else:
+        engine.add_node(parent_node)
+
+    # Synthesize warning when expected_children mismatches actual
+    synth_warning = ""
+    if action == "synthesize" and parent_id:
+        parent = engine.get_node(parent_id)
+        if parent and parent.metadata:
+            exp = parent.metadata.get("expected_children")
+            if exp is not None:
+                actual = len(parent.children)
+                if actual != int(exp):
+                    synth_warning = (
+                        f"\n⚠ Synthesis: parent expected {exp} children,"
+                        f" found {actual}."
+                    )
 
     # Build output
     siblings = 0
@@ -372,84 +391,16 @@ async def think_graph(
         f"Session: {sid} | Tree: {effective_tree_id} | Node: {nid}",
         (
             f"Action: {action} | Depth: {depth}"
-            f" | Children: 0 | Siblings: {siblings}"
+            f" | Children: {len(child_ids)} | Siblings: {siblings}"
         ),
     ]
     if parent_id:
         parts.append(f"Parent: {parent_id} | Path: {path_str}")
-    parts.append("Status: added")
+    if child_ids:
+        parts.append(f"Batch: {len(child_ids)} children created")
+        parts.append("Children: " + ", ".join(child_ids))
+    parts.append("Status: added" + synth_warning)
     return "\n".join(parts)
-
-
-# ── Tool: Thought Graph Validate ─────────────────────────────
-
-
-async def think_graph_validate(
-    session_id: str,
-    target_id: str,
-    check_type: str,
-    result: str,
-    details: str,
-    suggestions: list[str] | None = None,
-) -> str:
-    """Validate structure of a thought graph node or tree.
-
-    Stores your structural assessment on a node. The tool tracks
-    validations — it doesn't perform NLP analysis. You (the AI) do
-    the assessment; the tool records it.
-
-    Check types:
-        coverage: Do children collectively address the parent's problem?
-        contradictions: Do sibling nodes contradict each other?
-        gaps: Are there unstated assumptions or missing steps?
-        leaps: Does any node make unsupported conclusions?
-        completeness: Does the tree have a synthesis at root level?
-
-    Args:
-        session_id: Thinking session ID.
-        target_id: Node ID or tree ID to validate. If tree ID,
-            validation is stored on the root node.
-        check_type: What structural aspect to validate.
-        result: Assessment result — pass, fail, or warning.
-        details: Explanation of the assessment.
-        suggestions: Optional remediation ideas.
-
-    Returns:
-        Compact status with validation summary.
-    """
-    _validate_enum(check_type, _VALIDATE_CHECK_TYPES, "check_type")
-    _validate_enum(result, _VALIDATE_RESULTS, "result")
-
-    _, info = _require_think_session(session_id)
-    engine = _engine(info)
-
-    validation = {
-        "check_type": check_type,
-        "result": result,
-        "details": details,
-        "suggestions": suggestions or [],
-    }
-    # Hold the engine lock across lookup + mutation so a concurrent
-    # eviction can't remove the node between the two steps.
-    with engine.state_lock:
-        node = engine.get_node(target_id)
-        if node is None:
-            root = engine.get_tree_root(target_id)
-            if root is None:
-                raise ValueError(
-                    f"'{target_id}' not found as node ID or tree ID"
-                )
-            node = root
-        node.validation_results.append(validation)
-        total_checks = len(node.validation_results)
-        node_id_out = node.id
-
-    return (
-        f"Session: {session_id} | Node: {node_id_out}\n"
-        f"Validation: {check_type} = {result}\n"
-        f"Details: {details[:100]}\n"
-        f"Total checks on node: {total_checks}"
-    )
 
 
 # ── Tool: Thought Graph Delegate ─────────────────────────────
@@ -544,50 +495,105 @@ async def think_graph_delegate(
 
 
 async def think_decide(
-    decision_statement: str,
-    options: list[dict],
-    analysis_type: str,
-    stage: str,
-    decision_id: str,
-    iteration: int,
-    next_stage_needed: bool,
+    decision_statement: str = "",
+    options: list[dict] | None = None,
+    analysis_type: str = "multi-criteria",
+    stage: str = "recommendation",
+    decision_id: str = "",
+    iteration: int = 1,
+    next_stage_needed: bool = False,
     session_id: str | None = None,
     criteria: list[dict] | None = None,
     evaluations: list[dict] | None = None,
     recommendation: str | None = None,
+    items: list[dict] | None = None,
     ctx: _MCPContext | None = None,
 ) -> str:
-    """Structured decision analysis with multi-criteria evaluation.
+    """[SCAFFOLD] Multi-criteria decision analysis (1..N decisions).
 
-    Supports expected-utility, multi-criteria, maximin, minimax-regret, and
-    satisficing analysis types. Work through stages: problem-definition,
-    options, criteria, evaluation, analysis, recommendation.
+    Use when: a decision has 2+ defensible options + explicit criteria.
+    Do NOT use when: the answer is obvious (skip; just decide).
+
+    items[]: STRICT batch — each item: id, decision_statement, options[≥2],
+      criteria[≥1] (each {name, weight}), evaluations[], recommendation.
+      Server REJECTS items missing any required field.
+    Single-form: backward-compat staged form (problem-definition → options
+      → criteria → evaluation → analysis → recommendation).
 
     Args:
-        decision_statement: What decision is being made.
-        options: List of options, each with 'name' and 'description'.
-        analysis_type: One of: expected-utility, multi-criteria,
-            maximin, minimax-regret, satisficing.
-        stage: Current stage: problem-definition, options, criteria,
-            evaluation, analysis, recommendation.
-        decision_id: Unique identifier for this decision.
-        iteration: Current iteration of the analysis.
-        next_stage_needed: Whether another stage is needed.
-        session_id: Thinking session ID. Omit to auto-create.
-        criteria: Evaluation criteria with name, weight, description.
-        evaluations: Scores per criterion per option.
-        recommendation: Final recommendation text.
+      items: STRICT — list of decision items as above.
+      decision_statement, options, analysis_type, stage, decision_id,
+        iteration, next_stage_needed, criteria, evaluations, recommendation:
+        single-form fields.
+      session_id: omit to auto-create.
 
-    Returns:
-        Compact status with decision progress.
+    Returns: decision ids[] in items[] mode, or single-form status.
     """
-    _validate_enum(analysis_type, _DECISION_TYPES, "analysis_type")
-    _validate_enum(stage, _DECISION_STAGES, "stage")
-
     _, info = await anyio.to_thread.run_sync(
         lambda: _get_or_create_think_session(session_id, ctx)
     )
     engine = _engine(info)
+
+    # ── Items[] strict batch path ────────────────────────────
+    if items is not None:
+        from aismartbuddy.tools import validate_items
+
+        def _check_options(o: object) -> str | None:
+            if not isinstance(o, list) or len(o) < 2:
+                return "must be a list with at least 2 options"
+            return None
+
+        def _check_criteria(c: object) -> str | None:
+            if not isinstance(c, list) or not c:
+                return "must be a non-empty list of {name, weight}"
+            for j, x in enumerate(c):
+                if not isinstance(x, dict) or not x.get("name"):
+                    return f"criteria[{j}] missing 'name'"
+                if "weight" not in x:
+                    return f"criteria[{j}] missing 'weight'"
+            return None
+
+        validate_items(
+            items,
+            required=["decision_statement", "options", "criteria",
+                      "recommendation"],
+            tool="think_decide",
+            item_validators={
+                "options": _check_options,
+                "criteria": _check_criteria,
+            },
+        )
+
+        ids: list[str] = []
+        with engine.state_lock:
+            for it in items:
+                rec = DecisionRecord(
+                    decision_id=it["id"],
+                    statement=it["decision_statement"],
+                    options=list(it["options"]),
+                    analysis_type=it.get("analysis_type", "multi-criteria"),
+                    stage="recommendation",
+                    iteration=1,
+                    criteria=list(it["criteria"]),
+                    evaluations=list(it.get("evaluations") or []),
+                    recommendation=it["recommendation"],
+                )
+                engine.upsert_decision(rec)
+                ids.append(it["id"])
+
+        return (
+            f"Session: {info.session_id} | Decisions: {len(ids)}\n"
+            f"IDs: {', '.join(ids)}\n"
+            "Status: decided"
+        )
+
+    # ── Single-form backward-compat path ────────────────────
+    _validate_enum(analysis_type, _DECISION_TYPES, "analysis_type")
+    _validate_enum(stage, _DECISION_STAGES, "stage")
+    if not decision_statement or not options or not decision_id:
+        raise ValueError(
+            "single-form requires decision_statement, options, decision_id"
+        )
 
     record = DecisionRecord(
         decision_id=decision_id,
@@ -732,46 +738,44 @@ _MODEL_GUIDANCE: dict[str, str] = {
 
 async def think_model(
     model_name: str,
-    problem: str,
+    problem: str = "",
     session_id: str | None = None,
     steps: list[str] | None = None,
     reasoning: str | None = None,
     conclusion: str | None = None,
+    items: list[dict] | None = None,
+    auto_graph: bool = False,
     ctx: _MCPContext | None = None,
 ) -> str:
-    """Apply a structured mental model to a problem.
+    """[SCAFFOLD] Apply a mental model to 1..N problems. Call FIRST.
 
-    Available models:
-    - first_principles: Break down to fundamental truths, rebuild.
-    - opportunity_cost: Evaluate what you give up by choosing.
-    - error_propagation: Trace how errors compound through a system.
-    - rubber_duck: Explain the problem step by step to find the gap.
-    - pareto_principle: Find the 20% driving 80% of results.
-    - assumptions_xray: Surface hidden assumptions in a claim,
-      rate confidence, propose falsification tests.
-    - fishbone: Ishikawa diagram — categorize causes by type
-      (methods, materials, people, environment, etc).
-    - value_of_info: Assess whether gathering information is
-      worth the cost before deciding.
-    - swot: Strengths, weaknesses, opportunities, threats.
-    - pre_mortem: Assume failure, work backward to find causes.
-    - design_review: Find what breaks a design — edge cases,
-      state machine gaps, assumption audit.
-    - complexity: Cyclomatic complexity, coupling, cognitive
-      load, abstraction level analysis.
-    - root_cause: 5 Whys + Ishikawa — dig to root causes,
-      categorize, find systemic fixes.
+    Use when: starting an analysis (reasoning NOT yet done); decomposing N
+    sub-problems with the same model; you want the schema to FORCE structure.
+    Do NOT use when: mid-elaboration (use think_graph); you already finished
+    the reasoning and just want to record it (that's ceremony — skip).
+
+    Two forms:
+      items[]: STRICT batch — each item must have id/problem/steps/reasoning/
+        conclusion. Server REJECTS lazy items with the failing field name.
+        Optional connects_to (list of other item ids) becomes auto_graph edges.
+      single-item: backward-compat flexible form (problem/steps/reasoning/
+        conclusion all optional). Use only for mid-analysis ad-hoc model
+        application; prefer items[] at analysis START.
+
+    Models: first_principles, opportunity_cost, error_propagation, rubber_duck,
+    pareto_principle, assumptions_xray, fishbone, value_of_info, swot,
+    pre_mortem, design_review, complexity, root_cause.
 
     Args:
-        model_name: Which mental model to apply.
-        problem: The problem being analyzed.
-        session_id: Thinking session ID. Omit to auto-create.
-        steps: Reasoning steps taken following the model's framework.
-        reasoning: Detailed reasoning text.
-        conclusion: Final conclusion.
+      model_name: which mental model to apply.
+      items: STRICT — each item dict needs id, problem, steps[≥1], reasoning,
+        conclusion; optional connects_to[], metadata{}.
+      problem, steps, reasoning, conclusion: single-item form fields.
+      auto_graph: when True + parent session has graph backend, materialise
+        each item as a KnowledgeNode + connects_to edges in one round trip.
+      session_id: omit to auto-create think session.
 
-    Returns:
-        Compact status with framework guidance and conclusion.
+    Returns: item_ids[] (+ graph node count if auto_graph) or single-item status.
     """
     _validate_enum(model_name, _MODEL_NAMES, "model_name")
 
@@ -780,6 +784,57 @@ async def think_model(
     )
     engine = _engine(info)
 
+    # ── Items[] strict batch path ────────────────────────────
+    if items is not None:
+        from aismartbuddy.tools import materialize_auto_graph, validate_items
+
+        validate_items(
+            items,
+            required=["problem", "steps", "reasoning", "conclusion"],
+            tool="think_model",
+        )
+        from aismartbuddy.tools import collect_item_refs
+
+        item_ids: list[str] = []
+        with engine.state_lock:
+            for it in items:
+                rec = ModelRecord(
+                    model_name=model_name,
+                    problem=it["problem"],
+                    steps=list(it["steps"]),
+                    reasoning=it["reasoning"],
+                    conclusion=it["conclusion"],
+                    record_id=it["id"],
+                    refs=collect_item_refs(it),
+                )
+                engine.add_model(rec)
+                item_ids.append(it["id"])
+
+        graph_count = 0
+        if auto_graph:
+            if not session_id:
+                raise ValueError(
+                    "auto_graph requires an explicit unified session_id from "
+                    "session_create(backends=['think','graph'])."
+                )
+            graph_count = await materialize_auto_graph(
+                session_id, items,
+                source_tag=f"think_model:{model_name}",
+                entity_type="concept",
+                description_field="conclusion",
+            )
+
+        out = [
+            f"Session: {info.session_id} | Model: {model_name} | "
+            f"Items: {len(item_ids)}",
+            f"Item IDs: {', '.join(item_ids)}",
+        ]
+        if auto_graph:
+            out.append(f"Graph nodes created: {graph_count}")
+        out.append("Status: scaffolded")
+        return "\n".join(out)
+
+    # ── Single-item backward-compat path ─────────────────────
     record = ModelRecord(
         model_name=model_name,
         problem=problem,
@@ -812,37 +867,80 @@ async def think_model(
 
 
 async def think_debug(
-    approach_name: str,
-    issue: str,
+    approach_name: str = "binary_search",
+    issue: str = "",
     session_id: str | None = None,
     steps: list[str] | None = None,
     findings: str | None = None,
     resolution: str | None = None,
+    items: list[dict] | None = None,
     ctx: _MCPContext | None = None,
 ) -> str:
-    """Apply a systematic debugging approach to a technical issue.
+    """[ELABORATE] Apply systematic debugging (1..N issues).
 
-    Available approaches: binary_search, reverse_engineering, divide_conquer,
-    backtracking, cause_elimination, program_slicing.
+    Use when: technical issue needs methodical investigation. Approaches:
+    binary_search, reverse_engineering, divide_conquer, backtracking,
+    cause_elimination, program_slicing.
+
+    items[]: STRICT batch — each: id, approach, issue, steps[≥1], findings,
+      resolution. Lets you record N parallel debugging investigations atomically.
+    Single-form: backward-compat — record one approach + issue + optional fields.
 
     Args:
-        approach_name: Which debugging approach to use.
-        issue: The technical issue being debugged.
-        session_id: Thinking session ID. Omit to auto-create.
-        steps: Debugging steps taken.
-        findings: What was discovered.
-        resolution: How the issue was resolved.
+      items: STRICT — list of debug-record items as above.
+      approach_name, issue, steps, findings, resolution: single-form fields.
+      session_id: omit to auto-create.
 
-    Returns:
-        Compact status with debugging progress.
+    Returns: debug ids[] (items[] mode) or single status.
     """
-    _validate_enum(approach_name, _DEBUG_APPROACHES, "approach_name")
-
     _, info = await anyio.to_thread.run_sync(
         lambda: _get_or_create_think_session(session_id, ctx)
     )
     engine = _engine(info)
 
+    # ── Items[] strict batch path ────────────────────────────
+    if items is not None:
+        from aismartbuddy.tools import validate_items
+
+        validate_items(
+            items,
+            required=["approach", "issue", "steps", "findings", "resolution"],
+            tool="think_debug",
+        )
+        for i, it in enumerate(items):
+            if it["approach"] not in _DEBUG_APPROACHES:
+                raise ValueError(
+                    f"think_debug.items[{i}].approach '{it['approach']}' "
+                    f"invalid. Valid: {sorted(_DEBUG_APPROACHES)}"
+                )
+
+        from aismartbuddy.tools import collect_item_refs
+
+        ids: list[str] = []
+        with engine.state_lock:
+            for it in items:
+                rec = DebugRecord(
+                    approach_name=it["approach"],
+                    issue=it["issue"],
+                    steps=list(it["steps"]),
+                    findings=it["findings"],
+                    resolution=it["resolution"],
+                    record_id=it["id"],
+                    refs=collect_item_refs(it),
+                )
+                engine.add_debug(rec)
+                ids.append(it["id"])
+
+        return (
+            f"Session: {info.session_id} | Debugs: {len(ids)}\n"
+            f"IDs: {', '.join(ids)}\n"
+            "Status: debugged"
+        )
+
+    # ── Single-form backward-compat ─────────────────────────
+    _validate_enum(approach_name, _DEBUG_APPROACHES, "approach_name")
+    if not issue:
+        raise ValueError("single-form requires 'issue'")
     record = DebugRecord(
         approach_name=approach_name,
         issue=issue,
@@ -866,12 +964,12 @@ async def think_debug(
 
 
 async def think_argue(
-    claim: str,
-    premises: list[str],
-    conclusion: str,
-    argument_type: str,
-    confidence: float,
-    next_argument_needed: bool,
+    claim: str = "",
+    premises: list[str] | None = None,
+    conclusion: str = "",
+    argument_type: str = "thesis",
+    confidence: float = 0.5,
+    next_argument_needed: bool = False,
     session_id: str | None = None,
     argument_id: str | None = None,
     responds_to: str | None = None,
@@ -879,12 +977,21 @@ async def think_argue(
     contradicts: list[str] | None = None,
     strengths: list[str] | None = None,
     weaknesses: list[str] | None = None,
+    chain: list[dict] | None = None,
     ctx: _MCPContext | None = None,
 ) -> str:
     """Dialectical reasoning through thesis, antithesis, synthesis.
 
     Build chains of arguments that support, contradict, or synthesize each other.
     Types: thesis, antithesis, synthesis, objection, rebuttal.
+
+    Single mode: pass claim/premises/conclusion/argument_type for one argument.
+
+    Batch mode: pass `chain=[{type, claim, premises, conclusion, confidence,
+    responds_to_index?, strengths?, weaknesses?, supports?, contradicts?}, ...]`
+    to submit a full thesis→antithesis→synthesis dialectic in one call.
+    Sequential — entries processed in submission order. responds_to_index
+    references a prior entry in this chain (0-based).
 
     Args:
         claim: The central claim of this argument.
@@ -900,17 +1007,87 @@ async def think_argue(
         contradicts: IDs of arguments this contradicts.
         strengths: Notable strong points.
         weaknesses: Notable weak points.
+        chain: Batch mode — list of argument dicts. Returns chain_id +
+            argument_ids[]. KEEPS structural validation per-entry.
 
     Returns:
-        Compact status with argumentation chain progress.
+        Single mode: compact status with argumentation chain progress.
+        Batch mode: chain_id + ordered list of argument_ids.
     """
-    _validate_enum(argument_type, _ARGUMENT_TYPES, "argument_type")
-    confidence = max(0.0, min(1.0, confidence))
-
     _, info = await anyio.to_thread.run_sync(
         lambda: _get_or_create_think_session(session_id, ctx)
     )
     engine = _engine(info)
+
+    # ── Batch chain mode ─────────────────────────────────
+    if chain is not None:
+        if len(chain) < 1:
+            raise ValueError("chain must be non-empty")
+        # Validate every entry up front
+        for i, entry in enumerate(chain):
+            etype = entry.get("type") or entry.get("argument_type")
+            if not etype:
+                raise ValueError(f"chain[{i}] missing 'type'")
+            _validate_enum(etype, _ARGUMENT_TYPES, f"chain[{i}].type")
+            if not entry.get("claim"):
+                raise ValueError(f"chain[{i}] missing 'claim'")
+            if not entry.get("conclusion"):
+                raise ValueError(f"chain[{i}] missing 'conclusion'")
+            if not isinstance(entry.get("premises"), list):
+                raise ValueError(
+                    f"chain[{i}] 'premises' must be a list[str]"
+                )
+            if not entry["premises"]:
+                raise ValueError(f"chain[{i}] 'premises' must be non-empty")
+
+        # Process under one engine state lock so the chain is atomic
+        ids: list[str] = []
+        with engine.state_lock:
+            chain_id = uuid.uuid4().hex[:8]
+            for i, entry in enumerate(chain):
+                aid = entry.get("argument_id") or uuid.uuid4().hex[:8]
+                rt_idx = entry.get("responds_to_index")
+                rt = None
+                if rt_idx is not None:
+                    if not (0 <= int(rt_idx) < i):
+                        raise ValueError(
+                            f"chain[{i}].responds_to_index={rt_idx} "
+                            "must reference a prior entry"
+                        )
+                    rt = ids[int(rt_idx)]
+                etype = entry.get("type") or entry.get("argument_type")
+                conf = max(0.0, min(1.0, float(entry.get("confidence", 0.5))))
+                rec = ArgRecord(
+                    argument_id=aid,
+                    claim=entry["claim"],
+                    premises=list(entry["premises"]),
+                    conclusion=entry["conclusion"],
+                    argument_type=etype,
+                    confidence=conf,
+                    responds_to=rt,
+                    supports=list(entry.get("supports") or []),
+                    contradicts=list(entry.get("contradicts") or []),
+                    strengths=list(entry.get("strengths") or []),
+                    weaknesses=list(entry.get("weaknesses") or []),
+                )
+                engine.add_argument(chain_id, rec)
+                ids.append(aid)
+        return (
+            f"Session: {info.session_id} | Chain: {chain_id}"
+            f" | Batch: {len(ids)} arguments\n"
+            f"Arg IDs: {', '.join(ids)}\n"
+            "Status: dialectic batch applied"
+        )
+
+    # ── Single argument mode (existing) ──────────────────
+    _validate_enum(argument_type, _ARGUMENT_TYPES, "argument_type")
+    confidence = max(0.0, min(1.0, confidence))
+    if not claim:
+        raise ValueError("claim is required for single-argument mode")
+    if not premises:
+        raise ValueError("premises are required for single-argument mode")
+    if not conclusion:
+        raise ValueError("conclusion is required for single-argument mode")
 
     arg_id = argument_id or uuid.uuid4().hex[:8]
     record = ArgRecord(
@@ -951,89 +1128,44 @@ async def think_argue(
     return " | ".join(parts) + f"\nStatus: {status}"
 
 
-# ── Tool: Collaborative Reasoning ────────────────────────────
-
-
-async def think_collaborate(
-    topic: str,
-    personas: list[dict],
-    contributions: list[dict],
-    stage: str,
-    active_persona_id: str,
-    collaboration_id: str,
-    iteration: int,
-    next_contribution_needed: bool,
-    session_id: str | None = None,
-    consensus_points: list[str] | None = None,
-    disagreements: list[dict] | None = None,
-    open_questions: list[str] | None = None,
-    ctx: _MCPContext | None = None,
-) -> str:
-    """Simulate expert collaboration with diverse perspectives.
-
-    Define personas with expertise and biases, then make contributions
-    from each perspective. Stages: problem-definition, ideation, critique,
-    integration, decision, reflection.
-
-    Args:
-        topic: The problem being discussed.
-        personas: Expert personas with id, name, expertise,
-            background, perspective, biases, communication.
-        contributions: List of contributions with personaId, content, type, confidence.
-        stage: Current stage of collaboration.
-        active_persona_id: Which persona is currently contributing.
-        collaboration_id: Unique ID for this collaboration session.
-        iteration: Current iteration.
-        next_contribution_needed: Whether more contributions are needed.
-        session_id: Thinking session ID. Omit to auto-create.
-        consensus_points: Points of agreement.
-        disagreements: Points of disagreement with positions.
-        open_questions: Unresolved questions.
-
-    Returns:
-        Compact status with collaboration progress.
-    """
-    _validate_enum(stage, _COLLAB_STAGES, "stage")
-
-    _, info = await anyio.to_thread.run_sync(
-        lambda: _get_or_create_think_session(session_id, ctx)
-    )
-    engine = _engine(info)
-
-    record = CollabRecord(
-        session_id=collaboration_id,
-        topic=topic,
-        personas=personas,
-        contributions=contributions,
-        stage=stage,
-        iteration=iteration,
-        active_persona_id=active_persona_id,
-        consensus_points=consensus_points or [],
-        disagreements=disagreements or [],
-        open_questions=open_questions or [],
-    )
-    engine.upsert_collaboration(record)
-
-    parts = [
-        f"Session: {info.session_id}",
-        f"Collab: {collaboration_id}",
-        f"Stage: {stage}",
-        f"Personas: {len(personas)}",
-        f"Contributions: {len(contributions)}",
-        f"Iter: {iteration}",
-    ]
-    status = "collaborating" if next_contribution_needed else "concluded"
-    return " | ".join(parts) + f"\nStatus: {status}"
-
-
 # ── Tool: Scientific Method ──────────────────────────────────
 
 
+_MIN_FALSIFIABILITY_CHARS = 20
+
+
+def _validate_hypothesis_dict(h: dict) -> str | None:
+    """Per-item hypothesis validator. Returns None on OK, error string otherwise."""
+    if not isinstance(h, dict):
+        return "must be a dict with statement/variables/assumptions/confidence/falsifiability"
+    if not h.get("statement"):
+        return "missing 'statement'"
+    vars_ = h.get("variables")
+    if not isinstance(vars_, list) or not vars_:
+        return "'variables' must be non-empty list of {name, role}"
+    for j, v in enumerate(vars_):
+        if not isinstance(v, dict) or not v.get("name") or not v.get("role"):
+            return f"variables[{j}] missing name/role"
+        if v["role"] not in ("independent", "dependent", "controlled"):
+            return f"variables[{j}].role must be independent|dependent|controlled"
+    if not isinstance(h.get("assumptions"), list) or not h["assumptions"]:
+        return "'assumptions' must be non-empty list"
+    if "confidence" not in h:
+        return "missing 'confidence' (0.0-1.0)"
+    f = h.get("falsifiability") or ""
+    if len(f) < _MIN_FALSIFIABILITY_CHARS:
+        return (
+            f"'falsifiability' must be ≥ {_MIN_FALSIFIABILITY_CHARS} chars "
+            "(state a SPECIFIC observation that proves the hypothesis WRONG)"
+        )
+    return None
+
+
 async def think_science(
-    stage: str,
-    inquiry_id: str,
-    iteration: int,
-    next_stage_needed: bool,
+    stage: str = "hypothesis",
+    inquiry_id: str = "",
+    iteration: int = 1,
+    next_stage_needed: bool = False,
     session_id: str | None = None,
     observation: str | None = None,
     question: str | None = None,
@@ -1041,35 +1173,96 @@ async def think_science(
     experiment: dict | None = None,
     analysis: str | None = None,
     conclusion: str | None = None,
+    items: list[dict] | None = None,
+    auto_graph: bool = False,
     ctx: _MCPContext | None = None,
 ) -> str:
-    """Apply formal scientific reasoning with structured hypothesis testing.
+    """[SCAFFOLD] Generate falsifiable hypotheses (1..N). Call FIRST.
 
-    Work through stages: observation, question, hypothesis, experiment,
-    analysis, conclusion, iteration.
+    Use when: claim that needs testing; multiple competing hypotheses to record.
+    Do NOT use when: post-hoc result logging (use think_graph).
+
+    items[]: STRICT batch — each item: id, observation, question, hypothesis
+      {statement, variables[{name, role∈{independent,dependent,controlled}}],
+       assumptions[≥1], confidence, falsifiability ≥ 20 chars}.
+      Server REJECTS items where falsifiability is short or variables/assumptions
+      are missing.
+    Single-stage: backward-compat staged form (observation → hypothesis →
+      experiment → analysis → conclusion). Use mid-iteration.
 
     Args:
-        stage: Current stage in scientific method.
-        inquiry_id: Unique identifier for this inquiry.
-        iteration: Current iteration of the process.
-        next_stage_needed: Whether another stage is needed.
-        session_id: Thinking session ID. Omit to auto-create.
-        observation: Initial observation.
-        question: Research question.
-        hypothesis: Structured hypothesis with statement, variables, assumptions.
-        experiment: Experiment design with methodology, predictions.
-        analysis: Analysis of results.
-        conclusion: Final conclusion.
+      items: STRICT — list of hypothesis items as above.
+      auto_graph: when True + parent session has graph backend, materialise
+        each item as a KnowledgeNode (entity_type=question).
+      stage / inquiry_id / iteration / next_stage_needed: single-form fields.
+      observation, question, hypothesis, experiment, analysis, conclusion:
+        single-form payload.
+      session_id: omit to auto-create.
 
-    Returns:
-        Compact status with inquiry progress.
+    Returns: hypothesis_ids[] in items[] mode, or single-stage status.
     """
-    _validate_enum(stage, _SCIENCE_STAGES, "stage")
-
     _, info = await anyio.to_thread.run_sync(
         lambda: _get_or_create_think_session(session_id, ctx)
     )
     engine = _engine(info)
+
+    # ── Items[] strict batch path ────────────────────────────
+    if items is not None:
+        from aismartbuddy.tools import materialize_auto_graph, validate_items
+
+        validate_items(
+            items,
+            required=["observation", "question", "hypothesis"],
+            tool="think_science",
+            item_validators={"hypothesis": _validate_hypothesis_dict},
+        )
+
+        ids: list[str] = []
+        with engine.state_lock:
+            for it in items:
+                rec = InquiryRecord(
+                    inquiry_id=it["id"],
+                    stage="hypothesis",
+                    iteration=1,
+                    observation=it["observation"],
+                    question=it["question"],
+                    hypothesis=it["hypothesis"],
+                )
+                engine.upsert_inquiry(rec)
+                ids.append(it["id"])
+
+        graph_count = 0
+        if auto_graph:
+            if not session_id:
+                raise ValueError(
+                    "auto_graph requires explicit unified session_id from "
+                    "session_create(backends=['think','graph'])."
+                )
+            # Build description from hypothesis.statement
+            normalized = [
+                {**it, "_desc": it["hypothesis"]["statement"]}
+                for it in items
+            ]
+            graph_count = await materialize_auto_graph(
+                session_id, normalized,
+                source_tag="think_science",
+                entity_type="question",
+                description_field="_desc",
+            )
+
+        out = [
+            f"Session: {info.session_id} | Hypotheses: {len(ids)}",
+            f"IDs: {', '.join(ids)}",
+        ]
+        if auto_graph:
+            out.append(f"Graph nodes created: {graph_count}")
+        out.append("Status: hypothesized")
+        return "\n".join(out)
+
+    # ── Single-stage backward-compat path ─────────────────────
+    _validate_enum(stage, _SCIENCE_STAGES, "stage")
+    if not inquiry_id:
+        raise ValueError("inquiry_id required for single-stage form")
 
     record = InquiryRecord(
         inquiry_id=inquiry_id,
@@ -1099,13 +1292,56 @@ async def think_science(
 # ── Tool: Metacognitive Monitoring ───────────────────────────
 
 
+_CLAIM_STATUSES = frozenset({"fact", "inference", "speculation", "uncertain"})
+_STATUS_WEIGHT = {
+    "fact": 1.0, "inference": 0.75, "speculation": 0.5, "uncertain": 0.25,
+}
+
+
+def _validate_monitor_knowledge(k: dict) -> str | None:
+    """Per-item validator for monitor knowledge field."""
+    if not isinstance(k, dict):
+        return "must be a dict {domain, level, confidence, limitations[≥1]}"
+    if k.get("level") not in _KNOWLEDGE_LEVELS:
+        return f"level must be one of {sorted(_KNOWLEDGE_LEVELS)}"
+    if "confidence" not in k:
+        return "missing 'confidence' (0.0-1.0)"
+    lim = k.get("limitations")
+    if not isinstance(lim, list) or not lim:
+        return (
+            "'limitations' must be a non-empty list of strings — "
+            "self-assessment REJECTS empty limitations because the "
+            "forcing function is making 'what I don't know' explicit"
+        )
+    for j, x in enumerate(lim):
+        if not isinstance(x, str) or not x.strip():
+            return f"limitations[{j}] must be a non-empty string"
+    return None
+
+
+def _validate_monitor_claims(claims_list: list) -> str | None:
+    """Per-item validator for monitor claims field."""
+    if not isinstance(claims_list, list) or not claims_list:
+        return "must be a non-empty list of {claim, status, confidence, evidence}"
+    for j, c in enumerate(claims_list):
+        if not isinstance(c, dict) or not c.get("claim"):
+            return f"claims[{j}] missing 'claim'"
+        if c.get("status") not in _CLAIM_STATUSES:
+            return f"claims[{j}].status must be one of {sorted(_CLAIM_STATUSES)}"
+        if "confidence" not in c:
+            return f"claims[{j}] missing 'confidence'"
+        if not c.get("evidence"):
+            return f"claims[{j}] missing 'evidence'"
+    return None
+
+
 async def think_monitor(
-    task: str,
-    stage: str,
-    overall_confidence: float,
-    monitoring_id: str,
-    iteration: int,
-    next_assessment_needed: bool,
+    task: str = "",
+    stage: str = "monitoring",
+    overall_confidence: float = 0.5,
+    monitoring_id: str = "",
+    iteration: int = 1,
+    next_assessment_needed: bool = False,
     session_id: str | None = None,
     knowledge_assessment: dict | None = None,
     claims: list[dict] | None = None,
@@ -1113,41 +1349,118 @@ async def think_monitor(
     uncertainty_areas: list[str] | None = None,
     recommended_approach: str | None = None,
     suggested_assessments: list[str] | None = None,
+    items: list[dict] | None = None,
+    auto_graph: bool = False,
     ctx: _MCPContext | None = None,
 ) -> str:
-    """Systematic self-monitoring of knowledge and reasoning quality.
+    """[ASSESS] Self-monitor knowledge boundaries + claim certainty. Call LAST.
 
-    Track knowledge boundaries, claim certainty, and reasoning biases.
-    Stages: knowledge-assessment, planning, execution, monitoring,
-    evaluation, reflection.
+    Use when: honest calibration AFTER an analysis (limitations + claim
+    certainty); batch-assessing N tasks with the items[] form.
+    Do NOT use when: mid-elaboration (use think_graph metadata).
+
+    items[]: STRICT batch — each item: id, task, knowledge {domain, level∈
+      {expert,proficient,familiar,basic,minimal,none}, confidence,
+       limitations[≥1]}, claims[≥1] of {claim, status∈{fact,inference,
+       speculation,uncertain}, confidence, evidence}. REJECTS empty
+       limitations.
+    Single-form: backward-compat staged form for iterative monitoring.
 
     Args:
-        task: What task is being monitored.
-        stage: Current monitoring stage.
-        overall_confidence: Overall confidence (0.0 to 1.0).
-        monitoring_id: Unique ID for this monitoring session.
-        iteration: Current iteration.
-        next_assessment_needed: Whether further assessment is needed.
-        session_id: Thinking session ID. Omit to auto-create.
-        knowledge_assessment: Structured self-assessment with keys:
-            domain (str), knowledgeLevel (expert/proficient/familiar/
-            basic/minimal/none), confidenceScore (0-1),
-            supportingEvidence (str), knownLimitations (list[str]).
-        claims: Claims with status (fact/inference/speculation/
-            uncertain), confidenceScore (0-1), evidenceBasis (str),
-            and optional alternativeInterpretations, falsifiability.
-        reasoning_steps: Steps with potentialBiases (list[str]),
-            assumptions (list[str]), logicalValidity (0-1),
-            inferenceStrength (0-1).
-        uncertainty_areas: Areas of uncertainty.
-        recommended_approach: Recommended approach going forward.
-        suggested_assessments: Suggested next assessments to perform.
-            Values: knowledge, claim, reasoning, overall.
+      items: STRICT — list of monitoring items as above.
+      auto_graph: when True + parent session has graph backend, materialise
+        each item as a KnowledgeNode (entity_type=insight).
+      task / stage / monitoring_id / iteration / next_assessment_needed:
+        single-form fields.
+      knowledge_assessment, claims, reasoning_steps, uncertainty_areas,
+        recommended_approach, suggested_assessments: single-form payload.
+      session_id: omit to auto-create.
 
-    Returns:
-        Compact status with monitoring assessment.
+    Returns: assessment ids[] in items[] mode, or single-form status.
+
+    Stages (single-form): knowledge-assessment, planning, execution,
+    monitoring, evaluation, reflection. Single-form uses the legacy key names
+    `knowledgeLevel` / `confidenceScore` / `knownLimitations` inside
+    knowledge_assessment. The items[] form uses the short names
+    `level` / `confidence` / `limitations` — stick to ONE form per call.
     """
+    _, info = await anyio.to_thread.run_sync(
+        lambda: _get_or_create_think_session(session_id, ctx)
+    )
+    engine = _engine(info)
+
+    # ── Items[] strict batch path ────────────────────────────
+    if items is not None:
+        from aismartbuddy.tools import materialize_auto_graph, validate_items
+
+        validate_items(
+            items,
+            required=["task", "knowledge", "claims"],
+            tool="think_monitor",
+            item_validators={
+                "knowledge": _validate_monitor_knowledge,
+                "claims": _validate_monitor_claims,
+            },
+        )
+
+        ids: list[str] = []
+        with engine.state_lock:
+            for it in items:
+                k = it["knowledge"]
+                cl = it["claims"]
+                weighted = sum(
+                    float(c["confidence"]) * _STATUS_WEIGHT[c["status"]]
+                    for c in cl
+                )
+                weight_sum = sum(_STATUS_WEIGHT[c["status"]] for c in cl)
+                overall = weighted / weight_sum if weight_sum > 0 else 0.0
+                rec = MonitorRecord(
+                    monitoring_id=it["id"],
+                    task=it["task"],
+                    stage="self-assess",
+                    iteration=1,
+                    overall_confidence=overall,
+                    knowledge_assessment={
+                        "domain": k.get("domain", ""),
+                        "knowledgeLevel": k["level"],
+                        "confidence": float(k["confidence"]),
+                        "limitations": list(k["limitations"]),
+                    },
+                    claims=list(cl),
+                )
+                engine.upsert_monitor(rec)
+                ids.append(it["id"])
+
+        graph_count = 0
+        if auto_graph:
+            if not session_id:
+                raise ValueError(
+                    "auto_graph requires explicit unified session_id from "
+                    "session_create(backends=['think','graph'])."
+                )
+            normalized = [
+                {**it, "_desc": it["task"]} for it in items
+            ]
+            graph_count = await materialize_auto_graph(
+                session_id, normalized,
+                source_tag="think_monitor",
+                entity_type="insight",
+                description_field="_desc",
+            )
+
+        out = [
+            f"Session: {info.session_id} | Assessments: {len(ids)}",
+            f"IDs: {', '.join(ids)}",
+        ]
+        if auto_graph:
+            out.append(f"Graph nodes created: {graph_count}")
+        out.append("Status: monitored")
+        return "\n".join(out)
+
+    # ── Single-form backward-compat path ────────────────────
     _validate_enum(stage, _MONITOR_STAGES, "stage")
+    if not monitoring_id:
+        raise ValueError("monitoring_id required for single-form")
     overall_confidence = max(0.0, min(1.0, overall_confidence))
 
     if knowledge_assessment:
@@ -1165,11 +1478,6 @@ async def think_monitor(
     if suggested_assessments:
         for sa in suggested_assessments:
             _validate_enum(sa, _SUGGESTED_ASSESSMENTS, "suggested assessment")
-
-    _, info = await anyio.to_thread.run_sync(
-        lambda: _get_or_create_think_session(session_id, ctx)
-    )
-    engine = _engine(info)
 
     record = MonitorRecord(
         monitoring_id=monitoring_id,
@@ -1210,98 +1518,14 @@ async def think_monitor(
     return "\n".join(lines)
 
 
-# ── Tool: Visual Reasoning ───────────────────────────────────
-
-
-async def think_visualize(
-    operation: str,
-    diagram_id: str,
-    diagram_type: str,
-    iteration: int,
-    next_operation_needed: bool,
-    session_id: str | None = None,
-    elements: list[dict] | None = None,
-    observation: str | None = None,
-    hypothesis: str | None = None,
-    insight: str | None = None,
-    ctx: _MCPContext | None = None,
-) -> str:
-    """Visual thinking through diagrams and spatial representations.
-
-    Supports graph, flowchart, stateDiagram, conceptMap, treeDiagram, custom.
-    Operations: create, update, delete, transform, observe.
-
-    Args:
-        operation: What to do: create, update, delete, transform, observe.
-        diagram_id: Unique identifier for the diagram.
-        diagram_type: Type of diagram.
-        iteration: Current iteration.
-        next_operation_needed: Whether another operation is needed.
-        session_id: Thinking session ID. Omit to auto-create.
-        elements: Diagram elements (nodes, edges, containers, annotations).
-        observation: What you observe in the diagram.
-        hypothesis: Hypothesis about the visual structure.
-        insight: Insight derived from visual analysis.
-
-    Returns:
-        Compact status with diagram state.
-    """
-    _validate_enum(operation, _DIAGRAM_OPS, "operation")
-    _validate_enum(diagram_type, _DIAGRAM_TYPES, "diagram_type")
-
-    _, info = await anyio.to_thread.run_sync(
-        lambda: _get_or_create_think_session(session_id, ctx)
-    )
-    engine = _engine(info)
-
-    # Atomic read-modify-write: another agent could concurrently mutate the
-    # same diagram record between get_diagram and upsert_diagram.
-    with engine.state_lock:
-        existing = engine.get_diagram(diagram_id)
-        if operation == "delete":
-            engine.delete_diagram(diagram_id)
-            return f"Session: {info.session_id} | Diagram: {diagram_id} | Deleted"
-        elif existing:
-            if elements is not None:
-                existing.elements = elements
-            log_entry: dict = {"op": operation, "iter": iteration}
-            if observation:
-                log_entry["observation"] = observation
-            if hypothesis:
-                log_entry["hypothesis"] = hypothesis
-            existing.operations_log.append(log_entry)
-            record = existing
-        else:
-            init_log: dict = {"op": operation, "iter": iteration}
-            if observation:
-                init_log["observation"] = observation
-            if hypothesis:
-                init_log["hypothesis"] = hypothesis
-            record = DiagramRecord(
-                diagram_id=diagram_id,
-                diagram_type=diagram_type,
-                elements=elements or [],
-                operations_log=[init_log],
-            )
-        engine.upsert_diagram(record)
-
-    parts = [
-        f"Session: {info.session_id}",
-        f"Diagram: {diagram_id}",
-        f"Type: {record.diagram_type}",
-        f"Elements: {len(record.elements)}",
-        f"Op: {operation}",
-    ]
-    status = "evolving" if next_operation_needed else "stable"
-    if insight:
-        return " | ".join(parts) + f"\nStatus: {status}\nInsight: {insight[:200]}"
-    return " | ".join(parts) + f"\nStatus: {status}"
-
-
 # ── Tool: Summarize ──────────────────────────────────────────
 
 
-async def think_summarize(session_id: str) -> str:
+@size_guarded
+async def think_summarize(
+    session_id: str,
+    max_items_per_category: int = 20,
+) -> str:
     """Get a token-optimized summary of all thinking activity in a session.
 
     Returns a compact overview of all thought graphs, mental models,
@@ -1310,13 +1534,16 @@ async def think_summarize(session_id: str) -> str:
 
     Args:
         session_id: Thinking session ID.
+        max_items_per_category: Cap on items per category to prevent huge
+            responses on sessions with hundreds of items. Default 20.
+            Excess items collapse to "... (N more)" footer.
 
     Returns:
         Compact summary of all thinking activity.
     """
     _, info = _require_think_session(session_id)
     engine = _engine(info)
-    return f"Session: {session_id}\n{engine.get_summary()}"
+    return f"Session: {session_id}\n{engine.get_summary(max_items_per_category)}"
 
 
 # ── Tool: Destroy Session ────────────────────────────────────

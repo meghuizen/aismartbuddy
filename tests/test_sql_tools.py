@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from aismartbuddy.engines.duckdb_engine import DuckDBEngine
 
 
@@ -89,6 +91,39 @@ class TestDuckDBEngine:
         assert columns == ["id"]
         assert rows == []
 
+    def test_execute_windowed_streams_requested_slice(self, duckdb_engine: DuckDBEngine):
+        duckdb_engine.execute("CREATE TABLE t (id INTEGER)")
+        duckdb_engine.execute(
+            "INSERT INTO t SELECT i FROM range(0, 250) AS src(i)"
+        )
+
+        table, has_more = duckdb_engine.execute_windowed(
+            "SELECT id FROM t ORDER BY id",
+            offset=100,
+            limit=10,
+        )
+
+        assert table is not None
+        assert table.num_rows == 10
+        assert table.column("id").to_pylist() == list(range(100, 110))
+        assert has_more is True
+
+    def test_execute_windowed_returns_empty_after_end(self, duckdb_engine: DuckDBEngine):
+        duckdb_engine.execute("CREATE TABLE t (id INTEGER)")
+        duckdb_engine.execute(
+            "INSERT INTO t SELECT i FROM range(0, 5) AS src(i)"
+        )
+
+        table, has_more = duckdb_engine.execute_windowed(
+            "SELECT id FROM t ORDER BY id",
+            offset=10,
+            limit=5,
+        )
+
+        assert table is not None
+        assert table.num_rows == 0
+        assert has_more is False
+
 
 class TestImportFormats:
     """Test all supported import formats via import_data."""
@@ -158,7 +193,39 @@ class TestImportFormats:
         assert total == 0
 
     def test_import_unsupported_format(self, duckdb_engine: DuckDBEngine):
-        import pytest
-
         with pytest.raises(ValueError, match="Unsupported format"):
             duckdb_engine.import_data("t", "data", "xlsx")
+
+
+@pytest.mark.usefixtures("_init_session_manager")
+class TestSqlToolWindowing:
+    @pytest.mark.anyio
+    async def test_sql_query_offset_uses_windowed_results(self):
+        from aismartbuddy.tools.sql import sql_create_session, sql_query
+
+        sid_result = await sql_create_session()
+        sid = next(
+            line.split(":", 1)[1].strip()
+            for line in sid_result.splitlines()
+            if line.startswith("session_id:")
+        )
+
+        await sql_query(
+            session_id=sid,
+            query="CREATE TABLE t (id INTEGER);",
+        )
+        await sql_query(
+            session_id=sid,
+            query="INSERT INTO t SELECT i FROM range(0, 25) AS src(i);",
+        )
+
+        result = await sql_query(
+            session_id=sid,
+            query="SELECT id FROM t ORDER BY id;",
+            offset=10,
+            limit=5,
+        )
+
+        assert "# Page: rows 10-14" in result
+        assert "10" in result
+        assert "14" in result

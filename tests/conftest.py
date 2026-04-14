@@ -22,6 +22,17 @@ def session_manager(tmp_path):
 
 
 @pytest.fixture
+def _init_session_manager(session_manager: SessionManager):
+    """Wire the `session_manager` fixture into the module-level singleton
+    that tools read. Shared via conftest so test files don't duplicate."""
+    import aismartbuddy.session as session_mod
+
+    session_mod.session_manager = session_manager
+    yield
+    session_mod.session_manager = None
+
+
+@pytest.fixture
 def duckdb_engine(tmp_path):
     """Create a DuckDB engine with a temp database."""
     db_path = str(tmp_path / "test.duckdb")
