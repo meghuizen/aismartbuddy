@@ -862,6 +862,8 @@ async def think_graph(
     if action == "revise":
         if not node_id:
             raise ValueError("node_id is required for revise action")
+        if not thought:
+            raise ValueError("thought content is required for revise action")
         node = engine.revise_node(node_id, thought)
         if node is None:
             raise ValueError(f"Node '{node_id}' not found")

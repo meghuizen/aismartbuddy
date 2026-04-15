@@ -498,3 +498,17 @@ class TestPlanSparklingGrowingOrbit:
             parent_id=root_id,
         )
         assert "Suggested next: think_monitor" in synth
+
+    @pytest.mark.anyio
+    async def test_revise_rejects_empty_thought(self):
+        # Regression: with `thought: str = ""` as default, the revise branch
+        # must validate non-empty content or it silently blanks the node.
+        seeded = await think_graph(thought="Initial claim")
+        sid = _extract_value(seeded, "Session:")
+        node_id = _extract_value(seeded, "Node:")
+        with pytest.raises(ValueError, match="thought content is required"):
+            await think_graph(
+                session_id=sid,
+                action="revise",
+                node_id=node_id,
+            )
