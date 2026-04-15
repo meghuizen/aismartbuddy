@@ -12,6 +12,7 @@ from aismartbuddy.tools import (
     execute_and_format,
     fetch_next_and_format,
     get_session_manager,
+    resolve_active_or_provided_session_id,
     run_with_lock,
 )
 
@@ -28,7 +29,7 @@ def _validate_sql_identifier(name: str, label: str = "identifier") -> str:
     return name
 
 
-def _require_sql_session(session_id: str):
+def _require_sql_session(session_id: str | None):
     """Validate and return a SQL session.
 
     Accepts either:
@@ -37,6 +38,12 @@ def _require_sql_session(session_id: str):
 
     Routes through resolve_backend_session for the parent-id case.
     """
+    session_id = resolve_active_or_provided_session_id(session_id)
+    if not session_id:
+        raise ValueError(
+            "session_id is required unless an active session is set. "
+            "Use think_set_active_session(session_id)."
+        )
     mgr = get_session_manager()
     info = mgr.resolve_backend_session(session_id, "sql")
     return mgr, info
@@ -82,8 +89,8 @@ async def sql_create_session(
 
 
 async def sql_query(
-    session_id: str,
-    query: str,
+    session_id: str | None = None,
+    query: str = "",
     output_format: str = "csv",
     offset: int | None = None,
     limit: int | None = None,
@@ -117,12 +124,18 @@ async def sql_query(
     """
     mgr, info = _require_sql_session(session_id)
     return await execute_and_format(
-        info, mgr, query, output_format, offset, limit, paginate,
+        info,
+        mgr,
+        query,
+        output_format,
+        offset,
+        limit,
+        paginate,
         next_tool="sql_query_next",
     )
 
 
-async def sql_query_next(session_id: str, cursor_id: str) -> str:
+async def sql_query_next(session_id: str | None = None, cursor_id: str = "") -> str:
     """Fetch the next page of results from a paginated SQL query.
 
     Use after sql_query(..., paginate=True) returns a cursor_id.
@@ -142,14 +155,17 @@ async def sql_query_next(session_id: str, cursor_id: str) -> str:
     """
     mgr, info = _require_sql_session(session_id)
     return await fetch_next_and_format(
-        info, mgr, cursor_id, next_tool="sql_query_next",
+        info,
+        mgr,
+        cursor_id,
+        next_tool="sql_query_next",
     )
 
 
 async def sql_import(
-    session_id: str,
-    table_name: str,
-    data: str,
+    session_id: str | None = None,
+    table_name: str = "",
+    data: str = "",
     data_format: str = "csv",
     create_table: bool = True,
     delimiter: str | None = None,
@@ -202,18 +218,16 @@ async def sql_import(
     mgr, info = _require_sql_session(session_id)
     count = await run_with_lock(
         info,
-        lambda: info.engine.import_data(
-            table_name, data, data_format, create_table, delimiter
-        ),
+        lambda: info.engine.import_data(table_name, data, data_format, create_table, delimiter),
     )
     action = "Created table and imported" if create_table else "Appended"
     return f"{action} {count} rows into '{table_name}' (format: {data_format})."
 
 
 async def sql_import_batch(
-    session_id: str,
-    table_name: str,
-    chunks: list[str],
+    session_id: str | None = None,
+    table_name: str = "",
+    chunks: list[str] | None = None,
     data_format: str = "csv",
     delimiter: str | None = None,
 ) -> str:
@@ -253,17 +267,15 @@ async def sql_import_batch(
     mgr, info = _require_sql_session(session_id)
     total = await run_with_lock(
         info,
-        lambda: info.engine.import_batch(
-            table_name, chunks, data_format, delimiter
-        ),
+        lambda: info.engine.import_batch(table_name, chunks or [], data_format, delimiter),
     )
     return (
         f"Imported {total} rows into '{table_name}' "
-        f"from {len(chunks)} chunks (format: {data_format})."
+        f"from {len(chunks or [])} chunks (format: {data_format})."
     )
 
 
-async def sql_schema(session_id: str, table_name: str | None = None) -> str:
+async def sql_schema(session_id: str | None = None, table_name: str | None = None) -> str:
     """Get database schema information.
 
     Without table_name: lists all tables in the database.
@@ -281,9 +293,7 @@ async def sql_schema(session_id: str, table_name: str | None = None) -> str:
     mgr, info = _require_sql_session(session_id)
 
     if table_name:
-        columns, rows = await run_with_lock(
-            info, lambda: info.engine.describe_table(table_name)
-        )
+        columns, rows = await run_with_lock(info, lambda: info.engine.describe_table(table_name))
         return format_result(columns, rows, mgr.max_rows, mgr.max_chars, "table")
     else:
         tables = await run_with_lock(info, info.engine.get_tables)
@@ -291,17 +301,15 @@ async def sql_schema(session_id: str, table_name: str | None = None) -> str:
             return "No tables in database. Use sql_import or sql_query with CREATE TABLE."
         schema_list = []
         for tbl in tables:
-            cols, rows = await run_with_lock(
-                info, lambda t=tbl: info.engine.describe_table(t)
-            )
+            cols, rows = await run_with_lock(info, lambda t=tbl: info.engine.describe_table(t))
             col_info = [(row[0], row[1]) for row in rows]
             schema_list.append({"name": tbl, "columns": col_info})
         return format_schema_compact(schema_list)
 
 
 async def data_profile(
-    session_id: str,
-    table: str,
+    session_id: str | None = None,
+    table: str = "",
     columns: list[str] | None = None,
 ) -> str:
     """Statistical profile of a SQL table — replaces 5–10 manual queries.
@@ -328,14 +336,17 @@ async def data_profile(
     target = ", ".join(columns) if columns else "*"
     query = f"SUMMARIZE SELECT {target} FROM {table};"
     return await execute_and_format(
-        info, mgr, query, output_format="csv",
+        info,
+        mgr,
+        query,
+        output_format="csv",
     )
 
 
 async def data_anomalies(
-    session_id: str,
-    table: str,
-    columns: list[str],
+    session_id: str | None = None,
+    table: str = "",
+    columns: list[str] | None = None,
     method: str = "zscore",
     threshold: float | None = None,
 ) -> str:
@@ -363,9 +374,7 @@ async def data_anomalies(
     if not columns:
         raise ValueError("data_anomalies requires at least one column")
     if method not in ("zscore", "iqr", "isolation_forest"):
-        raise ValueError(
-            f"method must be zscore | iqr | isolation_forest, got {method!r}"
-        )
+        raise ValueError(f"method must be zscore | iqr | isolation_forest, got {method!r}")
     if method == "isolation_forest":
         raise NotImplementedError(
             "isolation_forest requires an external library (scikit-learn). "
@@ -380,14 +389,11 @@ async def data_anomalies(
         z_thresh = threshold if threshold is not None else 3.0
         # Build per-column z-score expression and flag any > threshold
         flags = " OR ".join(
-            f"ABS(({c} - AVG({c}) OVER ()) / NULLIF(STDDEV({c}) OVER (), 0)) "
-            f"> {z_thresh}"
+            f"ABS(({c} - AVG({c}) OVER ()) / NULLIF(STDDEV({c}) OVER (), 0)) > {z_thresh}"
             for c in columns
         )
         query = (
-            f"SELECT * FROM (SELECT *, "
-            f"({flags}) AS _is_anomaly FROM {table}) "
-            f"WHERE _is_anomaly;"
+            f"SELECT * FROM (SELECT *, ({flags}) AS _is_anomaly FROM {table}) WHERE _is_anomaly;"
         )
     else:  # iqr
         # For iqr, we need quantile_cont per column. Build CTE per column.
@@ -404,16 +410,17 @@ async def data_anomalies(
                 f"OR {c} > (SELECT p75_{c} + 1.5 * (p75_{c} - p25_{c}) FROM q_{c}))"
             )
         cte_str = "WITH " + ", ".join(ctes)
-        query = (
-            f"{cte_str} SELECT * FROM {table} WHERE " + " OR ".join(wheres) + ";"
-        )
+        query = f"{cte_str} SELECT * FROM {table} WHERE " + " OR ".join(wheres) + ";"
 
     return await execute_and_format(
-        info, mgr, query, output_format="csv",
+        info,
+        mgr,
+        query,
+        output_format="csv",
     )
 
 
-async def sql_destroy_session(session_id: str) -> str:
+async def sql_destroy_session(session_id: str | None = None) -> str:
     """Destroy a SQL session and clean up all temporary data.
 
     Always call this when done to free resources.
@@ -426,5 +433,5 @@ async def sql_destroy_session(session_id: str) -> str:
     """
     mgr, info = _require_sql_session(session_id)
     # destroy_session handles its own locking (pop-then-lock protocol)
-    await anyio.to_thread.run_sync(lambda: mgr.destroy_session(session_id))
-    return f"SQL session '{session_id}' destroyed and cleaned up."
+    await anyio.to_thread.run_sync(lambda: mgr.destroy_session(info.session_id))
+    return f"SQL session '{info.session_id}' destroyed and cleaned up."

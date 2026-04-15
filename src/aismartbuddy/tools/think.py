@@ -7,6 +7,7 @@ auto-session creation, and token-optimized compact text output.
 
 from __future__ import annotations
 
+import re
 import uuid
 from typing import TYPE_CHECKING
 
@@ -20,8 +21,13 @@ from mcp.server.fastmcp import Context as _MCPContext
 
 from aismartbuddy.engines.thinking_engine import (
     ArgRecord,
+    ConstraintRecord,
+    ConstraintValidationRecord,
     DebugRecord,
     DecisionRecord,
+    EvidenceChainRecord,
+    EvidenceRecord,
+    HypothesisRecord,
     InquiryRecord,
     InterferenceRecord,
     ModelRecord,
@@ -30,10 +36,15 @@ from aismartbuddy.engines.thinking_engine import (
     RuleProfile,
     ThinkingEngine,
     ThoughtNode,
+    TopologyRecord,
     ValidationAssessment,
 )
 from aismartbuddy.identity import resolve_identity
-from aismartbuddy.tools import get_session_manager, size_guarded
+from aismartbuddy.tools import (
+    get_session_manager,
+    resolve_active_or_provided_session_id,
+    size_guarded,
+)
 
 if TYPE_CHECKING:
     from aismartbuddy.session import SessionInfo, SessionManager
@@ -55,6 +66,9 @@ _MODEL_NAMES = frozenset(
         "design_review",
         "complexity",
         "root_cause",
+        "kuba",
+        "systems_dynamics",
+        "inversion",
     }
 )
 
@@ -168,6 +182,43 @@ _VALIDATION_STATUSES = frozenset(
         "not_applicable",
     }
 )
+_HYPOTHESIS_ACTIONS = frozenset(
+    {"register", "evidence", "compare", "discriminate", "update", "invalidate"}
+)
+_HYPOTHESIS_EVIDENCE_DIRECTIONS = frozenset({"supports", "weakens", "neutral"})
+_CONSTRAINT_ACTIONS = frozenset({"register", "validate", "list", "remove", "check_all"})
+_CONSTRAINT_TYPES = frozenset({"hard", "soft"})
+_CONSTRAINT_VALIDATION_RESULTS = frozenset({"pass", "fail", "uncertain"})
+_TOPOLOGY_ACTIONS = frozenset({"define", "abstract", "compare", "translate", "search"})
+_TOPOLOGY_NODE_ROLES = frozenset(
+    {"SOURCE", "SINK", "SENSOR", "EFFECTOR", "BUFFER", "SWITCH", "GATE", "JUNCTION"}
+)
+_TOPOLOGY_EDGE_TYPES = frozenset(
+    {"AMPLIFIES", "SUPPRESSES", "DELAYS", "SATURATES", "OSCILLATES", "THRESHOLDS", "COUPLES"}
+)
+_EVIDENCE_ACTIONS = frozenset({"register", "chain", "trace", "strength", "list"})
+_EVIDENCE_SOURCE_TYPES = frozenset(
+    {
+        "measurement",
+        "observation",
+        "literature",
+        "inference",
+        "analogy",
+        "simulation",
+        "expert_opinion",
+    }
+)
+_EVIDENCE_INFERENCE_TYPES = frozenset({"deductive", "inductive", "abductive", "analogical"})
+_BRIDGE_ACTIONS = frozenset(
+    {
+        "thoughts_for_entity",
+        "entities_for_thought",
+        "hypotheses_for_entity",
+        "evidence_for_hypothesis",
+        "constraints_for_hypothesis",
+        "full_context",
+    }
+)
 
 
 # ── Helpers ──────────────────────────────────────────────────
@@ -189,6 +240,7 @@ def _get_or_create_think_session(
     pass backends=['think', ...] to session_create up front.
     """
     mgr = get_session_manager()
+    session_id = resolve_active_or_provided_session_id(session_id)
     if session_id:
         # resolve_backend_session handles both parent-id and direct-child
         # cases; raises if the parent has no think backend.
@@ -200,10 +252,14 @@ def _get_or_create_think_session(
     return mgr, info
 
 
-def _require_think_session(session_id: str) -> tuple[SessionManager, SessionInfo]:
+def _require_think_session(session_id: str | None) -> tuple[SessionManager, SessionInfo]:
     """Validate and return an existing think session. Raises if wrong type."""
+    session_id = resolve_active_or_provided_session_id(session_id)
     if not session_id:
-        raise ValueError("session_id is required")
+        raise ValueError(
+            "session_id is required unless an active session is set. "
+            "Use think_set_active_session(session_id)."
+        )
     return _get_or_create_think_session(session_id)
 
 
@@ -265,6 +321,120 @@ def _format_rule_validation_summary(summary: dict) -> str:
         lines.append(f"- Unresolved conflicts: {', '.join(summary['conflicts'])}")
     if summary.get("nuance_notes"):
         lines.append(f"- Nuance notes: {' | '.join(summary['nuance_notes'][:3])}")
+    return "\n".join(lines)
+
+
+def _idempotent_result(session_id: str | None, idempotency_key: str | None) -> str | None:
+    """Return cached result for a write op if this idempotency key already succeeded."""
+    if not session_id or not idempotency_key:
+        return None
+    return get_session_manager().get_idempotent_result(session_id, idempotency_key)
+
+
+def _store_idempotent_result(
+    session_id: str | None, idempotency_key: str | None, result: str
+) -> str:
+    """Persist idempotent write result and return it unchanged."""
+    if session_id and idempotency_key:
+        get_session_manager().store_idempotent_result(session_id, idempotency_key, result)
+    return result
+
+
+def _companion_graph_session_id(think_session_id: str) -> str | None:
+    """Return the graph companion session for a think session when unified."""
+    return get_session_manager().find_companion_session(think_session_id, "graph")
+
+
+async def _safe_graph_context_lines(
+    think_session_id: str,
+    *,
+    entity_names: list[str] | None = None,
+    target_name: str | None = None,
+) -> list[str]:
+    """Best-effort graph-backed context. Returns [] if graph is unavailable or errors."""
+    graph_session_id = _companion_graph_session_id(think_session_id)
+    if not graph_session_id:
+        return []
+    try:
+        from aismartbuddy.tools.graph import graph_focus_summary, graph_query
+
+        lines = [f"Graph companion: {graph_session_id}"]
+        if entity_names:
+            names = [name for name in dict.fromkeys(entity_names) if str(name).strip()][:5]
+            if names:
+                lines.append("Graph-backed knowledge refs:")
+                focus = await graph_focus_summary(
+                    session_id=graph_session_id,
+                    node_names=names,
+                    node_type="KnowledgeNode",
+                    depth=1,
+                )
+                lines.extend(f"  {line}" for line in focus.splitlines()[:12])
+        if target_name:
+            quoted = target_name.replace("'", "''")
+            result = await graph_query(
+                session_id=graph_session_id,
+                query=(
+                    "MATCH (n:KnowledgeNode) "
+                    f"WHERE n.name = '{quoted}' "
+                    "RETURN n.name AS name, n.entity_type AS entity_type LIMIT 5;"
+                ),
+            )
+            if "name" in result:
+                lines.append("Graph node match:")
+                lines.extend(f"  {line}" for line in result.splitlines()[:6])
+        return lines
+    except Exception:
+        return []
+
+
+def _short(text: str, limit: int = 80) -> str:
+    cleaned = " ".join((text or "").split())
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[:limit] + "..."
+
+
+def _node_to_export_dict(node: ThoughtNode) -> dict:
+    return {
+        "id": node.id,
+        "tree_id": node.tree_id,
+        "action": node.action,
+        "parent_id": node.parent_id,
+        "depth": node.depth,
+        "thought": node.content,
+        "metadata": node.metadata,
+        "refs": list(node.refs),
+        "depends_on": list(node.depends_on),
+        "children": list(node.children),
+        "validation_results": list(node.validation_results),
+    }
+
+
+def _render_subtree_outline(engine: ThinkingEngine, node_id: str, depth: int | None = None) -> str:
+    root = engine.get_node(node_id)
+    if root is None:
+        return ""
+    lines: list[str] = []
+
+    def _walk(current_id: str, level: int) -> None:
+        node = engine.get_node(current_id)
+        if node is None:
+            return
+        if depth is not None and level > depth:
+            return
+        lines.append(f"{'  ' * level}- {node.id} [{node.action}] {_short(node.content, 100)}")
+        if node.validation_results:
+            latest = node.validation_results[-1]
+            lines.append(
+                f"{'  ' * (level + 1)}validation: "
+                f"hard_gates={'pass' if latest.get('passed_hard_gates', True) else 'fail'} "
+                f"score={latest.get('weighted_score')}"
+            )
+        for child_id in node.children:
+            _walk(child_id, level + 1)
+
+    _walk(root.id, 0)
     return "\n".join(lines)
 
 
@@ -495,6 +665,45 @@ _DELEGATE_ACTIONS = frozenset(
     }
 )
 
+# Soft threshold above which a single thought node is flagged as essay-length.
+# Long thoughts defeat graph queryability — short nodes stay addressable.
+_LONG_THOUGHT_THRESHOLD = 1500
+
+
+def _compose_next_hint(tool: str, key_arg: str, ids: list[str]) -> str:
+    """Format a 'Suggested next:' line to nudge cross-tool composition.
+
+    Return format: `Suggested next: <tool>(<key_arg>=["id1","id2"])`.
+    Empty id list ⇒ empty string (no nudge when there's nothing to pass).
+    """
+    if not ids:
+        return ""
+    # Cap to avoid flooding the hint with 50+ ids from a batch.
+    shown = ids[:8]
+    ids_repr = ", ".join(f'"{i}"' for i in shown)
+    more = f", ...+{len(ids) - len(shown)} more" if len(ids) > len(shown) else ""
+    return f'Suggested next: {tool}({key_arg}=[{ids_repr}{more}])'
+
+
+def _long_thought_warnings(entries: list[tuple[str, str]]) -> str:
+    """Return a multi-line advisory string for any entries whose content
+    exceeds the soft length threshold, or "" if none.
+
+    entries: list of (label, content) pairs, where label identifies the
+    offending thought (e.g. "thought", "thoughts[3]", "children[1]").
+    """
+    notes: list[str] = []
+    for label, content in entries:
+        length = len(content or "")
+        if length > _LONG_THOUGHT_THRESHOLD:
+            notes.append(
+                f"Note: {label} is {length} chars — consider action='branch' "
+                f"with children=[...] to keep nodes queryable."
+            )
+    if not notes:
+        return ""
+    return "\n".join(notes) + "\n"
+
 
 # ── Tool: Thought Graph ─────────────────────────────────────
 
@@ -517,7 +726,7 @@ def _build_path_string(engine: ThinkingEngine, node_id: str) -> str:
 
 
 async def think_graph(
-    thought: str,
+    thought: str = "",
     action: str = "think",
     session_id: str | None = None,
     parent_id: str | None = None,
@@ -527,9 +736,11 @@ async def think_graph(
     refs: list[str] | None = None,
     metadata: dict | None = None,
     children: list[dict] | None = None,
+    thoughts: list[dict] | None = None,
     expected_children: int | None = None,
     min_children: int | None = None,
     rule_profile_ids: list[str] | None = None,
+    idempotency_key: str | None = None,
     ctx: _MCPContext | None = None,
 ) -> str:
     """Thought graph — structured thinking with progressive complexity.
@@ -538,22 +749,50 @@ async def think_graph(
     hierarchical tree decomposition, multi-tree forests, revision with
     history, and synthesis.
 
+    PREFERRED: use the `thoughts=[...]` batch parameter for new chains and
+    trees. One call creates N nodes atomically — this is the fastest, most
+    queryable shape for sequential or hierarchical analysis. Fall back to
+    single-call mode only for incremental mid-analysis additions.
+
     KEEP THOUGHTS CONCISE. One thought = one move (a claim, an observation,
     a sub-goal, a conclusion). Aim for 1–3 sentences per node, not paragraphs.
     If a thought is becoming an essay, use action="branch" and split into
     children. Long stories collapse to noise; short nodes stay queryable.
 
-    For simple sequential thinking (like a chain of thoughts):
-        think_graph(thought="First insight")  → creates root
-        think_graph(thought="Building on that...", parent_id="<prev>")
-        think_graph(thought="Therefore...", parent_id="<prev>")
+    Thought-unit granularity rules:
+    - One node = one semantic unit. Do not combine multiple independent claims,
+      multiple reasoning steps, or a problem and its solution in one node.
+    - If a thought says "A implies B, and B implies C", that is at least two
+      thought units plus an optional synthesis, not one node.
+    - If a thought contains "however", "therefore", "additionally", or
+      another connector joining distinct ideas, split them unless they are
+      inseparable parts of the same inference step.
+    - Evidence and claim should usually be separate nodes linked by refs,
+      so validation can challenge the claim without losing the evidence.
 
-    For hierarchical decomposition:
-        think_graph(thought="Break this into parts", action="branch")
-        think_graph(thought="Part A analysis", parent_id="<branch>")
-        think_graph(thought="Part B analysis", parent_id="<branch>")
-        think_graph(thought="Combined conclusion", action="synthesize",
-                    parent_id="<branch>")
+    PREFERRED — sequential chain in one call:
+        think_graph(thoughts=[
+            {"thought": "First insight"},
+            {"thought": "Building on that...", "parent_ref": 0},
+            {"thought": "Therefore...", "parent_ref": 1},
+            {"thought": "Implication for decision", "parent_ref": 2},
+        ])
+        # parent_ref is an integer index into this same batch, or an existing
+        # node_id string. Index 0 is the root of a new tree.
+
+    PREFERRED — hierarchical decomposition in one call:
+        think_graph(thoughts=[
+            {"thought": "Break this into parts", "action": "branch"},
+            {"thought": "Part A analysis", "parent_ref": 0},
+            {"thought": "Part B analysis", "parent_ref": 0},
+            {"thought": "Combined conclusion",
+             "action": "synthesize", "parent_ref": 0},
+        ])
+
+    Incremental (mid-analysis additions, not for new chains):
+        think_graph(thought="Follow-up point", parent_id="<existing_id>")
+        think_graph(thought="Revised claim", action="revise",
+                    node_id="<existing_id>")
 
     Actions:
         think: Add a thought node (default). parent_id=None creates
@@ -566,7 +805,15 @@ async def think_graph(
             Same mechanics as think but tagged as synthesis.
 
     Args:
-        thought: The thinking content.
+        thoughts: PREFERRED. Batch mode — each item is one atomic thought unit:
+            {thought, action?, parent_ref?, metadata?, refs?, depends_on?}.
+            parent_ref may be an existing node_id string OR an integer index
+            pointing at another item earlier in this same batch (0 = the first
+            item, which becomes a new tree root). Batch mode collapses N
+            round-trips to 1 and is the default for new chains or trees. It is
+            not a place to hide one large mixed-meaning essay inside a single
+            array entry — one item, one thought unit.
+        thought: The thinking content (single-call / incremental mode).
         action: What kind of thought: think, branch, revise, synthesize.
         session_id: Thinking session ID. Omit to auto-create.
         parent_id: Parent node ID. None creates new tree root.
@@ -574,13 +821,27 @@ async def think_graph(
         tree_id: Optionally assign to existing tree (ignored when
             parent_id is set — tree is inferred from parent).
         metadata: Flexible context bag for additional data.
+            Recommended conventions:
+            - knowledge_refs: [entity_name, ...]
+            - hypothesis_refs: [hypothesis_id, ...]
+            - constraint_refs: [constraint_id, ...]
+            - evidence_refs: [evidence_id, ...]
+            - topology_refs: [topology_id, ...]
+            - confidence: 0.0-1.0
+            - claim_type: fact | inference | speculation | assumption
+            - domain: free-text domain tag
         children: Optional list of child specs to create atomically with the
             parent in one call (one round trip instead of N+1). Each child:
             {thought: str, metadata?: dict, action?: str}. Returns parent_id +
             child_ids[]. Use with action="branch" for decomposition batching.
+            Each child is still one thought unit. Batch children exist to reduce
+            round-trips, not to pack large multi-part analyses into one entry.
         expected_children: Planning horizon — declare how many children you
             intend to create. When action="synthesize" runs later, the tool
             warns if the actual count differs.
+        idempotency_key: Optional retry token for safe write retries. If the
+            same session_id + key combination already completed, the server
+            returns the original result without creating duplicate nodes.
 
     Returns:
         Compact status with node position and tree structure.
@@ -590,6 +851,12 @@ async def think_graph(
     _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
     engine = _engine(info)
     sid = info.session_id
+    cached = _idempotent_result(sid, idempotency_key)
+    if cached is not None:
+        return cached
+
+    if thought and thoughts:
+        raise ValueError("Provide either thought or thoughts, not both")
 
     # ── Revise: update existing node ─────────────────────
     if action == "revise":
@@ -599,15 +866,96 @@ async def think_graph(
         if node is None:
             raise ValueError(f"Node '{node_id}' not found")
         path_str = _build_path_string(engine, node.id)
-        return (
-            f"Session: {sid} | Tree: {node.tree_id} | Node: {node.id}\n"
-            f"Action: revise | Depth: {node.depth}"
-            f" | Revisions: {len(node.revision_history)}\n"
-            f"Path: {path_str}\n"
-            f"Status: revised"
+        return _store_idempotent_result(
+            sid,
+            idempotency_key,
+            (
+                f"Session: {sid} | Tree: {node.tree_id} | Node: {node.id}\n"
+                f"Action: revise | Depth: {node.depth}"
+                f" | Revisions: {len(node.revision_history)}\n"
+                f"Path: {path_str}\n"
+                f"Status: revised"
+            ),
         )
 
+    if thoughts is not None:
+        if not thoughts:
+            raise ValueError("thoughts batch must be non-empty")
+        bindings = _rule_bindings_from_profile_ids(engine, rule_profile_ids)
+        specs: list[dict] = []
+        created_refs: list[str] = []
+        for index, item in enumerate(thoughts):
+            content = str(item.get("thought", "")).strip()
+            if not content:
+                raise ValueError(f"thoughts[{index}] missing 'thought'")
+            item_action = item.get("action", action)
+            _validate_enum(str(item_action), _GRAPH_ACTIONS - {"revise"}, "batch action")
+            parent_ref = item.get("parent_ref")
+            resolved_parent_id = None
+            item_tree_id = item.get("tree_id")
+            item_depth = 0
+            if isinstance(parent_ref, int):
+                if parent_ref < 0 or parent_ref >= len(specs):
+                    raise ValueError(
+                        f"thoughts[{index}].parent_ref={parent_ref} is out of range for this batch"
+                    )
+                resolved_parent_id = specs[parent_ref]["id"]
+                item_tree_id = specs[parent_ref]["tree_id"]
+                item_depth = specs[parent_ref]["depth"] + 1
+            elif isinstance(parent_ref, str) and parent_ref.strip():
+                parent_node = engine.get_node(parent_ref.strip())
+                if parent_node is None:
+                    raise ValueError(f"thoughts[{index}] parent_ref '{parent_ref}' not found")
+                resolved_parent_id = parent_node.id
+                item_tree_id = parent_node.tree_id
+                item_depth = parent_node.depth + 1
+            elif item_tree_id and item_tree_id in engine.thought_trees:
+                raise ValueError(
+                    f"thoughts[{index}] targets existing tree '{item_tree_id}' without parent_ref"
+                )
+            specs.append(
+                {
+                    "id": uuid.uuid4().hex[:10],
+                    "tree_id": item_tree_id or uuid.uuid4().hex[:10],
+                    "content": content,
+                    "action": item_action,
+                    "parent_id": resolved_parent_id,
+                    "depends_on": list(item.get("depends_on") or []),
+                    "refs": list(item.get("refs") or []),
+                    "rule_bindings": list(bindings),
+                    "depth": item_depth,
+                    "metadata": dict(item.get("metadata") or {}),
+                }
+            )
+
+        created = engine.add_nodes_batch(specs)
+        for node in created:
+            created_refs.append(node.id)
+            await _materialize_subject_rule_bindings(
+                engine,
+                session_id,
+                subject_kind="thought",
+                subject_id=node.id,
+                subject_label=node.content,
+                bindings=node.rule_bindings,
+                source="think_graph",
+            )
+        warning = _long_thought_warnings(
+            [(f"thoughts[{i}]", spec["content"]) for i, spec in enumerate(specs)]
+        )
+        result = warning + "\n".join(
+            [
+                f"Session: {sid} | Batch nodes created: {len(created)}",
+                "Node IDs: " + ", ".join(created_refs),
+                "Trees: " + ", ".join(dict.fromkeys(node.tree_id for node in created)),
+                "Status: batch added",
+            ]
+        )
+        return _store_idempotent_result(sid, idempotency_key, result)
+
     # ── Think / Branch / Synthesize: add new node ────────
+    if not thought:
+        raise ValueError("thought is required in single-node mode")
     nid = uuid.uuid4().hex[:10]
     depth = 0
 
@@ -695,7 +1043,18 @@ async def think_graph(
         bindings=parent_node.rule_bindings,
         source="think_graph",
     )
-    return "\n".join(parts)
+    length_entries: list[tuple[str, str]] = [("thought", thought or "")]
+    if children:
+        for i, child in enumerate(children):
+            child_content = str((child or {}).get("thought", ""))
+            length_entries.append((f"children[{i}]", child_content))
+    warning = _long_thought_warnings(length_entries)
+    # Compose-next hint: after synthesize, nudge toward metacognitive review.
+    if action == "synthesize":
+        hint = _compose_next_hint("think_monitor", "refs", [nid])
+        if hint:
+            parts.append(hint)
+    return _store_idempotent_result(sid, idempotency_key, warning + "\n".join(parts))
 
 
 # ── Tool: Thought Graph Delegate ─────────────────────────────
@@ -712,6 +1071,13 @@ async def think_graph_delegate(
     Package a node's context for handoff to a subagent, or receive
     results back. The tool does NOT run subagents — it manages the
     boundary: package context out, receive results back.
+
+    Persona guidance for delegated analytical passes:
+        - Domain Specialist: deep local expertise, high nuance, higher domain bias
+        - Domain Alien: foreign-domain structural reasoning, useful for analogs
+        - Constraint Auditor: checks hard limits and impossibility claims
+        - Epistemologist: audits evidence quality and assumption load
+        - Synthesis Integrator: reconciles multiple viewpoints into a coherent path
 
     Actions:
         package: Serialize the node + its ancestry (path to root)
@@ -810,6 +1176,9 @@ async def think_decide(
     items[]: STRICT batch — each item: id, decision_statement, options[≥2],
       criteria[≥1] (each {name, weight}), evaluations[], recommendation.
       Server REJECTS items missing any required field.
+      Each item must be one decision. Do not pack multiple independent
+      decisions, multiple recommendations, or unrelated tradeoff spaces into
+      one item just because they share a topic.
     Single-form: backward-compat staged form (problem-definition → options
       → criteria → evaluation → analysis → recommendation).
 
@@ -883,11 +1252,13 @@ async def think_decide(
                 source="think_decide",
             )
 
-        return (
+        base = (
             f"Session: {info.session_id} | Decisions: {len(ids)}\n"
             f"IDs: {', '.join(ids)}\n"
             "Status: decided"
         )
+        hint = _compose_next_hint("score_evaluate", "analysis_refs", ids)
+        return base + (f"\n{hint}" if hint else "")
 
     # ── Single-form backward-compat path ────────────────────
     _validate_enum(analysis_type, _DECISION_TYPES, "analysis_type")
@@ -1075,13 +1446,18 @@ async def think_model(
       items[]: STRICT batch — each item must have id/problem/steps/reasoning/
         conclusion. Server REJECTS lazy items with the failing field name.
         Optional connects_to (list of other item ids) becomes auto_graph edges.
+        Each item is one problem decomposition unit. Do not put several
+        distinct subproblems, alternative conclusions, or unrelated reasoning
+        branches into one item. If you have N meaningfully separate thoughts,
+        create N items.
       single-item: backward-compat flexible form (problem/steps/reasoning/
         conclusion all optional). Use only for mid-analysis ad-hoc model
         application; prefer items[] at analysis START.
 
     Models: first_principles, opportunity_cost, error_propagation, rubber_duck,
     pareto_principle, assumptions_xray, fishbone, value_of_info, swot,
-    pre_mortem, design_review, complexity, root_cause.
+    pre_mortem, design_review, complexity, root_cause, kuba,
+    systems_dynamics, inversion.
 
     Good fits for omics / assay interpretation:
     - measurement-boundary review
@@ -1089,6 +1465,16 @@ async def think_model(
     - signal vs mechanism decomposition
     - cross-domain bridge mapping
     - intervention coverage / loop-breaking coverage
+
+    Additional domain-general frames:
+    - kuba: Know / Understand / Believe / Act progression and bottleneck finding
+    - systems_dynamics: reinforcing loops, balancing loops, delays, leverage points
+    - inversion: solve by analyzing guaranteed failure conditions first
+
+    Output convention for downstream chaining:
+    - conclusions should capture the main finding
+    - include surfaced assumptions in reasoning or refs when they matter later
+    - where possible, make the next tool call obvious from the conclusion
 
     Args:
       model_name: which mental model to apply.
@@ -1167,6 +1553,9 @@ async def think_model(
         if auto_graph:
             out.append(f"Graph nodes created: {graph_count}")
         out.append("Status: scaffolded")
+        hint = _compose_next_hint("score_evaluate", "analysis_refs", item_ids)
+        if hint:
+            out.append(hint)
         return "\n".join(out)
 
     # ── Single-item backward-compat path ─────────────────────
@@ -1232,6 +1621,8 @@ async def think_debug(
 
     items[]: STRICT batch — each: id, approach, issue, steps[≥1], findings,
       resolution. Lets you record N parallel debugging investigations atomically.
+      Each item is one debugging thread. If you are chasing three independent
+      failure modes, use three items rather than one blended narrative.
     Single-form: backward-compat — record one approach + issue + optional fields.
 
     Args:
@@ -1338,6 +1729,8 @@ async def think_argue(
     to submit a full thesis→antithesis→synthesis dialectic in one call.
     Sequential — entries processed in submission order. responds_to_index
     references a prior entry in this chain (0-based).
+    Each chain entry is one argument move. Do not collapse thesis,
+    counterargument, rebuttal, and synthesis into one oversized entry.
 
     Args:
         claim: The central claim of this argument.
@@ -1413,12 +1806,14 @@ async def think_argue(
                 )
                 engine.add_argument(chain_id, rec)
                 ids.append(aid)
-        return (
+        base = (
             f"Session: {info.session_id} | Chain: {chain_id}"
             f" | Batch: {len(ids)} arguments\n"
             f"Arg IDs: {', '.join(ids)}\n"
             "Status: dialectic batch applied"
         )
+        hint = _compose_next_hint("think_monitor", "refs", ids)
+        return base + (f"\n{hint}" if hint else "")
 
     # ── Single argument mode (existing) ──────────────────
     _validate_enum(argument_type, _ARGUMENT_TYPES, "argument_type")
@@ -1532,6 +1927,8 @@ async def think_science(
        assumptions[≥1], confidence, falsifiability ≥ 20 chars}.
       Server REJECTS items where falsifiability is short or variables/assumptions
       are missing.
+      Each item is one candidate hypothesis. Competing hypotheses belong in
+      separate items so they remain independently addressable and falsifiable.
     Single-stage: backward-compat staged form (observation → hypothesis →
       experiment → analysis → conclusion). Use mid-iteration.
 
@@ -1598,6 +1995,9 @@ async def think_science(
         if auto_graph:
             out.append(f"Graph nodes created: {graph_count}")
         out.append("Status: hypothesized")
+        hint = _compose_next_hint("think_evidence", "refs", ids)
+        if hint:
+            out.append(hint)
         return "\n".join(out)
 
     # ── Single-stage backward-compat path ─────────────────────
@@ -1711,6 +2111,8 @@ async def think_monitor(
        limitations[≥1]}, claims[≥1] of {claim, status∈{fact,inference,
        speculation,uncertain}, confidence, evidence}. REJECTS empty
        limitations.
+      Each item is one assessment target. Do not combine multiple tasks,
+      multiple subjects, or unrelated claim sets into one item.
     Single-form: backward-compat staged form for iterative monitoring.
 
     Args:
@@ -1796,6 +2198,9 @@ async def think_monitor(
         if auto_graph:
             out.append(f"Graph nodes created: {graph_count}")
         out.append("Status: monitored")
+        hint = _compose_next_hint("think_validate", "refs", ids)
+        if hint:
+            out.append(hint)
         return "\n".join(out)
 
     # ── Single-form backward-compat path ────────────────────
@@ -1883,7 +2288,8 @@ async def think_rules(
 
     Actions:
       create_profile: define a reusable rule profile.
-      add_rules_batch: strict batch add of rules to a profile.
+      add_rules_batch: strict batch add of rules to a profile. Each batch
+        entry is one rule, not a paragraph containing several requirements.
       update_weights_batch: strict batch update of numeric weights.
       deprecate_rules_batch: mark rules superseded without deleting history.
       list_profiles: list known profiles in the session.
@@ -2197,13 +2603,927 @@ async def think_validate(
     return "\n".join(lines)
 
 
+async def think_set_active_session(session_id: str) -> str:
+    """Set the implicit active session for subsequent tools."""
+    mgr = get_session_manager()
+    actual = await anyio.to_thread.run_sync(lambda: mgr.set_active_session(session_id))
+    return f"Active session set.\nsession_id: {actual}"
+
+
+@size_guarded
+async def think_get_subtree(
+    node_id: str,
+    session_id: str | None = None,
+    depth: int | None = None,
+) -> str:
+    """Return a node and its descendants as an outline."""
+    _, info = _require_think_session(session_id)
+    engine = _engine(info)
+    node = engine.get_node(node_id)
+    if node is None:
+        raise ValueError(f"Node '{node_id}' not found")
+    if depth is not None and depth < 0:
+        raise ValueError("depth must be >= 0")
+    outline = _render_subtree_outline(engine, node_id, depth)
+    return (
+        f"Session: {info.session_id}\n"
+        f"Node: {node_id} | Tree: {node.tree_id} | "
+        f"Depth limit: {depth if depth is not None else 'full'}\n"
+        f"{outline}"
+    )
+
+
+async def think_get_path(node_id: str, session_id: str | None = None) -> str:
+    """Return the ancestry path from root to a node."""
+    _, info = _require_think_session(session_id)
+    engine = _engine(info)
+    path = engine.get_path_to_root(node_id)
+    if not path:
+        raise ValueError(f"Node '{node_id}' not found")
+    path.reverse()
+    lines = [f"Session: {info.session_id}", f"Path length: {len(path)}"]
+    for level, node in enumerate(path):
+        lines.append(f"{level}. {node.id} [{node.action}] {_short(node.content, 100)}")
+    return "\n".join(lines)
+
+
+@size_guarded
+async def think_export_session(
+    session_id: str | None = None,
+    format: str = "outline",
+) -> str:
+    """Export full thought-tree state for session handoff/resume."""
+    if format not in {"outline", "flat", "json"}:
+        raise ValueError("format must be outline|flat|json")
+    _, info = _require_think_session(session_id)
+    engine = _engine(info)
+    if format == "json":
+        import json
+
+        payload = {
+            "session_id": info.session_id,
+            "trees": [
+                {
+                    "tree_id": tree_id,
+                    "root_id": root_id,
+                    "nodes": [
+                        _node_to_export_dict(node) for node in engine.get_subtree_nodes(root_id)
+                    ],
+                }
+                for tree_id, root_id in engine.thought_trees.items()
+            ],
+        }
+        return json.dumps(payload, indent=2)
+    if format == "flat":
+        lines = [f"Session: {info.session_id}", "Thought nodes:"]
+        for node in sorted(
+            engine.thought_nodes.values(), key=lambda n: (n.tree_id, n.depth, n.created_at)
+        ):
+            lines.append(
+                f"- {node.id} | tree={node.tree_id} | parent={node.parent_id or '-'} "
+                f"| depth={node.depth} | {node.action} | {_short(node.content, 100)}"
+            )
+        return "\n".join(lines)
+
+    lines = [
+        f"Session: {info.session_id}",
+        f"Trees: {len(engine.thought_trees)} | Nodes: {len(engine.thought_nodes)}",
+    ]
+    for tree_id, root_id in engine.thought_trees.items():
+        root = engine.get_node(root_id)
+        lines.append(f"\nTree {tree_id} — {_short(root.content if root else root_id, 80)}")
+        lines.append(_render_subtree_outline(engine, root_id, None))
+    return "\n".join(lines)
+
+
+async def think_link_sessions(
+    session_a: str,
+    node_a_id: str,
+    session_b: str,
+    node_b_id: str,
+    relationship: str,
+) -> str:
+    """Create a cross-session relationship between two nodes/artifacts."""
+    mgr = get_session_manager()
+    link = await anyio.to_thread.run_sync(
+        lambda: mgr.add_session_link(session_a, node_a_id, session_b, node_b_id, relationship)
+    )
+    return (
+        f"Link: {link.id}\n"
+        f"{link.session_a}:{link.node_a_id} --[{link.relationship}]--> "
+        f"{link.session_b}:{link.node_b_id}"
+    )
+
+
+async def think_get_session_links(session_id: str | None = None) -> str:
+    """Return all cross-session links touching a session."""
+    actual_session_id = resolve_active_or_provided_session_id(session_id)
+    if not actual_session_id:
+        raise ValueError("session_id is required unless an active session is set")
+    mgr = get_session_manager()
+    links = await anyio.to_thread.run_sync(lambda: mgr.list_session_links(actual_session_id))
+    if not links:
+        return f"Session: {actual_session_id}\nNo cross-session links."
+    lines = [f"Session: {actual_session_id}", f"Links: {len(links)}"]
+    for link in links:
+        lines.append(
+            f"- {link.id}: {link.session_a}:{link.node_a_id} "
+            f"--[{link.relationship}]--> {link.session_b}:{link.node_b_id}"
+        )
+    return "\n".join(lines)
+
+
+async def think_graph_validate(
+    node_id: str,
+    session_id: str | None = None,
+    auto_branch_on_warning: bool = False,
+) -> str:
+    """Validate a thought node for granularity and structural completeness."""
+    _, info = _require_think_session(session_id)
+    engine = _engine(info)
+    node = engine.get_node(node_id)
+    if node is None:
+        raise ValueError(f"Node '{node_id}' not found")
+
+    warnings: list[str] = []
+    suggestions: list[str] = []
+    content = node.content.strip()
+    sentence_count = len([part for part in re.split(r"[.!?]+", content) if part.strip()])
+    if len(content) > 280 or sentence_count > 3:
+        warnings.append("Node is too long; split into smaller thought units")
+        suggestions.append("Split this node into smaller claims or sub-questions")
+    if re.search(
+        r"\b(however|therefore|additionally|meanwhile|on the other hand)\b", content, re.I
+    ):
+        warnings.append("Node likely contains multiple semantic moves")
+        suggestions.append("Separate the contrasted or sequential ideas into sibling child nodes")
+    if node.action == "synthesize" and not node.children and not node.refs:
+        warnings.append("Synthesis node has no explicit synthesis inputs")
+        suggestions.append("Add refs to the nodes this synthesis depends on")
+    expected_children = node.metadata.get("expected_children")
+    if expected_children is not None and len(node.children) < int(expected_children):
+        warnings.append(f"Expected {expected_children} children but found {len(node.children)}")
+        suggestions.append("Add missing child nodes before relying on this branch as complete")
+
+    status = "pass" if not warnings else "warning"
+    created_ids: list[str] = []
+    if warnings and auto_branch_on_warning:
+        created = engine.add_nodes_batch(
+            [
+                {
+                    "id": uuid.uuid4().hex[:10],
+                    "tree_id": node.tree_id,
+                    "content": suggestion,
+                    "action": "think",
+                    "parent_id": node.id,
+                    "depth": node.depth + 1,
+                    "metadata": {"origin": "think_graph_validate", "validation_target": node.id},
+                    "refs": [],
+                    "depends_on": [],
+                    "rule_bindings": [],
+                }
+                for suggestion in dict.fromkeys(suggestions)
+            ]
+        )
+        created_ids = [created_node.id for created_node in created]
+
+    node.validation_results.append(
+        {
+            "validation_id": uuid.uuid4().hex[:10],
+            "passed_hard_gates": not warnings,
+            "weighted_score": 100.0 if not warnings else max(40.0, 100.0 - (len(warnings) * 20.0)),
+            "warnings": list(warnings),
+            "suggestions": list(dict.fromkeys(suggestions)),
+        }
+    )
+    lines = [f"Session: {info.session_id}", f"Node: {node_id}", f"Status: {status}"]
+    if warnings:
+        lines.append("Warnings: " + " | ".join(warnings))
+    if suggestions:
+        lines.append("Suggestions: " + " | ".join(dict.fromkeys(suggestions)))
+    if created_ids:
+        lines.append("Auto-branch created: " + ", ".join(created_ids))
+    return "\n".join(lines)
+
+
+async def think_hypothesis(
+    action: str,
+    session_id: str | None = None,
+    hypothesis_id: str | None = None,
+    statement: str | None = None,
+    domain: str | None = None,
+    prior_weight: float = 0.5,
+    predictions: list[dict] | None = None,
+    evidence_text: str | None = None,
+    direction: str | None = None,
+    strength: float = 0.5,
+    source_domain: str | None = None,
+    hypothesis_ids: list[str] | None = None,
+    new_predictions: list[dict] | None = None,
+    revised_statement: str | None = None,
+    reason: str | None = None,
+    invalidated_by: str | None = None,
+    ctx: _MCPContext | None = None,
+) -> str:
+    """Register, compare, update, and invalidate competing hypotheses."""
+    _validate_enum(action, _HYPOTHESIS_ACTIONS, "action")
+    _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
+    engine = _engine(info)
+
+    if action == "register":
+        if not statement:
+            raise ValueError("statement is required for register")
+        hid = hypothesis_id or f"hyp_{uuid.uuid4().hex[:8]}"
+        record = HypothesisRecord(
+            id=hid,
+            statement=statement,
+            domain=domain or "",
+            prior_weight=max(0.0, min(1.0, prior_weight)),
+            posterior_weight=max(0.0, min(1.0, prior_weight)),
+            predictions=list(predictions or []),
+        )
+        engine.upsert_hypothesis(record)
+        return f"Session: {info.session_id} | Hypothesis: {hid}\nStatus: registered"
+
+    if action == "evidence":
+        if not hypothesis_id or not evidence_text or not direction:
+            raise ValueError(
+                "hypothesis_id, evidence_text, and direction are required for evidence"
+            )
+        _validate_enum(direction, _HYPOTHESIS_EVIDENCE_DIRECTIONS, "direction")
+        record = engine.add_hypothesis_evidence(
+            hypothesis_id,
+            text=evidence_text,
+            direction=direction,
+            strength=strength,
+            source_domain=source_domain or "",
+        )
+        return (
+            f"Session: {info.session_id} | Hypothesis: {record.id}\n"
+            f"Posterior: {record.posterior_weight:.3f} | Evidence count: {len(record.evidence)}"
+        )
+
+    if action == "compare":
+        rows = sorted(
+            engine.get_hypotheses(),
+            key=lambda record: (record.invalidated, -record.posterior_weight, record.created_at),
+        )
+        if not rows:
+            return f"Session: {info.session_id}\nNo hypotheses registered."
+        lines = [f"Session: {info.session_id}", f"Hypotheses: {len(rows)}"]
+        for record in rows:
+            state = "invalidated" if record.invalidated else "active"
+            lines.append(
+                f"- {record.id}: {state} | prior={record.prior_weight:.3f} "
+                f"| posterior={record.posterior_weight:.3f} | evidence={len(record.evidence)} "
+                f"| domain={record.domain or '?'} | {_short(record.statement, 70)}"
+            )
+        return "\n".join(lines)
+
+    if action == "discriminate":
+        ids = hypothesis_ids or ([hypothesis_id] if hypothesis_id else [])
+        if len(ids) < 2:
+            raise ValueError("discriminate requires 2+ hypothesis ids")
+        selected = []
+        for hid in ids:
+            record = engine.get_hypothesis(hid)
+            if record is None:
+                raise ValueError(f"Hypothesis '{hid}' not found")
+            selected.append(record)
+        prediction_map: dict[str, set[str]] = {}
+        for record in selected:
+            for prediction in record.predictions:
+                observable = str(prediction.get("observable", "")).strip()
+                predicted_value = str(prediction.get("predicted_value", "")).strip()
+                if observable:
+                    prediction_map.setdefault(observable, set()).add(
+                        f"{record.id}:{predicted_value}"
+                    )
+        ranked = sorted(prediction_map.items(), key=lambda item: (-(len(item[1])), item[0]))
+        if not ranked:
+            return (
+                f"Session: {info.session_id}\n"
+                "No predictions registered for discriminating comparison."
+            )
+        observable, variants = ranked[0]
+        return (
+            f"Session: {info.session_id}\n"
+            f"Best discriminating observable: {observable}\n"
+            f"Predictions: {', '.join(sorted(variants))}"
+        )
+
+    if action == "update":
+        if not hypothesis_id:
+            raise ValueError("hypothesis_id is required for update")
+        record = engine.update_hypothesis(
+            hypothesis_id,
+            new_predictions=new_predictions,
+            revised_statement=revised_statement,
+        )
+        return f"Session: {info.session_id} | Hypothesis: {record.id}\nStatus: updated"
+
+    if not hypothesis_id:
+        raise ValueError("hypothesis_id is required for invalidate")
+    record = engine.invalidate_hypothesis(
+        hypothesis_id,
+        reason or invalidated_by or "invalidated",
+    )
+    return (
+        f"Session: {info.session_id} | Hypothesis: {record.id}\n"
+        f"Status: invalidated | Reason: {record.invalidation_reason}"
+    )
+
+
+async def think_constraint(
+    action: str,
+    session_id: str | None = None,
+    constraint_id: str | None = None,
+    domain: str | None = None,
+    type: str | None = None,
+    statement: str | None = None,
+    check_description: str | None = None,
+    applies_to: list[str] | None = None,
+    target_type: str | None = None,
+    target_id: str | None = None,
+    target_text: str | None = None,
+    status: str | None = None,
+    note: str | None = None,
+    ctx: _MCPContext | None = None,
+) -> str:
+    """Register constraints and validate targets against them.
+
+    `check_all` performs a real sweep: for each applicable constraint and each
+    matching target, it returns a matrix row. Existing validations are reused;
+    missing ones are created as `uncertain` so the gap remains explicit rather
+    than silently skipped.
+    """
+    _validate_enum(action, _CONSTRAINT_ACTIONS, "action")
+    _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
+    engine = _engine(info)
+
+    def _target_rows(kind: str, explicit_id: str | None) -> list[tuple[str, str]]:
+        if kind == "hypothesis":
+            rows = [(record.id, record.statement) for record in engine.get_hypotheses()]
+        elif kind == "thought":
+            rows = [(node.id, node.content) for node in engine.thought_nodes.values()]
+        elif kind == "model":
+            rows = [
+                (
+                    record.record_id or f"model:{index}",
+                    record.problem or record.conclusion or record.model_name,
+                )
+                for index, record in enumerate(engine.models, start=1)
+            ]
+        elif kind == "decision":
+            rows = [
+                (
+                    record.decision_id,
+                    record.statement or record.recommendation or record.stage,
+                )
+                for record in engine.decisions.values()
+            ]
+        elif kind == "holon":
+            rows = [
+                (record.id, record.description or record.name)
+                for record in engine.holon_nodes.values()
+            ]
+        elif kind == "evaluation":
+            rows = [
+                (record.id, record.context or record.rubric_id)
+                for record in engine.evaluations.values()
+            ]
+        else:
+            raise ValueError(
+                "target_type must be one of: hypothesis, thought, model, "
+                "decision, holon, evaluation"
+            )
+        if explicit_id:
+            rows = [row for row in rows if row[0] == explicit_id]
+            if not rows:
+                raise ValueError(f"{kind} '{explicit_id}' not found")
+        return rows
+
+    if action == "register":
+        if not constraint_id or not statement or not domain or not type:
+            raise ValueError("constraint_id, domain, type, and statement are required for register")
+        _validate_enum(type, _CONSTRAINT_TYPES, "type")
+        engine.upsert_constraint(
+            ConstraintRecord(
+                id=constraint_id,
+                domain=domain,
+                constraint_type=type,
+                statement=statement,
+                check_description=check_description or "",
+                applies_to=list(applies_to or []),
+            )
+        )
+        return f"Session: {info.session_id} | Constraint: {constraint_id}\nStatus: registered"
+
+    if action == "list":
+        rows = engine.get_constraints()
+        if not rows:
+            return f"Session: {info.session_id}\nNo constraints registered."
+        lines = [f"Session: {info.session_id}", f"Constraints: {len(rows)}"]
+        for row in rows:
+            lines.append(
+                f"- {row.id}: {row.constraint_type} | {row.domain} | {_short(row.statement, 80)}"
+            )
+        return "\n".join(lines)
+
+    if action == "remove":
+        if not constraint_id:
+            raise ValueError("constraint_id is required for remove")
+        engine.remove_constraint(constraint_id)
+        return f"Session: {info.session_id} | Constraint: {constraint_id}\nStatus: removed"
+
+    if action == "validate":
+        if not constraint_id or not target_type:
+            raise ValueError("constraint_id and target_type are required for validate")
+        constraint = engine.get_constraint(constraint_id)
+        if constraint is None:
+            raise ValueError(f"Constraint '{constraint_id}' not found")
+        result = status or "uncertain"
+        _validate_enum(result, _CONSTRAINT_VALIDATION_RESULTS, "status")
+        validation = ConstraintValidationRecord(
+            id=f"cval_{uuid.uuid4().hex[:8]}",
+            constraint_id=constraint_id,
+            target_type=target_type,
+            target_id=target_id or "",
+            target_text=target_text or "",
+            status=result,
+            note=note or "",
+        )
+        engine.add_constraint_validation(validation)
+        return (
+            f"Session: {info.session_id} | Constraint validation: {validation.id}\n"
+            f"Constraint: {constraint_id} | "
+            f"Target: {target_type}:{target_id or '-'} | Status: {result}"
+        )
+
+    if not target_type:
+        raise ValueError("target_type is required for check_all")
+
+    targets = _target_rows(target_type, target_id)
+    constraints = engine.get_constraints()
+    applicable_constraints = [
+        constraint
+        for constraint in constraints
+        if not constraint.applies_to or target_type in constraint.applies_to
+    ]
+    if not applicable_constraints:
+        return (
+            f"Session: {info.session_id}\n"
+            f"Constraint sweep target_type={target_type}\n"
+            "No applicable constraints."
+        )
+    if not targets:
+        return (
+            f"Session: {info.session_id}\n"
+            f"Constraint sweep target_type={target_type}\n"
+            "No targets found."
+        )
+
+    created = 0
+    matrix_rows: list[ConstraintValidationRecord] = []
+    for constraint in applicable_constraints:
+        for row_target_id, row_text in targets:
+            existing = engine.get_constraint_validations(
+                constraint_id=constraint.id,
+                target_type=target_type,
+                target_id=row_target_id,
+            )
+            if existing:
+                matrix_rows.append(existing[-1])
+                continue
+            validation = ConstraintValidationRecord(
+                id=f"cval_{uuid.uuid4().hex[:8]}",
+                constraint_id=constraint.id,
+                target_type=target_type,
+                target_id=row_target_id,
+                target_text=row_text,
+                status="uncertain",
+                note=(
+                    "Auto-generated by check_all. No explicit validation recorded yet; "
+                    "manual assessment required."
+                ),
+            )
+            engine.add_constraint_validation(validation)
+            matrix_rows.append(validation)
+            created += 1
+
+    pass_count = sum(1 for row in matrix_rows if row.status == "pass")
+    fail_count = sum(1 for row in matrix_rows if row.status == "fail")
+    uncertain_count = sum(1 for row in matrix_rows if row.status == "uncertain")
+    lines = [
+        f"Session: {info.session_id}",
+        (
+            f"Constraint sweep: {len(applicable_constraints)} constraints x {len(targets)} "
+            f"{target_type} targets = {len(matrix_rows)} checks"
+        ),
+        f"Created missing validations: {created}",
+        f"Status counts: pass={pass_count} fail={fail_count} uncertain={uncertain_count}",
+        "Matrix:",
+    ]
+    for row in matrix_rows[:30]:
+        lines.append(
+            f"- constraint={row.constraint_id} | target={row.target_type}:{row.target_id} "
+            f"| status={row.status} | note={_short(row.note, 80)}"
+        )
+    if len(matrix_rows) > 30:
+        lines.append(f"- ... ({len(matrix_rows) - 30} more)")
+    return "\n".join(lines)
+
+
+async def think_topology(
+    action: str,
+    session_id: str | None = None,
+    topology_id: str | None = None,
+    name: str | None = None,
+    nodes: list[dict] | None = None,
+    edges: list[dict] | None = None,
+    source_description: str | None = None,
+    source_domain: str | None = None,
+    topology_a_id: str | None = None,
+    topology_b_id: str | None = None,
+    target_domain: str | None = None,
+    pattern: str | None = None,
+    ctx: _MCPContext | None = None,
+) -> str:
+    """Define, compare, and translate domain-neutral structural topologies."""
+    _validate_enum(action, _TOPOLOGY_ACTIONS, "action")
+    _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
+    engine = _engine(info)
+
+    if action == "define":
+        if not topology_id or not name:
+            raise ValueError("topology_id and name are required for define")
+        for i, node in enumerate(nodes or []):
+            if node.get("role") not in _TOPOLOGY_NODE_ROLES:
+                raise ValueError(f"nodes[{i}].role must be one of {sorted(_TOPOLOGY_NODE_ROLES)}")
+        for i, edge in enumerate(edges or []):
+            if edge.get("type") not in _TOPOLOGY_EDGE_TYPES:
+                raise ValueError(f"edges[{i}].type must be one of {sorted(_TOPOLOGY_EDGE_TYPES)}")
+        engine.upsert_topology(
+            TopologyRecord(
+                id=topology_id,
+                name=name,
+                source_domain=source_domain or "",
+                source_description=source_description or "",
+                nodes=list(nodes or []),
+                edges=list(edges or []),
+            )
+        )
+        return f"Session: {info.session_id} | Topology: {topology_id}\nStatus: defined"
+
+    if action == "abstract":
+        if not source_description:
+            raise ValueError("source_description is required for abstract")
+        topology_id = topology_id or f"topo_{uuid.uuid4().hex[:8]}"
+        abstract_nodes: list[dict] = []
+        lower = source_description.lower()
+        role_map = [
+            ("sensor", "SENSOR"),
+            ("detect", "SENSOR"),
+            ("buffer", "BUFFER"),
+            ("queue", "BUFFER"),
+            ("switch", "SWITCH"),
+            ("gate", "GATE"),
+            ("source", "SOURCE"),
+            ("sink", "SINK"),
+            ("junction", "JUNCTION"),
+        ]
+        for token, role in role_map:
+            if token in lower:
+                abstract_nodes.append({"id": token, "role": role, "label": token})
+        if not abstract_nodes:
+            abstract_nodes = [{"id": "system", "role": "JUNCTION", "label": "system"}]
+        record = TopologyRecord(
+            id=topology_id,
+            name=name or topology_id,
+            source_domain=source_domain or "",
+            source_description=source_description,
+            nodes=abstract_nodes,
+            edges=list(edges or []),
+        )
+        engine.upsert_topology(record)
+        return (
+            f"Session: {info.session_id} | Topology: {record.id}\n"
+            f"Abstract nodes: {len(record.nodes)} | Status: abstracted"
+        )
+
+    if action == "compare":
+        if not topology_a_id or not topology_b_id:
+            raise ValueError("topology_a_id and topology_b_id are required for compare")
+        left = engine.get_topology(topology_a_id)
+        right = engine.get_topology(topology_b_id)
+        if left is None or right is None:
+            raise ValueError("Both topology ids must exist")
+        left_roles = {node.get("role") for node in left.nodes}
+        right_roles = {node.get("role") for node in right.nodes}
+        shared_roles = sorted(left_roles & right_roles)
+        left_edges = {edge.get("type") for edge in left.edges}
+        right_edges = {edge.get("type") for edge in right.edges}
+        shared_edge_types = ", ".join(sorted(left_edges & right_edges))
+        return (
+            f"Session: {info.session_id}\n"
+            f"Shared roles: {', '.join(shared_roles) if shared_roles else '(none)'}\n"
+            f"Shared edge types: {shared_edge_types or '(none)'}\n"
+            f"Role overlap score: {len(shared_roles)}/{len(sorted(left_roles | right_roles)) or 1}"
+        )
+
+    if action == "translate":
+        if not topology_id or not target_domain:
+            raise ValueError("topology_id and target_domain are required for translate")
+        record = engine.get_topology(topology_id)
+        if record is None:
+            raise ValueError(f"Topology '{topology_id}' not found")
+        translation = {
+            "target_domain": target_domain,
+            "hypothesis": (
+                f"In {target_domain}, a topology with roles "
+                f"{', '.join(sorted({node.get('role') for node in record.nodes}))} "
+                "likely implies analogous control or flow constraints."
+            ),
+        }
+        record.translations.append(translation)
+        engine.upsert_topology(record)
+        return (
+            f"Session: {info.session_id} | Topology: {record.id}\n"
+            f"Translation: {translation['hypothesis']}"
+        )
+
+    rows = engine.get_topologies()
+    if pattern:
+        rows = [
+            row
+            for row in rows
+            if pattern.lower() in row.source_description.lower()
+            or any(pattern.upper() == str(edge.get("type", "")).upper() for edge in row.edges)
+        ]
+    if not rows:
+        return f"Session: {info.session_id}\nNo matching topologies found."
+    lines = [f"Session: {info.session_id}", f"Topologies: {len(rows)}"]
+    for row in rows:
+        lines.append(
+            f"- {row.id}: {row.name} | domain={row.source_domain or '?'} "
+            f"| nodes={len(row.nodes)} edges={len(row.edges)}"
+        )
+    return "\n".join(lines)
+
+
+async def think_evidence(
+    action: str,
+    session_id: str | None = None,
+    evidence_id: str | None = None,
+    content: str | None = None,
+    source_type: str | None = None,
+    domain: str | None = None,
+    confidence: float = 0.5,
+    source_ref: str | None = None,
+    from_id: str | None = None,
+    to_id: str | None = None,
+    inference_type: str | None = None,
+    assumptions: list[str] | None = None,
+    claim_id: str | None = None,
+    ctx: _MCPContext | None = None,
+) -> str:
+    """Track evidence provenance chains and compute chain strength."""
+    _validate_enum(action, _EVIDENCE_ACTIONS, "action")
+    _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
+    engine = _engine(info)
+
+    if action == "register":
+        if not evidence_id or not content or not source_type:
+            raise ValueError("evidence_id, content, and source_type are required for register")
+        _validate_enum(source_type, _EVIDENCE_SOURCE_TYPES, "source_type")
+        engine.upsert_evidence(
+            EvidenceRecord(
+                id=evidence_id,
+                content=content,
+                source_type=source_type,
+                domain=domain or "",
+                confidence=max(0.0, min(1.0, confidence)),
+                source_ref=source_ref or "",
+            )
+        )
+        return f"Session: {info.session_id} | Evidence: {evidence_id}\nStatus: registered"
+
+    if action == "chain":
+        if not from_id or not to_id or not inference_type:
+            raise ValueError("from_id, to_id, and inference_type are required for chain")
+        _validate_enum(inference_type, _EVIDENCE_INFERENCE_TYPES, "inference_type")
+        chain = EvidenceChainRecord(
+            id=f"chain_{uuid.uuid4().hex[:8]}",
+            from_id=from_id,
+            to_id=to_id,
+            inference_type=inference_type,
+            assumptions=list(assumptions or []),
+        )
+        engine.add_evidence_chain(chain)
+        return (
+            f"Session: {info.session_id} | Evidence chain: {chain.id}\n"
+            f"{from_id} --[{inference_type}]--> {to_id}"
+        )
+
+    if action == "trace":
+        if not claim_id:
+            raise ValueError("claim_id is required for trace")
+        paths = engine.trace_evidence_paths(claim_id)
+        if not paths:
+            return f"Session: {info.session_id}\nNo provenance path found for {claim_id}."
+        lines = [f"Session: {info.session_id}", f"Paths: {len(paths)}"]
+        for path in paths[:10]:
+            lines.append("- " + " -> ".join(path))
+        return "\n".join(lines)
+
+    if action == "strength":
+        if not claim_id:
+            raise ValueError("claim_id is required for strength")
+        score = engine.compute_evidence_strength(claim_id)
+        return f"Session: {info.session_id}\nClaim: {claim_id} | Evidence strength: {score:.3f}"
+
+    rows = engine.get_all_evidence()
+    if not rows:
+        return f"Session: {info.session_id}\nNo evidence registered."
+    lines = [f"Session: {info.session_id}", f"Evidence items: {len(rows)}"]
+    for row in rows[:20]:
+        lines.append(
+            f"- {row.id}: {row.source_type} | conf={row.confidence:.2f} | {_short(row.content, 70)}"
+        )
+    return "\n".join(lines)
+
+
+async def think_bridge(
+    action: str,
+    session_id: str | None = None,
+    entity_name: str | None = None,
+    node_id: str | None = None,
+    hypothesis_id: str | None = None,
+    target_id: str | None = None,
+    target_type: str | None = None,
+    ctx: _MCPContext | None = None,
+) -> str:
+    """Query across thought graph, hypotheses, constraints, evidence, and topology state.
+
+    When the current think session belongs to a unified think+graph workspace,
+    the tool also attempts graph-backed context lookups. Those lookups are
+    best-effort and fail safe: if no graph backend exists, or the graph query
+    fails, the think-side response still succeeds.
+    """
+    _validate_enum(action, _BRIDGE_ACTIONS, "action")
+    _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
+    engine = _engine(info)
+
+    if action == "thoughts_for_entity":
+        if not entity_name:
+            raise ValueError("entity_name is required")
+        matches = [
+            f"{node.id}:{_short(node.content, 70)}"
+            for node in engine.thought_nodes.values()
+            if entity_name in node.metadata.get("knowledge_refs", [])
+        ]
+        lines = [f"Session: {info.session_id}", f"Thought matches: {len(matches)}"]
+        lines.extend(f"- {item}" for item in matches[:20])
+        graph_lines = await _safe_graph_context_lines(
+            info.session_id,
+            entity_names=[entity_name],
+            target_name=entity_name,
+        )
+        if graph_lines:
+            lines.append("Graph context:")
+            lines.extend(f"  {line}" for line in graph_lines)
+        return "\n".join(lines)
+
+    if action == "entities_for_thought":
+        if not node_id:
+            raise ValueError("node_id is required")
+        node = engine.get_node(node_id)
+        if node is None:
+            raise ValueError(f"Node '{node_id}' not found")
+        entities = node.metadata.get("knowledge_refs", [])
+        lines = [
+            f"Session: {info.session_id}",
+            f"Thought: {node_id}",
+            f"Entities: {', '.join(entities) if entities else '(none)'}",
+        ]
+        graph_lines = await _safe_graph_context_lines(info.session_id, entity_names=list(entities))
+        if graph_lines:
+            lines.append("Graph context:")
+            lines.extend(f"  {line}" for line in graph_lines)
+        return "\n".join(lines)
+
+    if action == "hypotheses_for_entity":
+        if not entity_name:
+            raise ValueError("entity_name is required")
+        matches = []
+        for record in engine.get_hypotheses():
+            if entity_name.lower() in record.statement.lower() or any(
+                entity_name.lower() in str(pred).lower() for pred in record.predictions
+            ):
+                matches.append(record)
+        if not matches:
+            return f"Session: {info.session_id}\nNo hypotheses mention {entity_name}."
+        lines = [f"Session: {info.session_id}", f"Hypotheses for {entity_name}: {len(matches)}"]
+        lines.extend(
+            [
+                f"- {record.id}: posterior={record.posterior_weight:.3f} | "
+                f"{_short(record.statement, 80)}"
+                for record in matches[:20]
+            ]
+        )
+        graph_lines = await _safe_graph_context_lines(
+            info.session_id,
+            entity_names=[entity_name],
+            target_name=entity_name,
+        )
+        if graph_lines:
+            lines.append("Graph context:")
+            lines.extend(f"  {line}" for line in graph_lines)
+        return "\n".join(lines)
+
+    if action == "evidence_for_hypothesis":
+        if not hypothesis_id:
+            raise ValueError("hypothesis_id is required")
+        strength = engine.compute_evidence_strength(hypothesis_id)
+        direct = engine.get_hypothesis(hypothesis_id)
+        lines = [
+            f"Session: {info.session_id}",
+            f"Hypothesis: {hypothesis_id}",
+            f"Strength: {strength:.3f}",
+        ]
+        if direct is not None and direct.evidence:
+            lines.append("Direct evidence:")
+            lines.extend(
+                f"- {item.direction}:{item.strength:.2f} | {_short(item.text, 80)}"
+                for item in direct.evidence[:10]
+            )
+        graph_lines = await _safe_graph_context_lines(info.session_id, target_name=hypothesis_id)
+        if graph_lines:
+            lines.append("Graph context:")
+            lines.extend(f"  {line}" for line in graph_lines)
+        return "\n".join(lines)
+
+    if action == "constraints_for_hypothesis":
+        if not hypothesis_id:
+            raise ValueError("hypothesis_id is required")
+        rows = engine.get_constraint_validations(target_type="hypothesis", target_id=hypothesis_id)
+        if not rows:
+            return f"Session: {info.session_id}\nNo constraint validations for {hypothesis_id}."
+        lines = [f"Session: {info.session_id}", f"Constraint validations: {len(rows)}"]
+        lines.extend(f"- {row.constraint_id}: {row.status} | {row.note}" for row in rows[:20])
+        graph_lines = await _safe_graph_context_lines(info.session_id, target_name=hypothesis_id)
+        if graph_lines:
+            lines.append("Graph context:")
+            lines.extend(f"  {line}" for line in graph_lines)
+        return "\n".join(lines)
+
+    if not target_id:
+        raise ValueError("target_id is required for full_context")
+    lines = [f"Session: {info.session_id}", f"Full context for {target_type or 'id'}:{target_id}"]
+    if target_id in engine.thought_nodes:
+        node = engine.thought_nodes[target_id]
+        lines.append(f"Thought: {_short(node.content, 120)}")
+        if node.metadata.get("knowledge_refs"):
+            lines.append("Knowledge refs: " + ", ".join(node.metadata["knowledge_refs"]))
+    if target_id in engine.hypotheses:
+        hyp = engine.hypotheses[target_id]
+        lines.append(f"Hypothesis posterior: {hyp.posterior_weight:.3f}")
+    if target_id in engine.constraints:
+        con = engine.constraints[target_id]
+        lines.append(f"Constraint: {con.constraint_type} | {_short(con.statement, 100)}")
+    if target_id in engine.evidence:
+        ev = engine.evidence[target_id]
+        lines.append(f"Evidence: {ev.source_type} | conf={ev.confidence:.2f}")
+    ref_matches = []
+    for node in engine.thought_nodes.values():
+        if target_id in node.refs:
+            ref_matches.append(f"thought:{node.id}")
+    for record in engine.models:
+        if target_id in record.refs:
+            ref_matches.append(f"model:{record.record_id or record.model_name}")
+    if ref_matches:
+        lines.append("Inbound refs: " + ", ".join(ref_matches[:20]))
+    graph_lines = await _safe_graph_context_lines(
+        info.session_id,
+        entity_names=list(node.metadata.get("knowledge_refs", []))
+        if target_id in engine.thought_nodes
+        else None,
+        target_name=target_id,
+    )
+    if graph_lines:
+        lines.append("Graph context:")
+        lines.extend(f"  {line}" for line in graph_lines)
+    return "\n".join(lines)
+
+
 # ── Tool: Summarize ──────────────────────────────────────────
 
 
 @size_guarded
 async def think_summarize(
-    session_id: str,
+    session_id: str | None = None,
     max_items_per_category: int = 20,
+    detail_level: str = "index",
 ) -> str:
     """Get a token-optimized summary of all thinking activity in a session.
 
@@ -2216,13 +3536,44 @@ async def think_summarize(
         max_items_per_category: Cap on items per category to prevent huge
             responses on sessions with hundreds of items. Default 20.
             Excess items collapse to "... (N more)" footer.
+        detail_level: Verbosity of per-item content:
+            - "index" (default, backward-compat): terse one-liners.
+            - "synopsis": RECOMMENDED when resuming a session — ~400-char
+              previews, more branches per tree, full synthesis nodes.
+            - "full": all branches, long previews. For end-of-session review.
 
     Returns:
         Compact summary of all thinking activity.
     """
     _, info = _require_think_session(session_id)
     engine = _engine(info)
-    return f"Session: {session_id}\n{engine.get_summary(max_items_per_category)}"
+    summary = engine.get_summary(max_items_per_category, detail_level=detail_level)
+    links = get_session_manager().list_session_links(info.session_id)
+    if links:
+        link_lines = ["\n### Cross-Session Links"]
+        for link in links[:10]:
+            link_lines.append(
+                f"- {link.id}: {link.session_a}:{link.node_a_id} "
+                f"--[{link.relationship}]--> {link.session_b}:{link.node_b_id}"
+            )
+        summary = summary + "\n" + "\n".join(link_lines)
+    graph_refs = sorted(
+        {
+            ref
+            for node in engine.thought_nodes.values()
+            for ref in node.metadata.get("knowledge_refs", [])
+        }
+    )
+    graph_lines = await _safe_graph_context_lines(
+        info.session_id,
+        entity_names=graph_refs[:5],
+    )
+    if graph_lines:
+        summary = summary + "\n\n### Cross-Backend Graph Context\n" + "\n".join(
+            f"- {line}" if index == 0 else f"  {line}"
+            for index, line in enumerate(graph_lines)
+        )
+    return f"Session: {info.session_id}\n{summary}"
 
 
 # ── Tool: Destroy Session ────────────────────────────────────
@@ -2458,6 +3809,12 @@ async def think_interfere(
 
     The tool enforces phase gates and returns suspended frames
     so you can apply frame detection to your own reasoning.
+
+    For analog search rather than novelty generation: use an abstract
+    topology description as the target_domain, suspend domain-specific
+    assumptions with add_frame, then add source laws from foreign domains
+    that share the same control structure. The emergent concept becomes the
+    cross-domain insight rather than a novel invented mechanism.
 
     Args:
         action: Which operation to perform.

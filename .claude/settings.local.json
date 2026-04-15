@@ -19,7 +19,8 @@
       "Bash(cp /c/Users/michiele/.claude/plans/bright-napping-crab.md /c/Users/michiele/source/repos/aismartbuddy/.meridian/plans/arrow-polars-pagination-architectural-overhaul.md)",
       "Bash(git commit -m ':*)",
       "Bash(mkdir -p .meridian/plans)",
-      "Bash(cp /c/Users/michiele/.claude/plans/pure-jumping-barto.md .meridian/plans/target-architecture-implementation.md)"
+      "Bash(cp /c/Users/michiele/.claude/plans/pure-jumping-barto.md .meridian/plans/target-architecture-implementation.md)",
+      "Bash(cp /c/Users/michiele/.claude/plans/sparkling-growing-orbit.md /c/Users/michiele/source/repos/aismartbuddy/.meridian/plans/reasoning-tool-improvements-from-usage-audit.md)"
     ]
   }
 }

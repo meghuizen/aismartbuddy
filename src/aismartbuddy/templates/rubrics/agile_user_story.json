@@ -1,0 +1,16 @@
+{
+  "rubric_id": "agile_user_story",
+  "description": "Agile user story review — value, independence, testability, negotiability, vertical slicing, and KUBA stage clarity.",
+  "dimensions": [
+    {"id": "user_value", "description": "User value and benefit are explicit", "weight": 0.25, "required": true},
+    {"id": "independence", "description": "Story is deliverable with minimal hidden sequencing dependency", "weight": 0.15, "required": true},
+    {"id": "testability", "description": "Acceptance criteria are concrete and verifiable", "weight": 0.20, "required": true},
+    {"id": "size_negotiability", "description": "Scope is appropriately small and open to refinement", "weight": 0.10, "required": false},
+    {"id": "vertical_slice", "description": "Delivers end-to-end user-visible value rather than a horizontal layer", "weight": 0.15, "required": true},
+    {"id": "kuba_stage", "description": "Clearly maps to Know, Understand, Believe, or Act stages", "weight": 0.15, "required": false}
+  ],
+  "severity_levels": ["critical", "high", "moderate", "low"],
+  "severity_deductions": {"critical": 3.0, "high": 2.0, "moderate": 1.0, "low": 0.5},
+  "pass_threshold": 7.0,
+  "scoring_strategy": "weighted_deduction"
+}

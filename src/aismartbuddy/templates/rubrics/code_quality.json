@@ -1,0 +1,16 @@
+{
+  "rubric_id": "code_quality",
+  "description": "Code quality — correctness, maintainability, edge cases, complexity, performance, and security.",
+  "dimensions": [
+    {"id": "correctness", "description": "Implements the intended behavior without regressions", "weight": 0.30, "required": true},
+    {"id": "edge_cases", "description": "Boundary conditions and failure modes are handled", "weight": 0.15, "required": true},
+    {"id": "cyclomatic_complexity", "description": "Branching complexity stays low enough to reason about and test", "weight": 0.15, "required": false},
+    {"id": "maintainability", "description": "Readable, cohesive, and change-friendly implementation", "weight": 0.15, "required": false},
+    {"id": "performance", "description": "Algorithmic and operational efficiency are appropriate for the use case", "weight": 0.15, "required": false},
+    {"id": "security", "description": "Trust boundaries and data flows do not introduce vulnerabilities", "weight": 0.10, "required": true}
+  ],
+  "severity_levels": ["critical", "high", "moderate", "low"],
+  "severity_deductions": {"critical": 3.0, "high": 2.0, "moderate": 1.0, "low": 0.5},
+  "pass_threshold": 7.0,
+  "scoring_strategy": "weighted_deduction"
+}

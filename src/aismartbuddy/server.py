@@ -217,19 +217,31 @@ from aismartbuddy.tools.sql import (  # noqa: E402
 )
 from aismartbuddy.tools.think import (  # noqa: E402
     think_argue,
+    think_bridge,
+    think_constraint,
     think_create_session,
     think_debug,
     think_decide,
     think_destroy_session,
+    think_evidence,
+    think_export_session,
+    think_get_path,
+    think_get_session_links,
+    think_get_subtree,
     think_graph,
     think_graph_delegate,
+    think_graph_validate,
+    think_hypothesis,
     think_interfere,
     think_interfere_state,
+    think_link_sessions,
     think_model,
     think_monitor,
     think_rules,
     think_science,
+    think_set_active_session,
     think_summarize,
+    think_topology,
     think_validate,
 )
 from aismartbuddy.tools.youtube import get_youtube_information  # noqa: E402
@@ -322,8 +334,20 @@ def _build_tool_specs(expose_legacy_reasoning_tools: bool | None = None) -> list
         (think_destroy_session, "think_destroy_session", "Destroy Thinking Session", _DESTRUCTIVE),
         (think_graph, "think_graph", "Thought Graph", _DEFAULT),
         (think_graph_delegate, "think_graph_delegate", "Thought Graph Delegation", _DEFAULT),
+        (think_graph_validate, "think_graph_validate", "Validate Thought Graph Node", _DEFAULT),
+        (think_get_subtree, "think_get_subtree", "Get Thought Subtree", _READONLY),
+        (think_get_path, "think_get_path", "Get Thought Path", _READONLY),
+        (think_export_session, "think_export_session", "Export Thought Session", _READONLY),
+        (think_set_active_session, "think_set_active_session", "Set Active Session", _DEFAULT),
+        (think_link_sessions, "think_link_sessions", "Link Sessions", _DEFAULT),
+        (think_get_session_links, "think_get_session_links", "Get Session Links", _READONLY),
         (think_decide, "think_decide", "Decision Framework", _DEFAULT),
         (think_model, "think_model", "Mental Model Analysis", _DEFAULT),
+        (think_hypothesis, "think_hypothesis", "Competing Hypotheses", _DEFAULT),
+        (think_constraint, "think_constraint", "Constraint Registry", _DEFAULT),
+        (think_topology, "think_topology", "Domain-Neutral Topology", _DEFAULT),
+        (think_evidence, "think_evidence", "Evidence Provenance Chains", _DEFAULT),
+        (think_bridge, "think_bridge", "Cross-System Thinking Bridge", _READONLY),
         (think_rules, "think_rules", "Manage Weighted Rule Profiles", _DEFAULT),
         (think_validate, "think_validate", "Validate Against Rule Profiles", _DEFAULT),
         (think_debug, "think_debug", "Systematic Debugging", _DEFAULT),
@@ -475,7 +499,11 @@ Single-call tool to ingest a YouTube video's metadata and transcript.
 Primary surface for analysis:
 - think_create_session(project_id="analysis") → standalone think session
 - session_create(backends=["think","graph","sql"], mode="analyze") → parent session
+- think_set_active_session(session_id) → make one session implicit for later think/sql/graph calls
 - think_model(items=[...]) → structured scaffold with a named mental model
+- Batch rule: each items[] entry is one semantic unit. Use batch mode to
+  submit several atomic thoughts/problems/hypotheses at once, not to hide a
+  long multi-part essay inside one entry.
 - think_rules(...) → create weighted hard/soft rule profiles and bind them to plans
 - think_validate(...) → validate a thought/model/decision/holon/evaluation against bound rules
 - think_science(items=[...]) → observation/question/hypothesis/experiment chain
@@ -502,6 +530,61 @@ Recommended analysis flow for assay-heavy domains:
 - think_model(items=[...]) to separate measured signal from inferred mechanism
 - think_science(items=[...]) to force competing explanations and falsification tests
 - think_monitor(items=[...]) to record tissue/assay/confounder limits before conclusions
+
+Metadata conventions for think_graph and related tools:
+- metadata.knowledge_refs → knowledge graph entity names
+- metadata.hypothesis_refs → think_hypothesis ids
+- metadata.constraint_refs → think_constraint ids
+- metadata.evidence_refs → think_evidence ids
+- metadata.topology_refs → think_topology ids
+- metadata.claim_type → fact | inference | speculation | assumption
+- metadata.domain → domain label
+
+Cross-system tools:
+- think_hypothesis(...) → competing hypothesis registry with ranking
+- think_constraint(...) → hard/soft constraint registry and validations
+- think_topology(...) → abstract structural topology and analog search support
+- think_evidence(...) → provenance chains and evidence strength
+- think_bridge(...) → "show me everything related to X" across subsystems
+- think_get_subtree / think_get_path / think_export_session → resumable read-back
+- think_link_sessions / think_get_session_links → cross-session project structure
+
+Useful orchestration patterns:
+- Analogical reasoning:
+  think_topology.abstract -> think_interfere -> think_hypothesis -> think_constraint
+- Constraint sweep:
+  think_constraint.list -> think_hypothesis.compare ->
+  think_constraint.validate -> think_hypothesis.invalidate
+- Abductive ranking:
+  think_hypothesis.compare -> think_evidence.chain/strength -> think_hypothesis.discriminate
+- System decomposition:
+  holon_create -> holon_analyze(feedback_loops/leverage_points) -> think_topology.abstract
+- Design review:
+  think_model(design_review) -> think_model(pre_mortem) -> think_model(assumptions_xray)
+- Root cause analysis:
+  think_model(root_cause) -> think_hypothesis.register -> think_constraint.check_all
+- KUBA adoption analysis:
+  think_model(model_name="kuba") -> think_graph branch per stage ->
+  think_argue thesis/antithesis/synthesis
+- Agile feature decomposition:
+  think_model(kuba) -> think_graph(feature/story branches) -> score_evaluate with agile rubrics
+
+Recommended persona archetypes for cross-domain review:
+- Domain Specialist -> deep local expertise, risk of domain lock-in
+- Domain Alien -> foreign-domain structural reasoning, risk of over-abstraction
+- Constraint Auditor -> hard-limit checking, risk of over-pruning novel ideas
+- Epistemologist -> evidence/inference hygiene, risk of over-caution
+- Synthesis Integrator -> convergence across views, risk of shallow technical detail
+- Even without a dedicated think_collaborate tool, these persona templates can
+  guide delegated passes, dialectical review, or branch-by-branch analysis.
+
+Rubric guidance:
+- rubric_templates are defaults, not contracts
+- adapt dimensions, weights, and thresholds to the actual problem
+- add missing dimensions when the template does not capture the real risk
+- security-critical or high-stakes work usually needs custom weighting
+- useful templates include discovery_value, code_quality, agile_feature,
+  agile_user_story, agile_task, research_hypothesis, plus the omics templates
 
 ### Explore / Diverge / Iterate
 - data_profile(session_id, table) → profile tabular data first

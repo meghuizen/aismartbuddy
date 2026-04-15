@@ -13,7 +13,7 @@ from aismartbuddy.tools.score import (
     score_gate,
     score_rubric,
 )
-from aismartbuddy.tools.think import think_model, think_rules, think_validate
+from aismartbuddy.tools.think import think_create_session, think_model, think_rules, think_validate
 
 
 def _extract(result: str, prefix: str) -> str:
@@ -61,6 +61,26 @@ class TestScoreRubric:
         r = await score_rubric(action="list", session_id=sid)
         assert "Rubrics (1)" in r
         assert "test" in r
+
+    @pytest.mark.anyio
+    async def test_update_rubric(self):
+        created = await score_rubric(
+            action="create",
+            rubric_id="test-update",
+            dimensions=[{"id": "d1", "weight": 1.0}],
+        )
+        sid = _extract(created, "Session:")
+        updated = await score_rubric(
+            action="update",
+            session_id=sid,
+            rubric_id="test-update",
+            dimensions=[
+                {"id": "d1", "weight": 1.0},
+                {"id": "d2", "weight": 0.5},
+            ],
+        )
+        assert "Status: updated" in updated
+        assert "Dimensions: 2" in updated
 
     @pytest.mark.anyio
     async def test_invalid_strategy(self):
@@ -720,9 +740,25 @@ class TestScoreTemplatesAndGraph:
     @pytest.mark.anyio
     async def test_new_rubric_templates_are_listed(self):
         listed = await rubric_templates(action="list")
+        assert "discovery_value" in listed
+        assert "code_quality" in listed
+        assert "agile_feature" in listed
+        assert "agile_user_story" in listed
+        assert "agile_task" in listed
+        assert "research_hypothesis" in listed
         assert "omics_profile_quality" in listed
         assert "mechanistic_overreach" in listed
         assert "assay_boundary_review" in listed
+
+    @pytest.mark.anyio
+    async def test_new_rubric_template_can_be_loaded(self):
+        sid = _extract(await think_create_session(), "session_id:")
+        loaded = await rubric_templates(
+            action="load",
+            template_id="code_quality",
+            session_id=sid,
+        )
+        assert "Rubric: code_quality" in loaded
 
     @pytest.mark.anyio
     async def test_scoring_materializes_graph_when_started_from_parent_session(self):

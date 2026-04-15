@@ -47,6 +47,12 @@ async def think_refs_query(
         "rule_profiles": [],
         "rule_conflicts": [],
         "validations": [],
+        "hypotheses": [],
+        "constraints": [],
+        "constraint_validations": [],
+        "topologies": [],
+        "evidence": [],
+        "evidence_chains": [],
     }
     with engine.state_lock:
         for nid, node in engine.thought_nodes.items():
@@ -104,6 +110,30 @@ async def think_refs_query(
                 )
             ):
                 matches["validations"].append(vid)
+        for hid, record in engine.hypotheses.items():
+            if entity_id == hid or entity_id in record.refs:
+                matches["hypotheses"].append(hid)
+        for cid, record in engine.constraints.items():
+            if entity_id == cid or entity_id in record.refs:
+                matches["constraints"].append(cid)
+        for cvid, record in engine.constraint_validations.items():
+            if (
+                entity_id == cvid
+                or entity_id == record.constraint_id
+                or entity_id == record.target_id
+                or entity_id in record.refs
+            ):
+                matches["constraint_validations"].append(cvid)
+        for tid, record in engine.topologies.items():
+            node_ids = {str(node.get("id")) for node in record.nodes}
+            if entity_id == tid or entity_id in node_ids:
+                matches["topologies"].append(tid)
+        for evid, record in engine.evidence.items():
+            if entity_id == evid or entity_id in record.refs:
+                matches["evidence"].append(evid)
+        for chain_id, chain in engine.evidence_chains.items():
+            if entity_id in {chain_id, chain.from_id, chain.to_id}:
+                matches["evidence_chains"].append(chain_id)
 
     total = sum(len(v) for v in matches.values())
     parts = [

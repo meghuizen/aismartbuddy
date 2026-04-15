@@ -30,8 +30,8 @@ T = TypeVar("T")
 
 # Response size guard thresholds (in bytes). Apply to tools returning
 # variable-length data (queries, holon views, summaries, exports).
-_SIZE_WARN_BYTES = 50 * 1024     # 50KB — log warn, return as-is
-_SIZE_ERROR_BYTES = 200 * 1024   # 200KB — log error, return as-is
+_SIZE_WARN_BYTES = 50 * 1024  # 50KB — log warn, return as-is
+_SIZE_ERROR_BYTES = 200 * 1024  # 200KB — log error, return as-is
 _SIZE_TRUNCATE_BYTES = 500 * 1024  # 500KB — truncate + append hint
 
 _logger = logging.getLogger("aismartbuddy.size_guard")
@@ -60,7 +60,9 @@ def size_guarded(fn: Callable[..., Any]) -> Callable[..., Any]:
         if size_bytes > _SIZE_TRUNCATE_BYTES:
             _logger.error(
                 "Tool %s response %d bytes exceeds %d hard cap — truncating",
-                tool_name, size_bytes, _SIZE_TRUNCATE_BYTES,
+                tool_name,
+                size_bytes,
+                _SIZE_TRUNCATE_BYTES,
             )
             # Truncate at byte boundary, decode tolerant
             cut = result.encode("utf-8")[:_SIZE_TRUNCATE_BYTES]
@@ -73,12 +75,16 @@ def size_guarded(fn: Callable[..., Any]) -> Callable[..., Any]:
         if size_bytes > _SIZE_ERROR_BYTES:
             _logger.error(
                 "Tool %s response %d bytes exceeds %d threshold",
-                tool_name, size_bytes, _SIZE_ERROR_BYTES,
+                tool_name,
+                size_bytes,
+                _SIZE_ERROR_BYTES,
             )
         elif size_bytes > _SIZE_WARN_BYTES:
             _logger.warning(
                 "Tool %s response %d bytes exceeds %d threshold",
-                tool_name, size_bytes, _SIZE_WARN_BYTES,
+                tool_name,
+                size_bytes,
+                _SIZE_WARN_BYTES,
             )
         return result
 
@@ -102,6 +108,13 @@ def resolve_backend_session(session_id: str, backend: str):  # SessionInfo
     parent_id facade and the existing direct child session_ids.
     """
     return get_session_manager().resolve_backend_session(session_id, backend)
+
+
+def resolve_active_or_provided_session_id(session_id: str | None) -> str | None:
+    """Return explicit session_id or the currently active session id."""
+    if session_id:
+        return session_id
+    return get_session_manager().get_active_session_id()
 
 
 # ── Items[] forcing-function helpers ──────────────────────────────────
@@ -141,9 +154,7 @@ def validate_items(
         if not item.get("id"):
             raise ValueError(f"{tool}.items[{i}] missing 'id'")
         if item["id"] in seen_ids:
-            raise ValueError(
-                f"{tool}.items[{i}] duplicate id '{item['id']}'"
-            )
+            raise ValueError(f"{tool}.items[{i}] duplicate id '{item['id']}'")
         seen_ids.add(item["id"])
         for f in required:
             v = item.get(f)
@@ -158,10 +169,7 @@ def validate_items(
                 if fname in item:
                     err = check(item[fname])
                     if err:
-                        raise ValueError(
-                            f"{tool}.items[{i}] ({item['id']}) "
-                            f"field '{fname}': {err}"
-                        )
+                        raise ValueError(f"{tool}.items[{i}] ({item['id']}) field '{fname}': {err}")
 
 
 def collect_item_refs(item: dict) -> list[str]:
@@ -235,9 +243,7 @@ async def materialize_auto_graph(
                 # Typically "already exists" from LadybugDB's idempotent
                 # DDL — safe to skip. Log at DEBUG so real DDL failures
                 # (connection, permission, syntax) remain traceable.
-                auto_graph_logger.debug(
-                    "CREATE NODE TABLE KnowledgeNode skipped: %s", e
-                )
+                auto_graph_logger.debug("CREATE NODE TABLE KnowledgeNode skipped: %s", e)
             try:
                 graph_info.engine.execute(
                     f"CREATE REL TABLE IF NOT EXISTS {edge_label} ("
@@ -246,9 +252,7 @@ async def materialize_auto_graph(
                     "source STRING, created_at STRING);"
                 )
             except Exception as e:
-                auto_graph_logger.debug(
-                    "CREATE REL TABLE %s skipped: %s", edge_label, e
-                )
+                auto_graph_logger.debug("CREATE REL TABLE %s skipped: %s", edge_label, e)
 
             n = 0
             for item in items:
@@ -303,11 +307,14 @@ async def run_with_lock(
     continues running but its result is discarded — only safe for idempotent
     reads. Writes under abandon_on_cancel=True can produce partial state.
     """
+
     def _locked() -> T:
         with info.lock:
             return sync_fn()
+
     return await anyio.to_thread.run_sync(
-        _locked, abandon_on_cancel=abandon_on_cancel,
+        _locked,
+        abandon_on_cancel=abandon_on_cancel,
     )
 
 
@@ -336,8 +343,15 @@ async def execute_and_format(
 
     async def _run() -> str:
         return await _execute_inner(
-            info, mgr, query, output_format, offset, effective_limit,
-            paginate, next_tool, abandon_on_cancel=abandon,
+            info,
+            mgr,
+            query,
+            output_format,
+            offset,
+            effective_limit,
+            paginate,
+            next_tool,
+            abandon_on_cancel=abandon,
         )
 
     if not abandon:
@@ -428,6 +442,7 @@ async def fetch_next_and_format(
     next_tool: str = "sql_query_next",
 ) -> str:
     """Shared next-page fetch logic for SQL and graph pagination tools."""
+
     def _fetch() -> tuple[Any, bool]:
         table = info.engine.fetch_next_page(cursor_id)
         has_more = info.engine.cursor_exists(cursor_id) if table is not None else False

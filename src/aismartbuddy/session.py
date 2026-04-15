@@ -60,6 +60,19 @@ class ParentSession:
 
 
 @dataclass
+class SessionLink:
+    """Cross-session link between two session-scoped nodes/artifacts."""
+
+    id: str
+    session_a: str
+    node_a_id: str
+    session_b: str
+    node_b_id: str
+    relationship: str
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+@dataclass
 class SessionInfo:
     """Metadata for an active database session.
 
@@ -117,6 +130,9 @@ class SessionManager:
         self._sessions: dict[str, SessionInfo] = {}
         # parent_id → ParentSession (facade routing to backend children)
         self._parent_sessions: dict[str, ParentSession] = {}
+        self._active_session_id: str | None = None
+        self._idempotency_results: dict[tuple[str, str], str] = {}
+        self._session_links: dict[str, SessionLink] = {}
         self._lock = threading.Lock()
 
         if temp_base_dir:
@@ -184,7 +200,9 @@ class SessionManager:
             from aismartbuddy.engines.duckdb_engine import DuckDBEngine
 
             engine = DuckDBEngine(
-                db_path, self._max_rows, self._max_chars,
+                db_path,
+                self._max_rows,
+                self._max_chars,
                 threads=self._duckdb_threads,
                 memory_limit=self._duckdb_memory_limit,
             )
@@ -193,7 +211,9 @@ class SessionManager:
             from aismartbuddy.engines.ladybug_engine import LadybugEngine
 
             engine = LadybugEngine(
-                db_path, self._max_rows, self._max_chars,
+                db_path,
+                self._max_rows,
+                self._max_chars,
                 buffer_pool_size=self._ladybug_buffer_pool_size,
                 max_threads=self._ladybug_max_threads,
             )
@@ -225,9 +245,14 @@ class SessionManager:
         )
         with self._lock:
             self._sessions[session_id] = info
+            if self._active_session_id is None:
+                self._active_session_id = session_id
         logger.info(
             "Created %s session: %s (user=%s project=%s)",
-            session_type, session_id, user_id, project_id,
+            session_type,
+            session_id,
+            user_id,
+            project_id,
         )
         return info
 
@@ -286,6 +311,9 @@ class SessionManager:
             if project_id is not None and info.project_id != project_id:
                 raise not_found
             self._sessions.pop(session_id, None)
+            if self._active_session_id == session_id:
+                self._active_session_id = None
+            self._drop_session_aux_state(session_id)
         # Wait for any in-flight tool call on this session to finish
         with info.lock:
             self._close_session(info)
@@ -321,9 +349,7 @@ class SessionManager:
         valid = {"think", "graph", "sql"}
         for b in backends:
             if b not in valid:
-                raise ValueError(
-                    f"Invalid backend {b!r}. Allowed: {sorted(valid)}"
-                )
+                raise ValueError(f"Invalid backend {b!r}. Allowed: {sorted(valid)}")
         if len(set(backends)) != len(backends):
             raise ValueError("backends must be unique")
 
@@ -367,16 +393,19 @@ class SessionManager:
         )
         with self._lock:
             self._parent_sessions[parent_id] = parent
+            self._active_session_id = parent_id
         logger.info(
-            "Created parent session %s with backends=%s "
-            "(user=%s project=%s)",
-            parent_id, backends, user_id, project_id,
+            "Created parent session %s with backends=%s (user=%s project=%s)",
+            parent_id,
+            backends,
+            user_id,
+            project_id,
         )
         return parent
 
     def resolve_backend_session(
         self,
-        session_id: str,
+        session_id: str | None,
         backend: str,
     ) -> SessionInfo:
         """Resolve session_id (parent OR direct child) to a SessionInfo for a backend.
@@ -390,6 +419,14 @@ class SessionManager:
             session_id: Either a direct child session_id or a parent_id.
             backend: The backend the caller's tool needs ("sql"|"graph"|"think").
         """
+        if not session_id:
+            session_id = self.get_active_session_id()
+            if not session_id:
+                raise ValueError(
+                    f"No active session set for backend '{backend}'. "
+                    "Create a session first or call think_set_active_session(session_id)."
+                )
+
         # Try parent first
         with self._lock:
             parent = self._parent_sessions.get(session_id)
@@ -410,8 +447,7 @@ class SessionManager:
         info = self.get_session(actual_session_id)
         if info.session_type != backend:
             raise ValueError(
-                f"Session '{actual_session_id}' is a {info.session_type} "
-                f"session, not {backend}."
+                f"Session '{actual_session_id}' is a {info.session_type} session, not {backend}."
             )
         return info
 
@@ -433,6 +469,9 @@ class SessionManager:
                 raise not_found
             children_ids = list(parent.children.values())
             self._parent_sessions.pop(parent_id, None)
+            if self._active_session_id == parent_id:
+                self._active_session_id = None
+            self._drop_session_aux_state(parent_id)
         # Destroy each child outside the parent lock
         for cid in children_ids:
             try:
@@ -467,10 +506,88 @@ class SessionManager:
         if user_id is None and project_id is None:
             return all_sessions
         return [
-            s for s in all_sessions
+            s
+            for s in all_sessions
             if (user_id is None or s.user_id == user_id)
             and (project_id is None or s.project_id == project_id)
         ]
+
+    def set_active_session(self, session_id: str) -> str:
+        """Set the implicit active session (parent or direct child)."""
+        with self._lock:
+            if session_id in self._parent_sessions or session_id in self._sessions:
+                self._active_session_id = session_id
+                return session_id
+        raise ValueError(_NOT_FOUND_MSG_TMPL.format(session_id=session_id))
+
+    def get_active_session_id(self) -> str | None:
+        """Return the current implicit active session id, if any."""
+        with self._lock:
+            if self._active_session_id in self._parent_sessions:
+                return self._active_session_id
+            if self._active_session_id in self._sessions:
+                return self._active_session_id
+            return None
+
+    def find_parent_for_child(self, child_session_id: str) -> ParentSession | None:
+        """Return the parent facade containing a child session, if any."""
+        with self._lock:
+            for parent in self._parent_sessions.values():
+                if child_session_id in parent.children.values():
+                    return parent
+        return None
+
+    def find_companion_session(self, child_session_id: str, backend: str) -> str | None:
+        """Return a sibling backend session for a child session, if available."""
+        parent = self.find_parent_for_child(child_session_id)
+        if parent is None:
+            return None
+        return parent.children.get(backend)
+
+    def get_idempotent_result(self, session_id: str, idempotency_key: str) -> str | None:
+        """Return a stored idempotent result if this write already completed."""
+        with self._lock:
+            return self._idempotency_results.get((session_id, idempotency_key))
+
+    def store_idempotent_result(self, session_id: str, idempotency_key: str, result: str) -> None:
+        """Persist the first successful result for an idempotent write."""
+        with self._lock:
+            self._idempotency_results.setdefault((session_id, idempotency_key), result)
+
+    def add_session_link(
+        self,
+        session_a: str,
+        node_a_id: str,
+        session_b: str,
+        node_b_id: str,
+        relationship: str,
+    ) -> SessionLink:
+        """Create and store a cross-session link between two nodes/artifacts."""
+        if not relationship:
+            raise ValueError("relationship is required")
+        # Existence check resolves parent/direct child capability tokens.
+        self.resolve_backend_session(session_a, "think")
+        self.resolve_backend_session(session_b, "think")
+        link = SessionLink(
+            id=uuid.uuid4().hex[:12],
+            session_a=session_a,
+            node_a_id=node_a_id,
+            session_b=session_b,
+            node_b_id=node_b_id,
+            relationship=relationship,
+        )
+        with self._lock:
+            self._session_links[link.id] = link
+        return link
+
+    def list_session_links(self, session_id: str) -> list[SessionLink]:
+        """Return all cross-session links involving the session."""
+        with self._lock:
+            return [
+                link
+                for link in self._session_links.values()
+                if link.session_a == session_id or link.session_b == session_id
+            ]
 
     def cleanup_expired(self) -> int:
         """Remove expired sessions and stale cursors.
@@ -500,16 +617,15 @@ class SessionManager:
             # of _parent_sessions over long-running server lifetime.
             parents_to_drop: list[str] = []
             for pid, parent in self._parent_sessions.items():
-                children_alive = any(
-                    cid in self._sessions for cid in parent.children.values()
-                )
-                idle = (
-                    now - parent.last_accessed
-                ).total_seconds() > self._session_timeout
+                children_alive = any(cid in self._sessions for cid in parent.children.values())
+                idle = (now - parent.last_accessed).total_seconds() > self._session_timeout
                 if not children_alive or idle:
                     parents_to_drop.append(pid)
             for pid in parents_to_drop:
                 self._parent_sessions.pop(pid, None)
+                if self._active_session_id == pid:
+                    self._active_session_id = None
+                self._drop_session_aux_state(pid)
 
         # Close expired sessions (waits for any in-flight call first)
         for info in to_close:
@@ -541,6 +657,9 @@ class SessionManager:
             all_sessions = list(self._sessions.values())
             self._sessions.clear()
             self._parent_sessions.clear()
+            self._active_session_id = None
+            self._idempotency_results.clear()
+            self._session_links.clear()
         for info in all_sessions:
             # Waits for any in-flight tool call to finish
             with info.lock:
@@ -564,6 +683,15 @@ class SessionManager:
             shutil.rmtree(info.temp_dir, ignore_errors=True)
         except Exception:
             logger.exception("Error removing temp dir for session %s", info.session_id)
+
+    def _drop_session_aux_state(self, session_id: str) -> None:
+        """Drop idempotency/link state tied to a removed session."""
+        doomed = [k for k in self._idempotency_results if k[0] == session_id]
+        for key in doomed:
+            self._idempotency_results.pop(key, None)
+        for link_id, link in list(self._session_links.items()):
+            if link.session_a == session_id or link.session_b == session_id:
+                self._session_links.pop(link_id, None)
 
 
 # Module-level singleton — initialized by server lifespan

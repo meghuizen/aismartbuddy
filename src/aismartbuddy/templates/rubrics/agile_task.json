@@ -1,0 +1,15 @@
+{
+  "rubric_id": "agile_task",
+  "description": "Agile task review — definition of done, scope, dependencies, approach, and traceability.",
+  "dimensions": [
+    {"id": "definition_of_done", "description": "Completion criteria are unambiguous", "weight": 0.25, "required": true},
+    {"id": "scope_containment", "description": "Task has a single responsibility and bounded scope", "weight": 0.20, "required": true},
+    {"id": "dependency_clarity", "description": "Blockers and prerequisites are explicit", "weight": 0.20, "required": true},
+    {"id": "technical_approach", "description": "The implementation path is stated or obvious from context", "weight": 0.15, "required": false},
+    {"id": "traceability", "description": "Task links back to parent story or outcome", "weight": 0.20, "required": true}
+  ],
+  "severity_levels": ["critical", "high", "moderate", "low"],
+  "severity_deductions": {"critical": 3.0, "high": 2.0, "moderate": 1.0, "low": 0.5},
+  "pass_threshold": 8.0,
+  "scoring_strategy": "weighted_deduction"
+}

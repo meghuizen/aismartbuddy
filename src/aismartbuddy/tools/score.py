@@ -32,7 +32,7 @@ from aismartbuddy.tools.think import (
 
 # ── Validation constants ─────────────────────────────────────
 
-_SCORE_RUBRIC_ACTIONS = frozenset({"create", "list"})
+_SCORE_RUBRIC_ACTIONS = frozenset({"create", "update", "list"})
 _SCORE_EVALUATE_ACTIONS = frozenset(
     {
         "start",
@@ -84,8 +84,15 @@ async def score_rubric(
     severity levels, deduction amounts, pass threshold, and strategy.
     Rubrics are reusable across evaluations.
 
+    Rubric templates are starting points, not fixed contracts. Adapt,
+    reweight, add, or remove dimensions to fit the actual artifact and risk
+    profile. Do not score irrelevant dimensions just because a template
+    includes them, and do not omit critical dimensions just because the
+    template forgot them.
+
     Actions:
         create: Define a new rubric. Requires rubric_id, dimensions.
+        update: Replace an existing rubric definition. Requires rubric_id, dimensions.
         list: Show all rubrics in the session.
 
     Args:
@@ -115,11 +122,11 @@ async def score_rubric(
     engine = _engine(info)
     sid = info.session_id
 
-    if action == "create":
+    if action in {"create", "update"}:
         if not rubric_id:
-            raise ValueError("rubric_id is required for create")
+            raise ValueError("rubric_id is required for create/update")
         if not dimensions:
-            raise ValueError("dimensions is required for create")
+            raise ValueError("dimensions is required for create/update")
         _validate_enum(scoring_strategy, _SCORING_STRATEGIES, "scoring_strategy")
         # Validate dimensions structure + uniqueness
         dim_ids_seen: set[str] = set()
@@ -159,7 +166,7 @@ async def score_rubric(
             f"Dimensions: {len(dimensions)} ({required} required)"
             f" | Threshold: {pass_threshold}/{scale_max}\n"
             f"Strategy: {scoring_strategy}\n"
-            "Status: created"
+            f"Status: {'created' if action == 'create' else 'updated'}"
         )
 
     # action == "list"
@@ -183,6 +190,11 @@ async def score_rubric(
 _TEMPLATES_DIR = __import__("pathlib").Path(__file__).parent.parent / "templates" / "rubrics"
 _TEMPLATE_IDS = frozenset(
     {
+        "agile_feature",
+        "agile_task",
+        "agile_user_story",
+        "code_quality",
+        "discovery_value",
         "security_review",
         "architecture_review",
         "code_review",
@@ -192,6 +204,7 @@ _TEMPLATE_IDS = frozenset(
         "omics_profile_quality",
         "mechanistic_overreach",
         "assay_boundary_review",
+        "research_hypothesis",
     }
 )
 
@@ -363,7 +376,10 @@ async def rubric_templates(
     """List or load pre-built scoring rubrics.
 
     Templates ship with the server: security_review, architecture_review,
-    code_review, research_quality, hypothesis_strength, documentation_completeness.
+    code_review, code_quality, research_quality, hypothesis_strength,
+    research_hypothesis, documentation_completeness, discovery_value,
+    agile_feature, agile_user_story, agile_task, omics_profile_quality,
+    mechanistic_overreach, assay_boundary_review.
     Loading a template is equivalent to calling score_rubric(action="create",
     ...) with the template's pre-configured fields.
 
@@ -451,6 +467,12 @@ async def score_evaluate(
     The key design: findings are submitted individually. The server
     computes the running score after each, preventing the AI from
     listing problems then giving a contradictory high score.
+
+    Rubrics should be adapted to the problem before evaluation starts.
+    If a security-critical system needs heavier security weighting, change
+    the rubric. If a prototype does not justify production maintainability
+    thresholds, reweight or remove that dimension. Templates are guidance,
+    not authority.
 
     Actions:
         start: Begin evaluation against a rubric. Returns eval ID.

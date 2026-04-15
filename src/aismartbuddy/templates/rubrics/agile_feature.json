@@ -1,0 +1,16 @@
+{
+  "rubric_id": "agile_feature",
+  "description": "Agile feature review — problem framing, outcomes, decomposition, acceptance criteria, risks, and KUBA coverage.",
+  "dimensions": [
+    {"id": "problem_statement", "description": "Problem and target user are clearly stated", "weight": 0.20, "required": true},
+    {"id": "outcome_definition", "description": "Measurable user or business outcome is defined", "weight": 0.20, "required": true},
+    {"id": "story_decomposition", "description": "Decomposed into independently valuable stories", "weight": 0.20, "required": true},
+    {"id": "acceptance_criteria", "description": "Feature-level completion criteria are specific and testable", "weight": 0.15, "required": true},
+    {"id": "risk_identification", "description": "Dependencies, assumptions, and delivery risks are explicit", "weight": 0.10, "required": false},
+    {"id": "kuba_coverage", "description": "Know / Understand / Believe / Act progression is represented where relevant", "weight": 0.15, "required": false}
+  ],
+  "severity_levels": ["critical", "high", "moderate", "low"],
+  "severity_deductions": {"critical": 3.0, "high": 2.0, "moderate": 1.0, "low": 0.5},
+  "pass_threshold": 7.0,
+  "scoring_strategy": "weighted_deduction"
+}

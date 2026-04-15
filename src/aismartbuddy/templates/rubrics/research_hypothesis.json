@@ -1,0 +1,15 @@
+{
+  "rubric_id": "research_hypothesis",
+  "description": "Research hypothesis review — consistency, evidence strength, constraints, explanatory scope, and parsimony.",
+  "dimensions": [
+    {"id": "internal_consistency", "description": "No internal contradictions or incompatible claims", "weight": 0.20, "required": true},
+    {"id": "evidence_chain_strength", "description": "Primary support has strong provenance and inference quality", "weight": 0.25, "required": true},
+    {"id": "constraint_compliance", "description": "Does not violate known hard constraints", "weight": 0.20, "required": true},
+    {"id": "explanatory_scope", "description": "Explains a meaningful share of the relevant observations", "weight": 0.20, "required": false},
+    {"id": "parsimony", "description": "Uses no more complexity than needed", "weight": 0.15, "required": false}
+  ],
+  "severity_levels": ["critical", "high", "moderate", "low"],
+  "severity_deductions": {"critical": 3.0, "high": 2.0, "moderate": 1.0, "low": 0.5},
+  "pass_threshold": 7.0,
+  "scoring_strategy": "weighted_deduction"
+}

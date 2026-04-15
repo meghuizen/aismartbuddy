@@ -424,6 +424,112 @@ class ValidationRecord:
 
 
 @dataclass
+class HypothesisEvidence:
+    """Evidence directly attached to a hypothesis ranking."""
+
+    text: str
+    direction: str  # supports | weakens | neutral
+    strength: float
+    source_domain: str = ""
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+@dataclass
+class HypothesisRecord:
+    """Competing hypothesis with accumulated evidence and predictions."""
+
+    id: str
+    statement: str
+    domain: str = ""
+    prior_weight: float = 0.5
+    posterior_weight: float = 0.5
+    predictions: list[dict] = field(default_factory=list)
+    evidence: list[HypothesisEvidence] = field(default_factory=list)
+    invalidated: bool = False
+    invalidation_reason: str = ""
+    history: list[dict] = field(default_factory=list)
+    refs: list[str] = field(default_factory=list)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+@dataclass
+class ConstraintRecord:
+    """Reusable hard or soft constraint."""
+
+    id: str
+    domain: str
+    constraint_type: str  # hard | soft
+    statement: str
+    check_description: str = ""
+    applies_to: list[str] = field(default_factory=list)
+    refs: list[str] = field(default_factory=list)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+@dataclass
+class ConstraintValidationRecord:
+    """Validation result of a target against a registered constraint."""
+
+    id: str
+    constraint_id: str
+    target_type: str
+    target_id: str = ""
+    target_text: str = ""
+    status: str = "uncertain"  # pass | fail | uncertain
+    note: str = ""
+    refs: list[str] = field(default_factory=list)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+@dataclass
+class TopologyRecord:
+    """Domain-neutral structural topology."""
+
+    id: str
+    name: str
+    source_domain: str = ""
+    source_description: str = ""
+    nodes: list[dict] = field(default_factory=list)
+    edges: list[dict] = field(default_factory=list)
+    translations: list[dict] = field(default_factory=list)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+@dataclass
+class EvidenceRecord:
+    """Primary evidence item with provenance metadata."""
+
+    id: str
+    content: str
+    source_type: str
+    domain: str = ""
+    confidence: float = 0.5
+    source_ref: str = ""
+    refs: list[str] = field(default_factory=list)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+@dataclass
+class EvidenceChainRecord:
+    """Directed provenance link from evidence/claim to another claim."""
+
+    id: str
+    from_id: str
+    to_id: str
+    inference_type: str
+    assumptions: list[str] = field(default_factory=list)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+_EVIDENCE_INFERENCE_RELIABILITY: dict[str, float] = {
+    "deductive": 0.95,
+    "inductive": 0.75,
+    "abductive": 0.60,
+    "analogical": 0.40,
+}
+
+
+@dataclass
 class ArtifactRecord:
     """Unified V2 reasoning artifact stored in session memory."""
 
@@ -518,6 +624,12 @@ class ThinkingEngine:
         self.rule_profiles: dict[str, RuleProfile] = {}
         self.rule_conflicts: dict[str, RuleConflictRecord] = {}
         self.validations: dict[str, ValidationRecord] = {}
+        self.hypotheses: dict[str, HypothesisRecord] = {}
+        self.constraints: dict[str, ConstraintRecord] = {}
+        self.constraint_validations: dict[str, ConstraintValidationRecord] = {}
+        self.topologies: dict[str, TopologyRecord] = {}
+        self.evidence: dict[str, EvidenceRecord] = {}
+        self.evidence_chains: dict[str, EvidenceChainRecord] = {}
         self.iterations: dict[str, IterationRecord] = {}
         self.artifacts: dict[str, ArtifactRecord] = {}
         self._artifact_ids_by_kind: dict[str, set[str]] = {}
@@ -562,6 +674,12 @@ class ThinkingEngine:
         self.rule_profiles.clear()
         self.rule_conflicts.clear()
         self.validations.clear()
+        self.hypotheses.clear()
+        self.constraints.clear()
+        self.constraint_validations.clear()
+        self.topologies.clear()
+        self.evidence.clear()
+        self.evidence_chains.clear()
         self.iterations.clear()
         self.artifacts.clear()
         self._artifact_ids_by_kind.clear()
@@ -630,6 +748,52 @@ class ThinkingEngine:
             parent_node.children.append(cid)
             child_ids.append(cid)
         return parent_node.id, child_ids
+
+    @_synchronized
+    def add_nodes_batch(self, node_specs: list[dict]) -> list[ThoughtNode]:
+        """Atomically add multiple thought nodes with internal parent refs.
+
+        node_specs entries must already be normalized with concrete node ids.
+        parent_id may refer to an existing node or to another earlier-created
+        batch node. Validation is fail-fast before any mutation.
+        """
+        if not node_specs:
+            return []
+
+        known_ids = set(self.thought_nodes.keys())
+        batch_ids = {str(spec["id"]) for spec in node_specs}
+        created: list[ThoughtNode] = []
+
+        # Validate all parent links first.
+        for spec in node_specs:
+            parent_id = spec.get("parent_id")
+            if parent_id and parent_id not in known_ids and parent_id not in batch_ids:
+                raise ValueError(f"Parent node '{parent_id}' not found for batch node")
+
+        self._cleanup_graph_memory()
+        for spec in node_specs:
+            node = ThoughtNode(
+                id=str(spec["id"]),
+                tree_id=str(spec["tree_id"]),
+                content=str(spec["content"]),
+                action=str(spec.get("action", "think")),
+                parent_id=spec.get("parent_id"),
+                children=[],
+                depends_on=list(spec.get("depends_on") or []),
+                refs=list(spec.get("refs") or []),
+                rule_bindings=list(spec.get("rule_bindings") or []),
+                depth=int(spec.get("depth", 0)),
+                metadata=dict(spec.get("metadata") or {}),
+            )
+            self.thought_nodes[node.id] = node
+            if node.parent_id is None:
+                self.thought_trees[node.tree_id] = node.id
+            else:
+                parent = self.thought_nodes.get(node.parent_id)
+                if parent is not None and node.id not in parent.children:
+                    parent.children.append(node.id)
+            created.append(node)
+        return created
 
     def get_node(self, node_id: str) -> ThoughtNode | None:
         return self.thought_nodes.get(node_id)
@@ -1670,6 +1834,227 @@ class ThinkingEngine:
             "nuance_notes": list(latest.nuance_notes) if latest else [],
         }
 
+    # ── Hypotheses / Constraints / Topologies / Evidence ─────────────
+
+    def _bounded_weight(self, value: float) -> float:
+        return max(0.01, min(0.99, float(value)))
+
+    def _recompute_hypothesis_posterior(self, record: HypothesisRecord) -> float:
+        odds = self._bounded_weight(record.prior_weight) / (
+            1.0 - self._bounded_weight(record.prior_weight)
+        )
+        for item in record.evidence:
+            factor = 1.0 + (2.0 * max(0.0, min(1.0, item.strength)))
+            if item.direction == "supports":
+                odds *= factor
+            elif item.direction == "weakens":
+                odds /= max(1.0, factor)
+        posterior = odds / (1.0 + odds)
+        record.posterior_weight = round(self._bounded_weight(posterior), 3)
+        return record.posterior_weight
+
+    @_synchronized
+    def upsert_hypothesis(self, record: HypothesisRecord) -> None:
+        self.hypotheses[record.id] = record
+        self._recompute_hypothesis_posterior(record)
+
+    def get_hypothesis(self, hypothesis_id: str) -> HypothesisRecord | None:
+        return self.hypotheses.get(hypothesis_id)
+
+    def get_hypotheses(self) -> list[HypothesisRecord]:
+        return list(self.hypotheses.values())
+
+    @_synchronized
+    def add_hypothesis_evidence(
+        self,
+        hypothesis_id: str,
+        *,
+        text: str,
+        direction: str,
+        strength: float,
+        source_domain: str = "",
+    ) -> HypothesisRecord:
+        record = self.hypotheses.get(hypothesis_id)
+        if record is None:
+            raise ValueError(f"Hypothesis '{hypothesis_id}' not found")
+        record.evidence.append(
+            HypothesisEvidence(
+                text=text,
+                direction=direction,
+                strength=max(0.0, min(1.0, strength)),
+                source_domain=source_domain,
+            )
+        )
+        self._recompute_hypothesis_posterior(record)
+        return record
+
+    @_synchronized
+    def invalidate_hypothesis(self, hypothesis_id: str, reason: str) -> HypothesisRecord:
+        record = self.hypotheses.get(hypothesis_id)
+        if record is None:
+            raise ValueError(f"Hypothesis '{hypothesis_id}' not found")
+        record.invalidated = True
+        record.invalidation_reason = reason
+        return record
+
+    @_synchronized
+    def update_hypothesis(
+        self,
+        hypothesis_id: str,
+        *,
+        new_predictions: list[dict] | None = None,
+        revised_statement: str | None = None,
+    ) -> HypothesisRecord:
+        record = self.hypotheses.get(hypothesis_id)
+        if record is None:
+            raise ValueError(f"Hypothesis '{hypothesis_id}' not found")
+        record.history.append(
+            {
+                "statement": record.statement,
+                "predictions": list(record.predictions),
+                "at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        if revised_statement:
+            record.statement = revised_statement
+        if new_predictions is not None:
+            record.predictions = list(new_predictions)
+        return record
+
+    @_synchronized
+    def upsert_constraint(self, record: ConstraintRecord) -> None:
+        self.constraints[record.id] = record
+
+    def get_constraint(self, constraint_id: str) -> ConstraintRecord | None:
+        return self.constraints.get(constraint_id)
+
+    def get_constraints(self) -> list[ConstraintRecord]:
+        return list(self.constraints.values())
+
+    @_synchronized
+    def remove_constraint(self, constraint_id: str) -> None:
+        self.constraints.pop(constraint_id, None)
+        for cid in [
+            vid
+            for vid, validation in self.constraint_validations.items()
+            if validation.constraint_id == constraint_id
+        ]:
+            self.constraint_validations.pop(cid, None)
+
+    @_synchronized
+    def add_constraint_validation(self, record: ConstraintValidationRecord) -> None:
+        self.constraint_validations[record.id] = record
+
+    def get_constraint_validations(
+        self,
+        *,
+        constraint_id: str | None = None,
+        target_type: str | None = None,
+        target_id: str | None = None,
+    ) -> list[ConstraintValidationRecord]:
+        rows = list(self.constraint_validations.values())
+        if constraint_id:
+            rows = [row for row in rows if row.constraint_id == constraint_id]
+        if target_type:
+            rows = [row for row in rows if row.target_type == target_type]
+        if target_id:
+            rows = [row for row in rows if row.target_id == target_id]
+        return rows
+
+    @_synchronized
+    def upsert_topology(self, record: TopologyRecord) -> None:
+        self.topologies[record.id] = record
+
+    def get_topology(self, topology_id: str) -> TopologyRecord | None:
+        return self.topologies.get(topology_id)
+
+    def get_topologies(self) -> list[TopologyRecord]:
+        return list(self.topologies.values())
+
+    @_synchronized
+    def upsert_evidence(self, record: EvidenceRecord) -> None:
+        self.evidence[record.id] = record
+
+    def get_evidence(self, evidence_id: str) -> EvidenceRecord | None:
+        return self.evidence.get(evidence_id)
+
+    def get_all_evidence(self) -> list[EvidenceRecord]:
+        return list(self.evidence.values())
+
+    @_synchronized
+    def add_evidence_chain(self, record: EvidenceChainRecord) -> None:
+        self.evidence_chains[record.id] = record
+
+    def get_evidence_chains(self) -> list[EvidenceChainRecord]:
+        return list(self.evidence_chains.values())
+
+    def trace_evidence_paths(self, claim_id: str) -> list[list[str]]:
+        """Return provenance paths ending at claim_id, starting from primary evidence."""
+        incoming: dict[str, list[EvidenceChainRecord]] = {}
+        for chain in self.evidence_chains.values():
+            incoming.setdefault(chain.to_id, []).append(chain)
+
+        paths: list[list[str]] = []
+
+        def _walk(current: str, path: list[str], seen: set[str]) -> None:
+            if current in seen:
+                return
+            seen = set(seen)
+            seen.add(current)
+            parents = incoming.get(current, [])
+            if not parents:
+                paths.append(list(reversed(path + [current])))
+                return
+            for chain in parents:
+                _walk(chain.from_id, path + [current], seen)
+
+        _walk(claim_id, [], set())
+        return paths
+
+    def compute_evidence_strength(self, claim_id: str) -> float:
+        """Compute aggregate evidence chain reliability for a claim."""
+        incoming: dict[str, list[EvidenceChainRecord]] = {}
+        for chain in self.evidence_chains.values():
+            incoming.setdefault(chain.to_id, []).append(chain)
+
+        memo: dict[str, float] = {}
+
+        def _score(node_id: str, seen: set[str]) -> float:
+            if node_id in memo:
+                return memo[node_id]
+            if node_id in seen:
+                return 0.0
+            if node_id in self.evidence:
+                confidence = max(0.0, min(1.0, self.evidence[node_id].confidence))
+                memo[node_id] = confidence
+                return confidence
+            if node_id in self.hypotheses:
+                base = self.hypotheses[node_id].posterior_weight
+            else:
+                base = 0.5
+            parents = incoming.get(node_id, [])
+            if not parents:
+                memo[node_id] = base
+                return base
+            scores: list[float] = []
+            next_seen = set(seen)
+            next_seen.add(node_id)
+            for chain in parents:
+                parent_score = _score(chain.from_id, next_seen)
+                edge_score = _EVIDENCE_INFERENCE_RELIABILITY.get(chain.inference_type, 0.5)
+                scores.append(parent_score * edge_score)
+            score = max(scores) if scores else base
+            memo[node_id] = round(max(0.0, min(1.0, score)), 3)
+            return memo[node_id]
+
+        return _score(claim_id, set())
+
+    def orphan_evidence_ids(self) -> list[str]:
+        chained = {chain.from_id for chain in self.evidence_chains.values()} | {
+            chain.to_id for chain in self.evidence_chains.values()
+        }
+        return sorted(eid for eid in self.evidence if eid not in chained)
+
     # ── Scoring ──────────────────────────────────────────
 
     def _cleanup_scoring_memory(self) -> None:
@@ -1885,15 +2270,48 @@ class ThinkingEngine:
 
     # ── Summary ──────────────────────────────────────────
 
-    def get_summary(self, max_items_per_category: int = 20) -> str:
+    def get_summary(
+        self,
+        max_items_per_category: int = 20,
+        detail_level: str = "index",
+    ) -> str:
         """Return a token-optimized summary of all thinking activity.
 
         Args:
             max_items_per_category: Cap on items shown per category.
                 Excess items collapse to "... (N more)" footer. Prevents
                 huge responses on sessions with hundreds of items.
+            detail_level: Verbosity of per-item content:
+                - "index" (default, backward-compat): terse one-liners with
+                  60-char previews. Good for dashboards and session listings.
+                - "synopsis": ~400-char previews, more branches per tree,
+                  full synthesis-node content. Good for resuming a session.
+                - "full": ~1200-char previews and all branches per tree.
+                  Good for end-of-session review.
         """
         cap = max(1, max_items_per_category)
+
+        if detail_level not in ("index", "synopsis", "full"):
+            detail_level = "index"
+        # Per-level verbosity knobs.
+        if detail_level == "index":
+            preview_root = 60
+            preview_branch = 50
+            preview_synth = 40
+            branches_per_tree = 4
+            synth_count = 2
+        elif detail_level == "synopsis":
+            preview_root = 200
+            preview_branch = 200
+            preview_synth = 400
+            branches_per_tree = 8
+            synth_count = 6
+        else:  # full
+            preview_root = 1200
+            preview_branch = 1200
+            preview_synth = 1200
+            branches_per_tree = 9999
+            synth_count = 9999
 
         def _append_items(lines, items, render):
             shown = list(items)[:cap]
@@ -1903,13 +2321,20 @@ class ThinkingEngine:
             if omitted > 0:
                 lines.append(f"- ... ({omitted} more)")
 
-        lines: list[str] = ["## Thinking Session Summary"]
+        def _preview(text: str, limit: int = 80) -> str:
+            cleaned = " ".join((text or "").split())
+            return cleaned[:limit] + ("..." if len(cleaned) > limit else "")
+
+        lines: list[str] = [f"## Thinking Session Summary (detail={detail_level})"]
 
         # Thought Graphs
         if self.thought_nodes:
             n_trees = len(self.thought_trees)
             n_nodes = len(self.thought_nodes)
-            lines.append(f"\n### Thought Graphs: {n_trees} trees, {n_nodes} nodes")
+            max_depth_all = max((node.depth for node in self.thought_nodes.values()), default=0)
+            lines.append(
+                f"\n### Thought Graphs: {n_trees} trees, {n_nodes} nodes, max depth {max_depth_all}"
+            )
             tree_items = list(self.thought_trees.items())
             for tid, root_id in tree_items[:cap]:
                 root = self.thought_nodes.get(root_id)
@@ -1917,13 +2342,91 @@ class ThinkingEngine:
                     subtree = self.get_subtree_nodes(root_id)
                     max_depth = max((n.depth for n in subtree), default=0)
                     delegated = sum(1 for n in subtree if n.delegation_state)
-                    root_preview = root.content[:40]
-                    line = f'- {tid}: "{root_preview}" — {len(subtree)} nodes, depth {max_depth}'
+                    root_preview = _preview(root.content, preview_root)
+                    line = (
+                        f'- Tree {tid}: "{root_preview}" — {len(subtree)} nodes, depth {max_depth}'
+                    )
                     if delegated:
                         line += f", {delegated} delegated"
                     lines.append(line)
+                    direct_children = [
+                        self.thought_nodes[cid]
+                        for cid in root.children[:branches_per_tree]
+                        if cid in self.thought_nodes
+                    ]
+                    for child in direct_children:
+                        child_subtree = self.get_subtree_nodes(child.id)
+                        lines.append(
+                            f"  Branch: {_preview(child.content, preview_branch)} "
+                            f"({len(child_subtree)} nodes)"
+                        )
+                    synths = [n for n in subtree if n.action == "synthesize"]
+                    if synths:
+                        lines.append(
+                            "  Synthesis: "
+                            + ", ".join(
+                                f"{n.id}={_preview(n.content, preview_synth)}"
+                                for n in synths[:synth_count]
+                            )
+                        )
+                    warnings = []
+                    for n in subtree:
+                        latest_validation = (
+                            n.validation_results[-1] if n.validation_results else None
+                        )
+                        if latest_validation and not latest_validation.get(
+                            "passed_hard_gates", True
+                        ):
+                            warnings.append(
+                                f"{n.id} hard_gates=fail "
+                                f"score={latest_validation.get('weighted_score')}"
+                            )
+                    if warnings:
+                        lines.append("  Validation warnings: " + " | ".join(warnings[:3]))
             if len(tree_items) > cap:
                 lines.append(f"- ... ({len(tree_items) - cap} more)")
+
+            knowledge_refs = sorted(
+                {
+                    ref
+                    for node in self.thought_nodes.values()
+                    for ref in node.metadata.get("knowledge_refs", [])
+                }
+            )
+            hypothesis_refs = sorted(
+                {
+                    ref
+                    for node in self.thought_nodes.values()
+                    for ref in node.metadata.get("hypothesis_refs", [])
+                }
+            )
+            constraint_refs = sorted(
+                {
+                    ref
+                    for node in self.thought_nodes.values()
+                    for ref in node.metadata.get("constraint_refs", [])
+                }
+            )
+            if knowledge_refs or hypothesis_refs or constraint_refs:
+                lines.append("Cross-links:")
+                if knowledge_refs:
+                    lines.append(
+                        "  knowledge_refs: "
+                        + ", ".join(knowledge_refs[:8])
+                        + (" ..." if len(knowledge_refs) > 8 else "")
+                    )
+                if hypothesis_refs:
+                    lines.append(
+                        "  hypothesis_refs: "
+                        + ", ".join(hypothesis_refs[:8])
+                        + (" ..." if len(hypothesis_refs) > 8 else "")
+                    )
+                if constraint_refs:
+                    lines.append(
+                        "  constraint_refs: "
+                        + ", ".join(constraint_refs[:8])
+                        + (" ..." if len(constraint_refs) > 8 else "")
+                    )
 
         # Models
         if self.models:
@@ -2058,6 +2561,110 @@ class ThinkingEngine:
                 )
             if len(self.rule_profiles) > cap:
                 lines.append(f"- ... ({len(self.rule_profiles) - cap} more)")
+
+        if self.hypotheses:
+            lines.append(f"\n### Hypotheses: {len(self.hypotheses)}")
+            sorted_hypotheses = sorted(
+                self.hypotheses.values(),
+                key=lambda h: (h.invalidated, -h.posterior_weight, h.created_at),
+            )
+            for hyp in sorted_hypotheses[:cap]:
+                state = "invalidated" if hyp.invalidated else "active"
+                lines.append(
+                    f"- {hyp.id}: {state} | posterior={hyp.posterior_weight:.3f} | "
+                    f"evidence={len(hyp.evidence)} | {_preview(hyp.statement, 70)}"
+                )
+            unvalidated = [
+                hyp.id
+                for hyp in self.hypotheses.values()
+                if not self.get_constraint_validations(target_type="hypothesis", target_id=hyp.id)
+            ]
+            if unvalidated:
+                lines.append(
+                    "Unvalidated hypotheses: "
+                    + ", ".join(unvalidated[:8])
+                    + (" ..." if len(unvalidated) > 8 else "")
+                )
+
+        if self.constraints or self.constraint_validations:
+            lines.append(
+                f"\n### Constraints: {len(self.constraints)} registered, "
+                f"{len(self.constraint_validations)} validations"
+            )
+            for constraint in list(self.constraints.values())[:cap]:
+                vals = self.get_constraint_validations(constraint_id=constraint.id)
+                passes = sum(1 for row in vals if row.status == "pass")
+                fails = sum(1 for row in vals if row.status == "fail")
+                lines.append(
+                    f"- {constraint.id}: {constraint.constraint_type} | "
+                    f"pass={passes} fail={fails} | {_preview(constraint.statement, 70)}"
+                )
+
+        if self.evidence or self.evidence_chains:
+            lines.append(
+                f"\n### Evidence: {len(self.evidence)} items, "
+                f"{len(self.evidence_chains)} provenance links"
+            )
+            orphan_ids = self.orphan_evidence_ids()
+            if orphan_ids:
+                lines.append(
+                    "Orphan evidence: "
+                    + ", ".join(orphan_ids[:8])
+                    + (" ..." if len(orphan_ids) > 8 else "")
+                )
+
+        if self.topologies:
+            lines.append(f"\n### Topologies: {len(self.topologies)}")
+            for topology in list(self.topologies.values())[:cap]:
+                lines.append(
+                    f"- {topology.id}: {topology.name} | nodes={len(topology.nodes)} "
+                    f"edges={len(topology.edges)} | domain={topology.source_domain or '?'}"
+                )
+
+        next_focus: list[str] = []
+        warning_nodes = []
+        for node in self.thought_nodes.values():
+            latest_validation = node.validation_results[-1] if node.validation_results else None
+            if latest_validation and not latest_validation.get("passed_hard_gates", True):
+                warning_nodes.append(node.id)
+        if warning_nodes:
+            next_focus.append(
+                "Validate or split thought nodes with warnings: "
+                + ", ".join(warning_nodes[:5])
+                + (" ..." if len(warning_nodes) > 5 else "")
+            )
+        if self.hypotheses:
+            unvalidated = [
+                hyp.id
+                for hyp in self.hypotheses.values()
+                if not self.get_constraint_validations(target_type="hypothesis", target_id=hyp.id)
+            ]
+            if unvalidated:
+                next_focus.append(
+                    "Run constraint sweep on hypotheses: "
+                    + ", ".join(unvalidated[:5])
+                    + (" ..." if len(unvalidated) > 5 else "")
+                )
+        orphan_ids = self.orphan_evidence_ids()
+        if orphan_ids:
+            next_focus.append(
+                "Chain orphan evidence into claims: "
+                + ", ".join(orphan_ids[:5])
+                + (" ..." if len(orphan_ids) > 5 else "")
+            )
+        open_conflicts = [
+            conflict.id for conflict in self.rule_conflicts.values() if conflict.status == "open"
+        ]
+        if open_conflicts:
+            next_focus.append(
+                "Resolve open rule conflicts: "
+                + ", ".join(open_conflicts[:5])
+                + (" ..." if len(open_conflicts) > 5 else "")
+            )
+        if next_focus:
+            lines.append("\n### Suggested Next Focus")
+            for item in next_focus[:cap]:
+                lines.append(f"- {item}")
 
         if len(lines) == 1:
             return "Empty thinking session — no activity recorded."

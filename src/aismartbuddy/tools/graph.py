@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import io
 import logging
+import re
 
 import anyio
 from mcp.server.fastmcp import Context
@@ -16,6 +17,7 @@ from aismartbuddy.tools import (
     execute_and_format,
     fetch_next_and_format,
     get_session_manager,
+    resolve_active_or_provided_session_id,
     run_with_lock,
     size_guarded,
 )
@@ -23,12 +25,18 @@ from aismartbuddy.tools import (
 logger = logging.getLogger("aismartbuddy.tools.graph")
 
 
-def _require_graph_session(session_id: str):
+def _require_graph_session(session_id: str | None):
     """Validate and return a graph session.
 
     Accepts a direct graph session_id OR a parent session_id whose backends
     include "graph".
     """
+    session_id = resolve_active_or_provided_session_id(session_id)
+    if not session_id:
+        raise ValueError(
+            "session_id is required unless an active session is set. "
+            "Use think_set_active_session(session_id)."
+        )
     mgr = get_session_manager()
     info = mgr.resolve_backend_session(session_id, "graph")
     return mgr, info
@@ -105,8 +113,8 @@ async def graph_create_session(
 
 
 async def graph_query(
-    session_id: str,
-    query: str,
+    session_id: str | None = None,
+    query: str = "",
     output_format: str = "csv",
     offset: int | None = None,
     limit: int | None = None,
@@ -151,16 +159,22 @@ async def graph_query(
     """
     mgr, info = _require_graph_session(session_id)
     return await execute_and_format(
-        info, mgr, query, output_format, offset, limit, paginate,
+        info,
+        mgr,
+        query,
+        output_format,
+        offset,
+        limit,
+        paginate,
         next_tool="graph_query_next",
         timeout_ms=timeout_ms if timeout_ms > 0 else None,
     )
 
 
 async def graph_import(
-    session_id: str,
-    table_name: str,
-    data: str,
+    session_id: str | None = None,
+    table_name: str = "",
+    data: str = "",
     table_type: str = "node",
     schema: str | None = None,
     from_table: str | None = None,
@@ -196,14 +210,12 @@ async def graph_import(
     mgr, info = _require_graph_session(session_id)
     count = await run_with_lock(
         info,
-        lambda: info.engine.import_csv(
-            table_name, data, table_type, schema, from_table, to_table
-        ),
+        lambda: info.engine.import_csv(table_name, data, table_type, schema, from_table, to_table),
     )
     return f"Imported {count} {table_type}s into '{table_name}'."
 
 
-async def graph_schema(session_id: str) -> str:
+async def graph_schema(session_id: str | None = None) -> str:
     """Get graph database schema — node tables, relationship tables, and their properties.
 
     Args:
@@ -219,7 +231,7 @@ async def graph_schema(session_id: str) -> str:
     return format_result(columns, rows, mgr.max_rows, mgr.max_chars, "table")
 
 
-async def graph_destroy_session(session_id: str) -> str:
+async def graph_destroy_session(session_id: str | None = None) -> str:
     """Destroy a graph session and clean up all temporary data.
 
     Always call this when done to free resources.
@@ -231,11 +243,11 @@ async def graph_destroy_session(session_id: str) -> str:
         Confirmation message.
     """
     mgr, info = _require_graph_session(session_id)
-    await anyio.to_thread.run_sync(lambda: mgr.destroy_session(session_id))
-    return f"Graph session '{session_id}' destroyed and cleaned up."
+    await anyio.to_thread.run_sync(lambda: mgr.destroy_session(info.session_id))
+    return f"Graph session '{info.session_id}' destroyed and cleaned up."
 
 
-async def graph_query_next(session_id: str, cursor_id: str) -> str:
+async def graph_query_next(session_id: str | None = None, cursor_id: str = "") -> str:
     """Fetch the next page of results from a paginated graph query.
 
     Use after graph_query(..., paginate=True) returns a cursor_id.
@@ -255,7 +267,10 @@ async def graph_query_next(session_id: str, cursor_id: str) -> str:
     """
     mgr, info = _require_graph_session(session_id)
     return await fetch_next_and_format(
-        info, mgr, cursor_id, next_tool="graph_query_next",
+        info,
+        mgr,
+        cursor_id,
+        next_tool="graph_query_next",
     )
 
 
@@ -263,7 +278,7 @@ async def graph_query_next(session_id: str, cursor_id: str) -> str:
 
 
 @size_guarded
-async def graph_statistics(session_id: str) -> str:
+async def graph_statistics(session_id: str | None = None) -> str:
     """Get a complete overview of the graph in one call.
 
     Returns node counts by type, relationship counts by type,
@@ -280,9 +295,7 @@ async def graph_statistics(session_id: str) -> str:
     stats = await run_with_lock(info, info.engine.get_statistics)
 
     lines = ["## Graph Overview"]
-    lines.append(
-        f"Total: {stats['total_nodes']} nodes, {stats['total_edges']} edges"
-    )
+    lines.append(f"Total: {stats['total_nodes']} nodes, {stats['total_edges']} edges")
     lines.append("")
 
     if stats["node_tables"]:
@@ -299,9 +312,9 @@ async def graph_statistics(session_id: str) -> str:
 
 
 async def graph_neighbors(
-    session_id: str,
-    node_name: str,
-    node_type: str,
+    session_id: str | None = None,
+    node_name: str = "",
+    node_type: str = "",
     depth: int = 1,
     direction: str = "both",
 ) -> str:
@@ -345,9 +358,9 @@ async def graph_neighbors(
 
 @size_guarded
 async def graph_focus_summary(
-    session_id: str,
-    node_names: list[str],
-    node_type: str,
+    session_id: str | None = None,
+    node_names: list[str] | None = None,
+    node_type: str = "",
     depth: int = 1,
     direction: str = "both",
 ) -> str:
@@ -390,20 +403,11 @@ async def graph_focus_summary(
     for node_name in names:
         safe_name = _escape_cypher_string(node_name)
         if direction == "outgoing":
-            pattern = (
-                f"(start:{node_type} {{name: '{safe_name}'}})"
-                f"-[r*1..{depth}]->(neighbor)"
-            )
+            pattern = f"(start:{node_type} {{name: '{safe_name}'}})-[r*1..{depth}]->(neighbor)"
         elif direction == "incoming":
-            pattern = (
-                f"(neighbor)-[r*1..{depth}]->"
-                f"(start:{node_type} {{name: '{safe_name}'}})"
-            )
+            pattern = f"(neighbor)-[r*1..{depth}]->(start:{node_type} {{name: '{safe_name}'}})"
         else:
-            pattern = (
-                f"(start:{node_type} {{name: '{safe_name}'}})"
-                f"-[r*1..{depth}]-(neighbor)"
-            )
+            pattern = f"(start:{node_type} {{name: '{safe_name}'}})-[r*1..{depth}]-(neighbor)"
 
         cypher = (
             f"MATCH p = {pattern} "
@@ -411,28 +415,24 @@ async def graph_focus_summary(
             "neighbor.name AS name, length(p) AS hops "
             "ORDER BY hops, name LIMIT 20;"
         )
-        columns, rows = await run_with_lock(
-            info, lambda c=cypher: info.engine.execute(c)
-        )
+        columns, rows = await run_with_lock(info, lambda c=cypher: info.engine.execute(c))
         sections.append(f"\n### {node_name}")
         if not rows:
             sections.append(
                 f"No neighbors found for {node_type} '{node_name}' within {depth} hops."
             )
             continue
-        sections.append(
-            format_result(columns, rows, mgr.max_rows, mgr.max_chars, "table")
-        )
+        sections.append(format_result(columns, rows, mgr.max_rows, mgr.max_chars, "table"))
 
     return "\n".join(sections)
 
 
 async def graph_find_connections(
-    session_id: str,
-    from_name: str,
-    from_type: str,
-    to_name: str,
-    to_type: str,
+    session_id: str | None = None,
+    from_name: str = "",
+    from_type: str = "",
+    to_name: str = "",
+    to_type: str = "",
     max_depth: int = 5,
     max_paths: int = 20,
 ) -> str:
@@ -522,9 +522,7 @@ async def _analyze_categories(info, mgr, stats) -> str:
                 f"RETURN n.{prop} AS {prop}, count(n) AS cnt ORDER BY cnt DESC;"
             )
             try:
-                _, rows = await run_with_lock(
-                    info, lambda c=cypher: info.engine.execute(c)
-                )
+                _, rows = await run_with_lock(info, lambda c=cypher: info.engine.execute(c))
                 if rows:
                     for row in rows:
                         lines.append(f"  {prop}={row[0]}: {row[1]}")
@@ -542,7 +540,7 @@ async def _analyze_cross_connections(info, mgr, stats) -> str:
         if len(rel_types) < 2:
             continue
         for i, rt1 in enumerate(rel_types):
-            for rt2 in rel_types[i + 1:]:
+            for rt2 in rel_types[i + 1 :]:
                 cypher = (
                     f"MATCH (n:{table_name})-[:{rt1}]-() "
                     f"MATCH (n)-[:{rt2}]-() "
@@ -550,9 +548,7 @@ async def _analyze_cross_connections(info, mgr, stats) -> str:
                     f"'{rt1}+{rt2}' AS bridges;"
                 )
                 try:
-                    _, rows = await run_with_lock(
-                        info, lambda c=cypher: info.engine.execute(c)
-                    )
+                    _, rows = await run_with_lock(info, lambda c=cypher: info.engine.execute(c))
                     all_results.extend(rows)
                 except Exception as exc:
                     logger.warning("Cross-connection query failed: %s", exc)
@@ -571,7 +567,116 @@ async def _analyze_cross_connections(info, mgr, stats) -> str:
     )
 
 
-async def graph_analyze(session_id: str, analysis_type: str) -> str:
+async def _analyze_feedback_loops(info, mgr, stats) -> str:
+    """Detect simple directed cycles in the graph."""
+    try:
+        cols, rows = await run_with_lock(
+            info,
+            lambda: info.engine.execute(
+                "MATCH (a)-[r1]->(b)-[r2]->(a) "
+                "RETURN DISTINCT a.name AS node_a, b.name AS node_b, "
+                "type(r1) AS edge_ab, type(r2) AS edge_ba LIMIT 20;"
+            ),
+        )
+    except Exception:
+        return "No feedback loops found."
+    if not rows:
+        return "No feedback loops found."
+    return format_result(cols, rows, mgr.max_rows, mgr.max_chars, "table")
+
+
+async def _analyze_motifs(info, mgr, stats) -> str:
+    """Find recurring small motifs such as mutual pairs and feed-forward triads."""
+    lines = ["## Graph Motifs"]
+    try:
+        _, mutual_rows = await run_with_lock(
+            info,
+            lambda: info.engine.execute(
+                "MATCH (a)-[r1]->(b)-[r2]->(a) "
+                "RETURN DISTINCT a.name AS left_node, b.name AS right_node "
+                "LIMIT 20;"
+            ),
+        )
+    except Exception:
+        mutual_rows = []
+    if mutual_rows:
+        lines.append(f"Mutual pairs: {len(mutual_rows)}")
+        for row in mutual_rows[:10]:
+            lines.append(f"  {row[0]} <-> {row[1]}")
+    try:
+        _, triad_rows = await run_with_lock(
+            info,
+            lambda: info.engine.execute(
+                "MATCH (a)-[r1]->(b)-[r2]->(c), (a)-[r3]->(c) "
+                "RETURN DISTINCT a.name AS start, b.name AS middle, c.name AS end "
+                "LIMIT 20;"
+            ),
+        )
+    except Exception:
+        triad_rows = []
+    if triad_rows:
+        lines.append(f"Feed-forward triads: {len(triad_rows)}")
+        for row in triad_rows[:10]:
+            lines.append(f"  {row[0]} -> {row[1]} -> {row[2]} and {row[0]} -> {row[2]}")
+    if len(lines) == 1:
+        return "No recurring motifs found."
+    return "\n".join(lines)
+
+
+async def _analyze_bottlenecks(info, mgr, stats) -> str:
+    """Approximate bottlenecks via high connectivity across relationship types."""
+    all_results = []
+    for table_name in stats["node_tables"]:
+        cypher = (
+            f"MATCH (n:{table_name})-[r]-() "
+            f"RETURN '{table_name}' AS type, n.name AS name, count(r) AS degree "
+            f"ORDER BY degree DESC LIMIT 10;"
+        )
+        try:
+            _, rows = await run_with_lock(info, lambda c=cypher: info.engine.execute(c))
+            all_results.extend(rows)
+        except Exception:
+            continue
+    if not all_results:
+        return "No bottlenecks found."
+    all_results.sort(key=lambda row: row[2], reverse=True)
+    return format_result(
+        ["type", "name", "degree"], all_results[:20], mgr.max_rows, mgr.max_chars, "table"
+    )
+
+
+async def _analyze_domain_bridges(info, mgr, stats) -> str:
+    """Find edges carrying different domain metadata between knowledge nodes."""
+    rel_tables = [
+        table_name
+        for table_name in stats["rel_tables"]
+        if table_name.lower() not in {"derivedfrom", "partof"}
+    ]
+    rows: list[tuple] = []
+    for rel in rel_tables:
+        cypher = (
+            f"MATCH (a:KnowledgeNode)-[r:{rel}]->(b:KnowledgeNode) "
+            "WHERE r.domain IS NOT NULL AND r.domain <> '' "
+            "RETURN DISTINCT a.name AS from_node, b.name AS to_node, r.domain AS domain, "
+            f"'{rel}' AS relation LIMIT 20;"
+        )
+        try:
+            _, rel_rows = await run_with_lock(info, lambda c=cypher: info.engine.execute(c))
+            rows.extend(rel_rows)
+        except Exception:
+            continue
+    if not rows:
+        return "No domain bridges found."
+    return format_result(
+        ["from_node", "to_node", "domain", "relation"],
+        rows[:20],
+        mgr.max_rows,
+        mgr.max_chars,
+        "table",
+    )
+
+
+async def graph_analyze(session_id: str | None = None, analysis_type: str = "") -> str:
     """Run pre-built analytical queries on the graph.
 
     Saves you from writing complex Cypher for common graph analysis tasks.
@@ -583,6 +688,10 @@ async def graph_analyze(session_id: str, analysis_type: str) -> str:
             - "hubs" — find the 10 most-connected nodes (highest degree)
             - "categories" — group all nodes by type and key properties
             - "cross_connections" — find nodes linking different node types
+            - "motifs" — recurring small subgraph patterns
+            - "bottlenecks" — high-connectivity bridge nodes
+            - "domain_bridges" — cross-domain relationships using edge domain metadata
+            - "feedback_loops" — simple directed cycles
 
     Returns:
         Analysis results in table format.
@@ -595,6 +704,10 @@ async def graph_analyze(session_id: str, analysis_type: str) -> str:
         "hubs": _analyze_hubs,
         "categories": _analyze_categories,
         "cross_connections": _analyze_cross_connections,
+        "motifs": _analyze_motifs,
+        "bottlenecks": _analyze_bottlenecks,
+        "domain_bridges": _analyze_domain_bridges,
+        "feedback_loops": _analyze_feedback_loops,
     }
     handler = dispatch.get(analysis_type)
     if handler is None:
@@ -713,10 +826,7 @@ async def graph_compare(
         return "\n".join(lines)
 
     else:
-        return (
-            f"Unknown compare_type: '{compare_type}'. "
-            "Options: structure, nodes, properties"
-        )
+        return f"Unknown compare_type: '{compare_type}'. Options: structure, nodes, properties"
 
 
 async def graph_cross_reference(
@@ -793,11 +903,18 @@ async def graph_cross_reference(
 
 # ── Knowledge Graph Tools ─────────────────────────────────────────
 
-_ENTITY_TYPES = {"concept", "entity", "fact", "evidence", "question", "insight"}
+_DEFAULT_ENTITY_TYPES = {"concept", "entity", "fact", "evidence", "question", "insight"}
 _ENTITY_TYPE_ALIASES = {"hypothesis": "question"}
-_RELATION_TYPES = {
-    "supports", "contradicts", "refines", "causes", "prevents",
-    "requires", "part_of", "similar_to", "derived_from",
+_DEFAULT_RELATION_TYPES = {
+    "supports",
+    "contradicts",
+    "refines",
+    "causes",
+    "prevents",
+    "requires",
+    "part_of",
+    "similar_to",
+    "derived_from",
 }
 
 
@@ -806,13 +923,26 @@ def _normalize_entity_type(entity_type: str) -> str:
     return _ENTITY_TYPE_ALIASES.get(entity_type, entity_type)
 
 
+def _normalize_relation_table_name(relation: str) -> str:
+    """Convert any user relation label into a safe relation-table identifier."""
+    cleaned = re.sub(r"[^A-Za-z0-9]+", "_", relation.strip()).strip("_")
+    if not cleaned:
+        raise ValueError("relation must be a non-empty string")
+    parts = [part.capitalize() for part in cleaned.split("_") if part]
+    table_name = "".join(parts) or "Relation"
+    _validate_id(table_name, "relation_table")
+    return table_name
+
+
 async def graph_knowledge_add(
-    session_id: str,
-    entity: str,
+    session_id: str | None = None,
+    entity: str = "",
     entity_type: str = "concept",
     properties: dict | None = None,
     confidence: float = 1.0,
     source: str = "ai",
+    items: list[dict] | None = None,
+    idempotency_key: str | None = None,
 ) -> str:
     """Add a knowledge node with provenance metadata to the graph.
 
@@ -820,12 +950,15 @@ async def graph_knowledge_add(
     typed entities, confidence scores, and provenance tracking.
 
     The first call auto-creates a KnowledgeNode table if it doesn't exist.
+    Batch mode: pass items=[{entity, entity_type?, confidence?, properties?, source?}, ...]
+    to create multiple nodes in one call. Each item is one entity.
 
     Args:
         session_id: Session token from graph_create_session.
         entity: Name/label of the knowledge entity.
-        entity_type: One of: concept, entity, fact, evidence, question, insight.
-            Alias accepted: hypothesis -> question.
+        entity_type: Documented defaults: concept, entity, fact, evidence,
+            question, insight. Any non-empty string is accepted and registered
+            as provided. Alias accepted: hypothesis -> question.
         properties: Optional dict of additional properties (stored as description).
         confidence: Confidence score 0.0 to 1.0 (default 1.0).
         source: Provenance — who/what added this (default "ai").
@@ -834,13 +967,22 @@ async def graph_knowledge_add(
         Confirmation with node details.
     """
     mgr, info = _require_graph_session(session_id)
+    if items is not None:
+        return await knowledge_batch(
+            session_id=session_id,
+            nodes=items,
+            relations=None,
+            idempotency_key=idempotency_key,
+        )
+
+    if idempotency_key:
+        cached = mgr.get_idempotent_result(info.session_id, idempotency_key)
+        if cached is not None:
+            return cached
 
     entity_type = _normalize_entity_type(entity_type)
-    if entity_type not in _ENTITY_TYPES:
-        raise ValueError(
-            f"Invalid entity_type: '{entity_type}'. "
-            f"Options: {', '.join(sorted(_ENTITY_TYPES))}"
-        )
+    if not entity_type.strip():
+        raise ValueError("entity_type must be a non-empty string")
     confidence = max(0.0, min(1.0, confidence))
 
     safe_name = _escape_cypher_string(entity)
@@ -879,54 +1021,78 @@ async def graph_knowledge_add(
             f"}});"
         ),
     )
-    return (
-        f"Added {entity_type}: '{entity}' "
-        f"(confidence: {confidence}, source: {source})"
-    )
+    result = f"Added {entity_type}: '{entity}' (confidence: {confidence}, source: {source})"
+    if idempotency_key:
+        mgr.store_idempotent_result(info.session_id, idempotency_key, result)
+    return result
 
 
 async def graph_knowledge_relate(
-    session_id: str,
-    from_name: str,
-    to_name: str,
-    relation: str,
+    session_id: str | None = None,
+    from_name: str = "",
+    to_name: str = "",
+    relation: str = "",
     weight: float = 1.0,
     justification: str = "",
     source: str = "ai",
+    domain: str | None = None,
+    directionality: str | None = None,
+    confidence_basis: str | None = None,
+    items: list[dict] | None = None,
+    idempotency_key: str | None = None,
 ) -> str:
     """Add a semantic relationship between two knowledge nodes.
 
     Creates weighted, justified relationships with provenance.
     The first call for each relation type auto-creates the relationship table.
+    Batch mode: pass items=[{from_name, to_name, relation, weight?, justification?,
+    source?, domain?, directionality?, confidence_basis?}, ...] to create
+    multiple semantic relationships in one call.
 
     Args:
         session_id: Session token from graph_create_session.
         from_name: Name of the source knowledge node.
         to_name: Name of the target knowledge node.
-        relation: Semantic relationship type. One of: supports, contradicts,
-            refines, causes, prevents, requires, part_of, similar_to, derived_from.
+        relation: Semantic relationship type. Documented defaults are
+            supports, contradicts, refines, causes, prevents, requires,
+            part_of, similar_to, derived_from. Any non-empty string is accepted.
         weight: Relationship strength 0.0 to 1.0 (default 1.0).
         justification: Why this relationship exists (free text).
         source: Provenance — who/what added this.
+        domain: Optional origin domain for this edge.
+        directionality: Optional semantic direction class
+            (causal/correlative/structural/temporal/logical).
+        confidence_basis: Optional evidence basis
+            (experimental/theoretical/analogical/inferred/assumed).
 
     Returns:
         Confirmation with relationship details.
     """
     mgr, info = _require_graph_session(session_id)
-
-    if relation not in _RELATION_TYPES:
-        raise ValueError(
-            f"Invalid relation: '{relation}'. "
-            f"Options: {', '.join(sorted(_RELATION_TYPES))}"
+    if items is not None:
+        return await knowledge_batch(
+            session_id=session_id,
+            nodes=None,
+            relations=items,
+            idempotency_key=idempotency_key,
         )
+
+    if idempotency_key:
+        cached = mgr.get_idempotent_result(info.session_id, idempotency_key)
+        if cached is not None:
+            return cached
+    if not relation.strip():
+        raise ValueError("relation must be a non-empty string")
     weight = max(0.0, min(1.0, weight))
 
     safe_from = _escape_cypher_string(from_name)
     safe_to = _escape_cypher_string(to_name)
     safe_just = _escape_cypher_string(justification)
     safe_source = _escape_cypher_string(source)
-    rel_table = relation.capitalize().replace("_", "")  # e.g., "part_of" → "Partof"
-    _validate_id(rel_table, "relation_table")
+    safe_domain = _escape_cypher_string(domain or "")
+    safe_directionality = _escape_cypher_string(directionality or "")
+    safe_confidence_basis = _escape_cypher_string(confidence_basis or "")
+    rel_table = _normalize_relation_table_name(relation)
 
     from datetime import datetime, timezone
 
@@ -940,7 +1106,8 @@ async def graph_knowledge_relate(
                 f"CREATE REL TABLE IF NOT EXISTS {rt} ("
                 f"FROM KnowledgeNode TO KnowledgeNode, "
                 f"weight DOUBLE, justification STRING, "
-                f"source STRING, created_at STRING);"
+                f"source STRING, domain STRING, directionality STRING, "
+                f"confidence_basis STRING, created_at STRING);"
             ),
         )
     except Exception:
@@ -955,26 +1122,36 @@ async def graph_knowledge_relate(
             f"weight: {weight}, "
             f"justification: '{safe_just}', "
             f"source: '{safe_source}', "
+            f"domain: '{safe_domain}', "
+            f"directionality: '{safe_directionality}', "
+            f"confidence_basis: '{safe_confidence_basis}', "
             f"created_at: '{ts}'"
             f"}}]->(b);"
         ),
     )
-    return (
+    result = (
         f"Related: '{from_name}' --[{relation} w={weight}]--> '{to_name}'"
         f"{f' ({justification})' if justification else ''}"
     )
+    if idempotency_key:
+        mgr.store_idempotent_result(info.session_id, idempotency_key, result)
+    return result
 
 
 async def knowledge_batch(
-    session_id: str,
+    session_id: str | None = None,
     nodes: list[dict] | None = None,
     relations: list[dict] | None = None,
+    idempotency_key: str | None = None,
 ) -> str:
     """Bulk-create knowledge graph nodes and relations in one call.
 
     Use INSTEAD of multiple sequential graph_knowledge_add /
     graph_knowledge_relate calls when adding 3+ items. Same per-item
     validation as the single-item tools — invalid items abort the batch.
+    Each node entry should be one entity and each relation entry should be
+    one semantic relationship. Batch mode reduces round-trips; it is not a
+    place to pack multiple entities or multiple meanings into one dict.
 
     Two-phase: nodes are created first (so relations can match), then
     relations. All operations execute under a single session lock —
@@ -985,11 +1162,12 @@ async def knowledge_batch(
         nodes: List of node dicts. Each: {entity, entity_type?, confidence?,
             properties?, source?}. entity is required;
             entity_type defaults to "concept", confidence to 1.0, source to "ai".
-            Alias accepted: hypothesis -> question.
+            Alias accepted: hypothesis -> question. entity_type is open-ended.
         relations: List of relation dicts. Each: {from_name, to_name, relation,
-            weight?, justification?, source?}. relation must be in the standard
-            relation set (supports/contradicts/refines/causes/prevents/requires/
-            part_of/similar_to/derived_from).
+            weight?, justification?, source?, domain?, directionality?,
+            confidence_basis?}. relation is open-ended; documented defaults are
+            supports/contradicts/refines/causes/prevents/requires/
+            part_of/similar_to/derived_from.
 
     Returns:
         Counts of nodes/relations created plus any per-item errors.
@@ -997,34 +1175,28 @@ async def knowledge_batch(
     from datetime import datetime, timezone
 
     mgr, info = _require_graph_session(session_id)
+    if idempotency_key:
+        cached = mgr.get_idempotent_result(info.session_id, idempotency_key)
+        if cached is not None:
+            return cached
     nodes = nodes or []
     relations = relations or []
     if not nodes and not relations:
-        raise ValueError(
-            "knowledge_batch requires at least one node or relation"
-        )
+        raise ValueError("knowledge_batch requires at least one node or relation")
 
     # Phase 0: validate all items up front (fail-fast per plan)
     for i, n in enumerate(nodes):
         if not n.get("entity"):
             raise ValueError(f"nodes[{i}] missing 'entity'")
         et = _normalize_entity_type(n.get("entity_type", "concept"))
-        if et not in _ENTITY_TYPES:
-            raise ValueError(
-                f"nodes[{i}] invalid entity_type '{et}'. "
-                f"Options: {', '.join(sorted(_ENTITY_TYPES))}"
-            )
+        if not str(et).strip():
+            raise ValueError(f"nodes[{i}] entity_type must be non-empty")
     for i, r in enumerate(relations):
         if not r.get("from_name") or not r.get("to_name"):
-            raise ValueError(
-                f"relations[{i}] missing 'from_name' or 'to_name'"
-            )
+            raise ValueError(f"relations[{i}] missing 'from_name' or 'to_name'")
         rel = r.get("relation")
-        if rel not in _RELATION_TYPES:
-            raise ValueError(
-                f"relations[{i}] invalid relation '{rel}'. "
-                f"Options: {', '.join(sorted(_RELATION_TYPES))}"
-            )
+        if not str(rel or "").strip():
+            raise ValueError(f"relations[{i}] relation must be non-empty")
 
     ts = datetime.now(timezone.utc).isoformat()
 
@@ -1042,14 +1214,10 @@ async def knowledge_batch(
         count = 0
         for n in nodes:
             entity = _escape_cypher_string(n["entity"])
-            etype = _escape_cypher_string(
-                _normalize_entity_type(n.get("entity_type", "concept"))
-            )
+            etype = _escape_cypher_string(_normalize_entity_type(n.get("entity_type", "concept")))
             conf = max(0.0, min(1.0, float(n.get("confidence", 1.0))))
             src = _escape_cypher_string(n.get("source", "ai"))
-            props = _escape_cypher_string(
-                str(n["properties"]) if n.get("properties") else ""
-            )
+            props = _escape_cypher_string(str(n["properties"]) if n.get("properties") else "")
             info.engine.execute(
                 f"CREATE (n:KnowledgeNode {{"
                 f"name: '{entity}', description: '{props}', "
@@ -1066,14 +1234,14 @@ async def knowledge_batch(
         errors: list[str] = []
         for i, r in enumerate(relations):
             relation = r["relation"]
-            rel_table = relation.capitalize().replace("_", "")
-            _validate_id(rel_table, "relation_table")
+            rel_table = _normalize_relation_table_name(relation)
             try:
                 info.engine.execute(
                     f"CREATE REL TABLE IF NOT EXISTS {rel_table} ("
                     f"FROM KnowledgeNode TO KnowledgeNode, "
                     f"weight DOUBLE, justification STRING, "
-                    f"source STRING, created_at STRING);"
+                    f"source STRING, domain STRING, directionality STRING, "
+                    f"confidence_basis STRING, created_at STRING);"
                 )
             except Exception:
                 pass
@@ -1082,13 +1250,19 @@ async def knowledge_batch(
             weight = max(0.0, min(1.0, float(r.get("weight", 1.0))))
             just = _escape_cypher_string(r.get("justification", ""))
             src = _escape_cypher_string(r.get("source", "ai"))
+            edge_domain = _escape_cypher_string(r.get("domain", ""))
+            edge_directionality = _escape_cypher_string(r.get("directionality", ""))
+            edge_confidence_basis = _escape_cypher_string(r.get("confidence_basis", ""))
             try:
                 info.engine.execute(
                     f"MATCH (a:KnowledgeNode {{name: '{from_n}'}}), "
                     f"(b:KnowledgeNode {{name: '{to_n}'}}) "
                     f"CREATE (a)-[:{rel_table} {{"
                     f"weight: {weight}, justification: '{just}', "
-                    f"source: '{src}', created_at: '{ts}'"
+                    f"source: '{src}', domain: '{edge_domain}', "
+                    f"directionality: '{edge_directionality}', "
+                    f"confidence_basis: '{edge_confidence_basis}', "
+                    f"created_at: '{ts}'"
                     f"}}]->(b);"
                 )
                 count += 1
@@ -1106,20 +1280,22 @@ async def knowledge_batch(
     n_count, r_count, r_errors = await run_with_lock(info, _insert_all)
 
     parts = [
-        f"Session: {session_id}",
+        f"Session: {info.session_id}",
         f"Nodes added: {n_count}",
         f"Relations added: {r_count}",
     ]
     out = " | ".join(parts)
     if r_errors:
         out += "\nRelation errors:\n  " + "\n  ".join(r_errors)
+    if idempotency_key:
+        mgr.store_idempotent_result(info.session_id, idempotency_key, out)
     return out
 
 
 @size_guarded
 async def graph_knowledge_infer(
-    session_id: str,
-    inference_type: str,
+    session_id: str | None = None,
+    inference_type: str = "",
     max_depth: int = 5,
     min_nodes_override: int = 10,
 ) -> str:
@@ -1134,6 +1310,9 @@ async def graph_knowledge_infer(
             - "gaps" — high-degree nodes with low avg edge confidence
             - "chains" — transitive support chains (A supports B, B supports C)
             - "clusters" — groups of tightly connected nodes
+            - "convergence" — nodes supported by 2+ distinct domains
+            - "weak_links" — assumed/analogical links lacking corroboration
+            - "prediction_conflicts" — competing hypothesis/question nodes disagreeing on a target
         max_depth: For chains, bounds the transitive search depth (default 5,
             clamped to [2, 10]). Lower values terminate faster on large graphs;
             higher values find longer support chains.
@@ -1144,14 +1323,16 @@ async def graph_knowledge_infer(
     mgr, info = _require_graph_session(session_id)
     # Bound max_depth to prevent runaway transitive closure
     max_depth = max(2, min(max_depth, 10))
+    try:
+        stats = await run_with_lock(info, info.engine.get_statistics)
+    except Exception:
+        stats = {"rel_tables": {}}
 
     # Early-return if graph is too small to yield meaningful inference
     try:
         cols, rows = await run_with_lock(
             info,
-            lambda: info.engine.execute(
-                "MATCH (n:KnowledgeNode) RETURN count(n) AS c;"
-            ),
+            lambda: info.engine.execute("MATCH (n:KnowledgeNode) RETURN count(n) AS c;"),
         )
         node_count = int(rows[0][0]) if rows else 0
     except Exception:
@@ -1164,19 +1345,32 @@ async def graph_knowledge_infer(
         )
 
     if inference_type == "contradictions":
-        # Find nodes connected by both Supports and Contradicts
-        cypher = (
-            "MATCH (a:KnowledgeNode)-[:Supports]->(b:KnowledgeNode) "
-            "MATCH (a)-[:Contradicts]->(b) "
-            "RETURN a.name AS from_node, b.name AS to_node, "
-            "a.confidence AS from_conf, b.confidence AS to_conf;"
-        )
-        try:
-            cols, rows = await run_with_lock(
-                info, lambda: info.engine.execute(cypher)
-            )
-        except Exception:
-            return "No contradictions found (Supports/Contradicts tables may not exist)."
+        support_tables = [
+            name
+            for name in stats["rel_tables"]
+            if any(token in name.lower() for token in ("support", "refine", "derive"))
+        ] or ["Supports"]
+        conflict_tables = [
+            name
+            for name in stats["rel_tables"]
+            if any(token in name.lower() for token in ("contradict", "oppose", "prevent"))
+        ] or ["Contradicts"]
+        rows = []
+        cols = ["from_node", "to_node", "support_relation", "conflict_relation"]
+        for support_table in support_tables:
+            for conflict_table in conflict_tables:
+                cypher = (
+                    f"MATCH (a:KnowledgeNode)-[:{support_table}]->(b:KnowledgeNode) "
+                    f"MATCH (a)-[:{conflict_table}]->(b) "
+                    f"RETURN a.name AS from_node, b.name AS to_node, "
+                    f"'{support_table}' AS support_relation, "
+                    f"'{conflict_table}' AS conflict_relation;"
+                )
+                try:
+                    _, rel_rows = await run_with_lock(info, lambda c=cypher: info.engine.execute(c))
+                    rows.extend(rel_rows)
+                except Exception:
+                    continue
         if not rows:
             return "No contradictions found — no nodes are both supported and contradicted."
         return format_result(cols, rows, mgr.max_rows, mgr.max_chars, "table")
@@ -1189,9 +1383,7 @@ async def graph_knowledge_infer(
             "ORDER BY n.confidence ASC, degree DESC LIMIT 20;"
         )
         try:
-            cols, rows = await run_with_lock(
-                info, lambda: info.engine.execute(cypher)
-            )
+            cols, rows = await run_with_lock(info, lambda: info.engine.execute(cypher))
         except Exception:
             return "No knowledge nodes found."
         if not rows:
@@ -1200,29 +1392,24 @@ async def graph_knowledge_infer(
         for row in rows:
             conf = row[2] if row[2] is not None else 0
             if conf < 0.7:
-                lines.append(
-                    f"  {row[0]} ({row[1]}): confidence={conf:.2f}, "
-                    f"connections={row[3]}"
-                )
+                lines.append(f"  {row[0]} ({row[1]}): confidence={conf:.2f}, connections={row[3]}")
         if len(lines) == 1:
             return "No significant knowledge gaps — all nodes have confidence >= 0.7."
         return "\n".join(lines)
 
     elif inference_type == "chains":
-        # Find transitive support chains up to max_depth hops
+        # Find transitive relation chains up to max_depth hops across all relation types
         cypher = (
-            f"MATCH (a:KnowledgeNode)-[:Supports*2..{max_depth}]->(b:KnowledgeNode) "
+            f"MATCH (a:KnowledgeNode)-[r*2..{max_depth}]->(b:KnowledgeNode) "
             "RETURN a.name AS chain_start, b.name AS chain_end "
             "LIMIT 20;"
         )
         try:
-            cols, rows = await run_with_lock(
-                info, lambda: info.engine.execute(cypher)
-            )
+            cols, rows = await run_with_lock(info, lambda: info.engine.execute(cypher))
         except Exception:
-            return "No support chains found (Supports table may not exist)."
+            return "No relation chains found."
         if not rows:
-            return "No transitive support chains found."
+            return "No transitive relation chains found."
         return format_result(cols, rows, mgr.max_rows, mgr.max_chars, "table")
 
     elif inference_type == "clusters":
@@ -1234,24 +1421,84 @@ async def graph_knowledge_infer(
             "ORDER BY edges DESC LIMIT 15;"
         )
         try:
-            cols, rows = await run_with_lock(
-                info, lambda: info.engine.execute(cypher)
-            )
+            cols, rows = await run_with_lock(info, lambda: info.engine.execute(cypher))
         except Exception:
             return "No knowledge clusters found."
         if not rows:
             return "No clusters — knowledge nodes are not interconnected."
         return format_result(cols, rows, mgr.max_rows, mgr.max_chars, "table")
 
+    elif inference_type == "convergence":
+        cypher = (
+            "MATCH (a:KnowledgeNode)-[r]->(b:KnowledgeNode) "
+            "WHERE r.domain IS NOT NULL AND r.domain <> '' "
+            "WITH b, count(DISTINCT r.domain) AS domains, "
+            "collect(DISTINCT r.domain) AS domain_list "
+            "WHERE domains >= 2 "
+            "RETURN b.name AS target, domains, domain_list "
+            "ORDER BY domains DESC LIMIT 20;"
+        )
+        try:
+            cols, rows = await run_with_lock(info, lambda: info.engine.execute(cypher))
+        except Exception:
+            return "No convergence found."
+        if not rows:
+            return "No convergence found."
+        return format_result(cols, rows, mgr.max_rows, mgr.max_chars, "table")
+
+    elif inference_type == "weak_links":
+        weak_rows: list[tuple] = []
+        for rel_table in stats["rel_tables"]:
+            cypher = (
+                f"MATCH (a:KnowledgeNode)-[r:{rel_table}]->(b:KnowledgeNode) "
+                "WHERE r.confidence_basis = 'assumed' OR r.confidence_basis = 'analogical' "
+                f"RETURN a.name AS from_node, b.name AS to_node, '{rel_table}' AS relation, "
+                "r.confidence_basis AS confidence_basis LIMIT 20;"
+            )
+            try:
+                _, rows = await run_with_lock(info, lambda c=cypher: info.engine.execute(c))
+                weak_rows.extend(rows)
+            except Exception:
+                continue
+        if not weak_rows:
+            return "No weak links found."
+        return format_result(
+            ["from_node", "to_node", "relation", "confidence_basis"],
+            weak_rows[:20],
+            mgr.max_rows,
+            mgr.max_chars,
+            "table",
+        )
+
+    elif inference_type == "prediction_conflicts":
+        cypher = (
+            "MATCH (a:KnowledgeNode)-[r1]->(target:KnowledgeNode)<-[r2]-(b:KnowledgeNode) "
+            "WHERE a.name <> b.name "
+            "AND (a.entity_type = 'question' OR a.entity_type = 'hypothesis') "
+            "AND (b.entity_type = 'question' OR b.entity_type = 'hypothesis') "
+            "AND type(r1) <> type(r2) "
+            "RETURN a.name AS hypothesis_a, type(r1) AS relation_a, "
+            "target.name AS target, b.name AS hypothesis_b, type(r2) AS relation_b "
+            "LIMIT 20;"
+        )
+        try:
+            cols, rows = await run_with_lock(info, lambda: info.engine.execute(cypher))
+        except Exception:
+            return "No prediction conflicts found."
+        if not rows:
+            return "No prediction conflicts found."
+        return format_result(cols, rows, mgr.max_rows, mgr.max_chars, "table")
+
     else:
         return (
             f"Unknown inference_type: '{inference_type}'. "
-            "Options: contradictions, gaps, chains, clusters"
+            "Options: contradictions, gaps, chains, clusters, convergence, "
+            "weak_links, prediction_conflicts"
         )
 
 
 @size_guarded
-async def graph_knowledge_summary(session_id: str) -> str:
+async def graph_knowledge_summary(session_id: str | None = None) -> str:
     """Get a comprehensive knowledge graph summary in one call.
 
     Returns: entity counts by type, relationship counts by type,
@@ -1294,10 +1541,18 @@ async def graph_knowledge_summary(session_id: str) -> str:
     # Relationship counts
     stats = await run_with_lock(info, info.engine.get_statistics)
     rel_tables = {
-        k: v for k, v in stats.get("rel_tables", {}).items()
-        if k not in ("ParticipatesIn", "Regulates", "CompensatesFor",
-                      "DrivesProcess", "CellExpresses", "PathwayInteracts",
-                      "ProducesPhenotype")
+        k: v
+        for k, v in stats.get("rel_tables", {}).items()
+        if k
+        not in (
+            "ParticipatesIn",
+            "Regulates",
+            "CompensatesFor",
+            "DrivesProcess",
+            "CellExpresses",
+            "PathwayInteracts",
+            "ProducesPhenotype",
+        )
     }
     if rel_tables:
         lines.append("\n### Relationships")
@@ -1340,10 +1595,7 @@ async def graph_knowledge_summary(session_id: str) -> str:
             lines.append("\n### Top Hubs")
             for row in rows:
                 conf = row[2] if row[2] is not None else 0
-                lines.append(
-                    f"  {row[0]} ({row[1]}): {row[3]} connections, "
-                    f"confidence={conf:.2f}"
-                )
+                lines.append(f"  {row[0]} ({row[1]}): {row[3]} connections, confidence={conf:.2f}")
     except Exception:
         pass
 

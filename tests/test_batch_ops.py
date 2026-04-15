@@ -64,16 +64,16 @@ class TestKnowledgeBatch:
         assert "Relations added: 2" in result
 
     @pytest.mark.anyio
-    async def test_invalid_entity_type_aborts_batch(self):
+    async def test_open_entity_type_is_accepted(self):
         sid = await _create_graph_session()
-        with pytest.raises(ValueError, match="invalid entity_type"):
-            await knowledge_batch(
-                session_id=sid,
-                nodes=[
-                    {"entity": "Good", "entity_type": "concept"},
-                    {"entity": "Bad", "entity_type": "INVALID_TYPE"},
-                ],
-            )
+        result = await knowledge_batch(
+            session_id=sid,
+            nodes=[
+                {"entity": "Good", "entity_type": "concept"},
+                {"entity": "Bad", "entity_type": "mechanism"},
+            ],
+        )
+        assert "Nodes added: 2" in result
 
     @pytest.mark.anyio
     async def test_hypothesis_entity_type_alias_maps_to_question(self):
@@ -96,19 +96,20 @@ class TestKnowledgeBatch:
             )
 
     @pytest.mark.anyio
-    async def test_invalid_relation_aborts(self):
+    async def test_open_relation_is_accepted(self):
         sid = await _create_graph_session()
-        with pytest.raises(ValueError, match="invalid relation"):
-            await knowledge_batch(
-                session_id=sid,
-                nodes=[{"entity": "A"}, {"entity": "B"}],
-                relations=[
-                    {
-                        "from_name": "A", "to_name": "B",
-                        "relation": "made_up_relation",
-                    },
-                ],
-            )
+        result = await knowledge_batch(
+            session_id=sid,
+            nodes=[{"entity": "A"}, {"entity": "B"}],
+            relations=[
+                {
+                    "from_name": "A",
+                    "to_name": "B",
+                    "relation": "amplifies",
+                },
+            ],
+        )
+        assert "Relations added: 1" in result
 
     @pytest.mark.anyio
     async def test_empty_batch_rejected(self):

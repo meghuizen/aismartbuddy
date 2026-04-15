@@ -1,0 +1,14 @@
+{
+  "rubric_id": "discovery_value",
+  "description": "Discovery value — novelty, cross-domain support, discriminability, and refutability.",
+  "dimensions": [
+    {"id": "novelty", "description": "How different this is from already-known explanations or designs", "weight": 0.25, "required": false},
+    {"id": "cross_domain_support", "description": "Evidence or structural support from two or more independent domains", "weight": 0.25, "required": false},
+    {"id": "discriminability", "description": "Makes predictions or consequences other alternatives do not", "weight": 0.25, "required": true},
+    {"id": "refutability", "description": "Can be falsified with specific observations, tests, or counterexamples", "weight": 0.25, "required": true}
+  ],
+  "severity_levels": ["critical", "high", "moderate", "low"],
+  "severity_deductions": {"critical": 3.0, "high": 2.0, "moderate": 1.0, "low": 0.5},
+  "pass_threshold": 7.0,
+  "scoring_strategy": "weighted_deduction"
+}
