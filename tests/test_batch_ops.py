@@ -6,6 +6,7 @@ import pytest
 
 from aismartbuddy.tools.graph import (
     graph_create_session,
+    graph_focus_summary,
     knowledge_batch,
 )
 from aismartbuddy.tools.score import score_evaluate, score_rubric
@@ -241,6 +242,9 @@ class TestUnifiedSession:
         )
         assert "Status: created" in holon_r
 
+        assert f"parent_session_id: {parent_id}" in result
+        assert "child_session_ids:" in result
+
     @pytest.mark.anyio
     async def test_missing_backend_raises_actionable_error(self):
         from aismartbuddy.tools.infra import session_create
@@ -267,5 +271,30 @@ class TestUnifiedSession:
             query="CREATE NODE TABLE T (id INT64 PRIMARY KEY);",
         )
         assert result is not None
+
+    @pytest.mark.anyio
+    async def test_graph_focus_summary_batches_multiple_neighbors(self):
+        sid = await _create_graph_session()
+        await knowledge_batch(
+            session_id=sid,
+            nodes=[
+                {"entity": "A"},
+                {"entity": "B"},
+                {"entity": "C"},
+            ],
+            relations=[
+                {"from_name": "A", "to_name": "B", "relation": "supports"},
+                {"from_name": "B", "to_name": "C", "relation": "supports"},
+            ],
+        )
+        result = await graph_focus_summary(
+            session_id=sid,
+            node_names=["A", "B"],
+            node_type="KnowledgeNode",
+            depth=1,
+        )
+        assert "## Graph Focus Summary" in result
+        assert "### A" in result
+        assert "### B" in result
 
 

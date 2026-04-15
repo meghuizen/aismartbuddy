@@ -71,11 +71,13 @@ async def session_create(
     return (
         f"Unified session created.\n"
         f"session_id: {parent.parent_id}\n"
+        f"parent_session_id: {parent.parent_id}\n"
         f"user_id: {parent.user_id} | project_id: {parent.project_id}\n"
         f"mode: {parent.mode} | enforcement: {parent.enforcement}"
         f" | max_node_chars: {parent.max_node_chars}\n"
         f"backends: {', '.join(parent.children.keys())}\n"
-        f"children: {children_str}"
+        f"children: {children_str}\n"
+        f"child_session_ids: {children_str}"
     )
 
 

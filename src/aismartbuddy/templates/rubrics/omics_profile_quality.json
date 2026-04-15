@@ -1,0 +1,15 @@
+{
+  "rubric_id": "omics_profile_quality",
+  "description": "Omics profile interpretation quality — measured signal, confounders, assay boundaries, and hypothesis discipline.",
+  "dimensions": [
+    {"id": "signal_extraction", "description": "Extracts the strongest measured signal before narrative synthesis", "weight": 1.0, "required": true},
+    {"id": "confounder_handling", "description": "Accounts for cell composition, timing, and preprocessing confounders", "weight": 1.0, "required": true},
+    {"id": "assay_boundaries", "description": "Respects what the assay can and cannot directly support", "weight": 1.0, "required": true},
+    {"id": "mechanistic_calibration", "description": "Separates measured findings from inferred mechanisms", "weight": 0.9, "required": false},
+    {"id": "falsifiability", "description": "Proposes concrete tests that would weaken the interpretation", "weight": 0.7, "required": false}
+  ],
+  "severity_levels": ["critical", "high", "moderate", "low"],
+  "severity_deductions": {"critical": 3.0, "high": 2.0, "moderate": 1.0, "low": 0.5},
+  "pass_threshold": 7.5,
+  "scoring_strategy": "weighted_deduction"
+}

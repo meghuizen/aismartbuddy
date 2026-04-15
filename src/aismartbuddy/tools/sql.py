@@ -158,6 +158,8 @@ async def sql_import(
 
     Supports multiple formats with automatic schema detection.
     For bulk imports, CSV is the most token-efficient format.
+    Use one of the supported general-purpose shapes so downstream tools can
+    profile and extract findings reliably before reasoning.
 
     Supported formats:
     - "csv" — Comma-separated values (default). Auto-detects headers and types.
@@ -169,6 +171,16 @@ async def sql_import(
 
     For custom delimiters (pipe, semicolon, etc.), use data_format="txt"
     with delimiter="|" or delimiter=";".
+
+    Reusable input shapes:
+    - entity-score table: `entity,score,direction,panel,source`
+    - differential table: `feature,log2fc,pvalue,padj`
+    - ranked list: `entity,rank,metric,source`
+    - wide matrix: `feature,sample_a,sample_b,...`
+
+    Preferred workflow:
+    `sql_import` → `data_profile` / `data_anomalies` →
+    `extract_findings_from_sql` → `think_model` / `think_science`
 
     Example: sql_import(session_id, "users", "name,age\\nAlice,30\\nBob,25")
 
@@ -214,6 +226,16 @@ async def sql_import_batch(
 
     Each chunk should include column headers (for CSV/TSV) or be a
     complete JSON array (for JSON). All chunks must have the same schema.
+
+    Reusable input shapes:
+    - entity-score table: `entity,score,direction,panel,source`
+    - differential table: `feature,log2fc,pvalue,padj`
+    - ranked list: `entity,rank,metric,source`
+    - wide matrix: `feature,sample_a,sample_b,...`
+
+    Preferred workflow:
+    `sql_import_batch` → `data_profile` / `data_anomalies` →
+    `extract_findings_from_sql` → `think_model` / `think_science`
 
     Example: sql_import_batch(session_id, "logs", [chunk1, chunk2, chunk3])
 

@@ -99,6 +99,12 @@ from aismartbuddy.config import (  # noqa: E402
     help="Long-form chars for holon context display (zoom_in children).",
 )
 @click.option(
+    "--expose-legacy-reasoning-tools/--hide-legacy-reasoning-tools",
+    default=False,
+    envvar="AISMARTBUDDY_EXPOSE_LEGACY_REASONING_TOOLS",
+    help="Expose the legacy V2 reasoning tool surface in the public MCP registry.",
+)
+@click.option(
     "--entra-tenant-id", type=str, default=None,
     envvar="AISMARTBUDDY_ENTRA_TENANT",
     help="Entra ID tenant ID. Set with --entra-audience to enable OAuth.",
@@ -135,6 +141,7 @@ def main(
     default_project_id: str,
     holon_truncate_chars: int,
     holon_truncate_long: int,
+    expose_legacy_reasoning_tools: bool,
     entra_tenant_id: str | None,
     entra_audience: str | None,
     entra_required_scope: str | None,
@@ -161,6 +168,7 @@ def main(
         default_project_id=default_project_id,
         holon_truncate_chars=holon_truncate_chars,
         holon_truncate_long=holon_truncate_long,
+        expose_legacy_reasoning_tools=expose_legacy_reasoning_tools,
         entra_tenant_id=entra_tenant_id,
         entra_audience=entra_audience,
         entra_required_scope=entra_required_scope,

@@ -17,6 +17,7 @@ from aismartbuddy.engines.thinking_engine import (
     ThoughtNode,
 )
 from aismartbuddy.session import SessionManager
+from aismartbuddy.tools.refs import think_refs_query
 from aismartbuddy.tools.think import (
     think_argue,
     think_debug,
@@ -28,8 +29,10 @@ from aismartbuddy.tools.think import (
     think_interfere_state,
     think_model,
     think_monitor,
+    think_rules,
     think_science,
     think_summarize,
+    think_validate,
 )
 
 # ── ThinkingEngine unit tests ────────────────────────────────
@@ -57,49 +60,42 @@ class TestThinkingEngine:
 
     def test_node_chain(self, engine: ThinkingEngine):
         engine.add_node(ThoughtNode(id="r1", tree_id="t1", content="Root"))
-        engine.add_node(ThoughtNode(
-            id="c1", tree_id="t1", content="Child", parent_id="r1", depth=1
-        ))
-        engine.add_node(ThoughtNode(
-            id="g1", tree_id="t1", content="Grand", parent_id="c1", depth=2
-        ))
+        engine.add_node(
+            ThoughtNode(id="c1", tree_id="t1", content="Child", parent_id="r1", depth=1)
+        )
+        engine.add_node(
+            ThoughtNode(id="g1", tree_id="t1", content="Grand", parent_id="c1", depth=2)
+        )
         assert engine.get_node_count() == 3
         assert "c1" in engine.get_node("r1").children
         assert "g1" in engine.get_node("c1").children
 
     def test_hierarchical_branching(self, engine: ThinkingEngine):
-        engine.add_node(ThoughtNode(
-            id="r1", tree_id="t1", content="Problem", action="branch"
-        ))
+        engine.add_node(ThoughtNode(id="r1", tree_id="t1", content="Problem", action="branch"))
         for i in range(3):
-            engine.add_node(ThoughtNode(
-                id=f"b{i}", tree_id="t1", content=f"Branch {i}",
-                parent_id="r1", depth=1,
-            ))
+            engine.add_node(
+                ThoughtNode(
+                    id=f"b{i}",
+                    tree_id="t1",
+                    content=f"Branch {i}",
+                    parent_id="r1",
+                    depth=1,
+                )
+            )
         assert len(engine.get_node("r1").children) == 3
 
     def test_get_subtree(self, engine: ThinkingEngine):
         engine.add_node(ThoughtNode(id="r", tree_id="t1", content="Root"))
-        engine.add_node(ThoughtNode(
-            id="a", tree_id="t1", content="A", parent_id="r", depth=1
-        ))
-        engine.add_node(ThoughtNode(
-            id="b", tree_id="t1", content="B", parent_id="r", depth=1
-        ))
-        engine.add_node(ThoughtNode(
-            id="a1", tree_id="t1", content="A1", parent_id="a", depth=2
-        ))
+        engine.add_node(ThoughtNode(id="a", tree_id="t1", content="A", parent_id="r", depth=1))
+        engine.add_node(ThoughtNode(id="b", tree_id="t1", content="B", parent_id="r", depth=1))
+        engine.add_node(ThoughtNode(id="a1", tree_id="t1", content="A1", parent_id="a", depth=2))
         assert len(engine.get_subtree_nodes("r")) == 4
         assert len(engine.get_subtree_nodes("a")) == 2
 
     def test_get_path_to_root(self, engine: ThinkingEngine):
         engine.add_node(ThoughtNode(id="r", tree_id="t1", content="Root"))
-        engine.add_node(ThoughtNode(
-            id="c", tree_id="t1", content="Child", parent_id="r", depth=1
-        ))
-        engine.add_node(ThoughtNode(
-            id="g", tree_id="t1", content="Grand", parent_id="c", depth=2
-        ))
+        engine.add_node(ThoughtNode(id="c", tree_id="t1", content="Child", parent_id="r", depth=1))
+        engine.add_node(ThoughtNode(id="g", tree_id="t1", content="Grand", parent_id="c", depth=2))
         path = engine.get_path_to_root("g")
         assert [n.id for n in path] == ["g", "c", "r"]
 
@@ -120,76 +116,59 @@ class TestThinkingEngine:
         n_trees = (MAX_NODES // nodes_per_tree) + 5
         for t in range(n_trees):
             tid = f"t{t}"
-            engine.add_node(ThoughtNode(
-                id=f"r{t}", tree_id=tid, content=f"Root {t}"
-            ))
+            engine.add_node(ThoughtNode(id=f"r{t}", tree_id=tid, content=f"Root {t}"))
             for n in range(1, nodes_per_tree):
-                engine.add_node(ThoughtNode(
-                    id=f"n{t}_{n}", tree_id=tid, content=f"Node {n}",
-                    parent_id=f"r{t}", depth=1,
-                ))
+                engine.add_node(
+                    ThoughtNode(
+                        id=f"n{t}_{n}",
+                        tree_id=tid,
+                        content=f"Node {n}",
+                        parent_id=f"r{t}",
+                        depth=1,
+                    )
+                )
         assert engine.get_node_count() <= MAX_NODES
 
     def test_memory_limit_trees(self, engine: ThinkingEngine):
         for t in range(MAX_TREES + 10):
-            engine.add_node(ThoughtNode(
-                id=f"r{t}", tree_id=f"t{t}", content=f"Root {t}"
-            ))
+            engine.add_node(ThoughtNode(id=f"r{t}", tree_id=f"t{t}", content=f"Root {t}"))
         assert len(engine.get_tree_ids()) <= MAX_TREES
 
     def test_add_model(self, engine: ThinkingEngine):
-        engine.add_model(ModelRecord(
-            model_name="first_principles", problem="test"
-        ))
+        engine.add_model(ModelRecord(model_name="first_principles", problem="test"))
         assert len(engine.models) == 1
 
     def test_upsert_decision(self, engine: ThinkingEngine):
         d = DecisionRecord(decision_id="d1", statement="Choose DB")
         engine.upsert_decision(d)
         assert engine.get_decision("d1") is not None
-        d2 = DecisionRecord(
-            decision_id="d1", statement="v2", stage="criteria"
-        )
+        d2 = DecisionRecord(decision_id="d1", statement="v2", stage="criteria")
         engine.upsert_decision(d2)
         assert engine.get_decision("d1").stage == "criteria"
 
     def test_add_debug(self, engine: ThinkingEngine):
-        engine.add_debug(DebugRecord(
-            approach_name="binary_search", issue="test issue"
-        ))
+        engine.add_debug(DebugRecord(approach_name="binary_search", issue="test issue"))
         assert len(engine.debugs) == 1
 
     def test_argumentation_chain(self, engine: ThinkingEngine):
-        engine.add_argument(
-            "chain1", ArgRecord(argument_id="a1", claim="Claim 1")
-        )
-        engine.add_argument(
-            "chain1", ArgRecord(argument_id="a2", claim="Counter 1")
-        )
+        engine.add_argument("chain1", ArgRecord(argument_id="a1", claim="Claim 1"))
+        engine.add_argument("chain1", ArgRecord(argument_id="a2", claim="Counter 1"))
         assert len(engine.get_arg_chain("chain1")) == 2
 
     def test_inquiry(self, engine: ThinkingEngine):
-        engine.upsert_inquiry(InquiryRecord(
-            inquiry_id="i1", stage="observation"
-        ))
+        engine.upsert_inquiry(InquiryRecord(inquiry_id="i1", stage="observation"))
         assert engine.get_inquiry("i1").stage == "observation"
 
     def test_monitor(self, engine: ThinkingEngine):
-        engine.upsert_monitor(MonitorRecord(
-            monitoring_id="m1", task="Test task"
-        ))
+        engine.upsert_monitor(MonitorRecord(monitoring_id="m1", task="Test task"))
         assert engine.get_monitor("m1").task == "Test task"
 
     def test_summary_empty(self, engine: ThinkingEngine):
         assert "Empty thinking session" in engine.get_summary()
 
     def test_summary_with_content(self, engine: ThinkingEngine):
-        engine.add_node(ThoughtNode(
-            id="r1", tree_id="t1", content="Test thought"
-        ))
-        engine.add_model(ModelRecord(
-            model_name="pareto_principle", problem="test"
-        ))
+        engine.add_node(ThoughtNode(id="r1", tree_id="t1", content="Test thought"))
+        engine.add_model(ModelRecord(model_name="pareto_principle", problem="test"))
         summary = engine.get_summary()
         assert "Thought Graphs" in summary
         assert "Mental Models" in summary
@@ -242,7 +221,7 @@ def _extract_field(result: str, prefix: str) -> str:
         for part in line.split(" | "):
             part = part.strip()
             if part.startswith(prefix):
-                return part[len(prefix):].strip()
+                return part[len(prefix) :].strip()
     return ""
 
 
@@ -260,15 +239,11 @@ class TestThoughtGraph:
         sid = _extract_field(r1, "Session:")
         nid1 = _extract_field(r1, "Node:")
 
-        r2 = await think_graph(
-            thought="Building on that...", parent_id=nid1, session_id=sid
-        )
+        r2 = await think_graph(thought="Building on that...", parent_id=nid1, session_id=sid)
         assert "Depth: 1" in r2
         nid2 = _extract_field(r2, "Node:")
 
-        r3 = await think_graph(
-            thought="Therefore...", parent_id=nid2, session_id=sid
-        )
+        r3 = await think_graph(thought="Therefore...", parent_id=nid2, session_id=sid)
         assert "Depth: 2" in r3
 
     @pytest.mark.anyio
@@ -285,12 +260,8 @@ class TestThoughtGraph:
         nid = _extract_field(r1, "Node:")
         assert "Action: branch" in r1
 
-        await think_graph(
-            thought="Branch A", parent_id=nid, session_id=sid
-        )
-        r3 = await think_graph(
-            thought="Branch B", parent_id=nid, session_id=sid
-        )
+        await think_graph(thought="Branch A", parent_id=nid, session_id=sid)
+        r3 = await think_graph(thought="Branch B", parent_id=nid, session_id=sid)
         assert "Siblings: 1" in r3  # Branch B has 1 sibling (Branch A)
 
     @pytest.mark.anyio
@@ -300,8 +271,10 @@ class TestThoughtGraph:
         nid = _extract_field(r1, "Node:")
 
         r2 = await think_graph(
-            thought="Revised insight", action="revise",
-            node_id=nid, session_id=sid,
+            thought="Revised insight",
+            action="revise",
+            node_id=nid,
+            session_id=sid,
         )
         assert "Action: revise" in r2
         assert "Revisions: 1" in r2
@@ -317,7 +290,9 @@ class TestThoughtGraph:
         await think_graph(thought="Part B", parent_id=branch_id, session_id=sid)
         r = await think_graph(
             thought="Combined conclusion",
-            action="synthesize", parent_id=branch_id, session_id=sid,
+            action="synthesize",
+            parent_id=branch_id,
+            session_id=sid,
         )
         assert "Action: synthesize" in r
 
@@ -360,9 +335,11 @@ class TestThoughtGraph:
 
         r2 = await think_graph(
             thought="Task B: Implement API (depends on design)",
-            session_id=sid, depends_on=[node_a],
+            session_id=sid,
+            depends_on=[node_a],
         )
         assert "Status: added" in r2
+
 
 @pytest.mark.usefixtures("_init_session_manager")
 class TestThoughtGraphDelegate:
@@ -372,14 +349,10 @@ class TestThoughtGraphDelegate:
         sid = _extract_field(r1, "Session:")
         root_id = _extract_field(r1, "Node:")
 
-        r2 = await think_graph(
-            thought="Delegatable subtask", parent_id=root_id, session_id=sid
-        )
+        r2 = await think_graph(thought="Delegatable subtask", parent_id=root_id, session_id=sid)
         child_id = _extract_field(r2, "Node:")
 
-        r = await think_graph_delegate(
-            session_id=sid, node_id=child_id, action="package"
-        )
+        r = await think_graph_delegate(session_id=sid, node_id=child_id, action="package")
         assert "Delegation: packaged" in r
         assert "Delegation Package" in r
         assert "Root problem" in r
@@ -391,11 +364,11 @@ class TestThoughtGraphDelegate:
         sid = _extract_field(r1, "Session:")
         nid = _extract_field(r1, "Node:")
 
-        await think_graph_delegate(
-            session_id=sid, node_id=nid, action="package"
-        )
+        await think_graph_delegate(session_id=sid, node_id=nid, action="package")
         r = await think_graph_delegate(
-            session_id=sid, node_id=nid, action="receive",
+            session_id=sid,
+            node_id=nid,
+            action="receive",
             result="Subagent found the answer: 42",
         )
         assert "Delegation: completed" in r
@@ -406,19 +379,13 @@ class TestThoughtGraphDelegate:
         sid = _extract_field(r1, "Session:")
         nid0 = _extract_field(r1, "Node:")
 
-        r2 = await think_graph(
-            thought="Level 1", parent_id=nid0, session_id=sid
-        )
+        r2 = await think_graph(thought="Level 1", parent_id=nid0, session_id=sid)
         nid1 = _extract_field(r2, "Node:")
 
-        r3 = await think_graph(
-            thought="Level 2", parent_id=nid1, session_id=sid
-        )
+        r3 = await think_graph(thought="Level 2", parent_id=nid1, session_id=sid)
         nid2 = _extract_field(r3, "Node:")
 
-        r = await think_graph_delegate(
-            session_id=sid, node_id=nid2, action="package"
-        )
+        r = await think_graph_delegate(session_id=sid, node_id=nid2, action="package")
         assert "Context depth: 3 nodes" in r
         assert "Level 0" in r
         assert "Level 1" in r
@@ -430,9 +397,7 @@ class TestThoughtGraphDelegate:
         sid = _extract_field(r1, "Session:")
 
         with pytest.raises(ValueError, match="not found"):
-            await think_graph_delegate(
-                session_id=sid, node_id="nonexistent", action="package"
-            )
+            await think_graph_delegate(session_id=sid, node_id="nonexistent", action="package")
 
 
 # ── Decision tool tests ──────────────────────────────────────
@@ -476,57 +441,67 @@ class TestThinkDecideTool:
     async def test_invalid_analysis_type(self):
         with pytest.raises(ValueError, match="Invalid analysis_type"):
             await think_decide(
-                decision_statement="test", options=[],
-                analysis_type="invalid", stage="options",
-                decision_id="x", iteration=0, next_stage_needed=False,
+                decision_statement="test",
+                options=[],
+                analysis_type="invalid",
+                stage="options",
+                decision_id="x",
+                iteration=0,
+                next_stage_needed=False,
             )
 
     # ── items[] strict batch form ────────────────────────────
 
     @pytest.mark.anyio
     async def test_items_batch(self):
-        r = await think_decide(items=[
-            {
-                "id": "d1",
-                "decision_statement": "Adopt new build tool?",
-                "options": [
-                    {"name": "keep", "description": "stay with maven"},
-                    {"name": "switch", "description": "move to bazel"},
-                ],
-                "criteria": [{"name": "speed", "weight": 0.7}],
-                "recommendation": "switch — bazel is 3x faster",
-            },
-        ])
+        r = await think_decide(
+            items=[
+                {
+                    "id": "d1",
+                    "decision_statement": "Adopt new build tool?",
+                    "options": [
+                        {"name": "keep", "description": "stay with maven"},
+                        {"name": "switch", "description": "move to bazel"},
+                    ],
+                    "criteria": [{"name": "speed", "weight": 0.7}],
+                    "recommendation": "switch — bazel is 3x faster",
+                },
+            ]
+        )
         assert "Decisions: 1" in r and "d1" in r
 
     @pytest.mark.anyio
     async def test_items_options_too_few_rejected(self):
         with pytest.raises(ValueError, match="at least 2 options"):
-            await think_decide(items=[
-                {
-                    "id": "x",
-                    "decision_statement": "test",
-                    "options": [{"name": "only", "description": "one"}],
-                    "criteria": [{"name": "c", "weight": 1.0}],
-                    "recommendation": "r",
-                },
-            ])
+            await think_decide(
+                items=[
+                    {
+                        "id": "x",
+                        "decision_statement": "test",
+                        "options": [{"name": "only", "description": "one"}],
+                        "criteria": [{"name": "c", "weight": 1.0}],
+                        "recommendation": "r",
+                    },
+                ]
+            )
 
     @pytest.mark.anyio
     async def test_items_criteria_missing_weight_rejected(self):
         with pytest.raises(ValueError, match="missing 'weight'"):
-            await think_decide(items=[
-                {
-                    "id": "x",
-                    "decision_statement": "test",
-                    "options": [
-                        {"name": "a", "description": "a"},
-                        {"name": "b", "description": "b"},
-                    ],
-                    "criteria": [{"name": "c"}],
-                    "recommendation": "r",
-                },
-            ])
+            await think_decide(
+                items=[
+                    {
+                        "id": "x",
+                        "decision_statement": "test",
+                        "options": [
+                            {"name": "a", "description": "a"},
+                            {"name": "b", "description": "b"},
+                        ],
+                        "criteria": [{"name": "c"}],
+                        "recommendation": "r",
+                    },
+                ]
+            )
 
 
 @pytest.mark.usefixtures("_init_session_manager")
@@ -545,7 +520,8 @@ class TestThinkModelTool:
     @pytest.mark.anyio
     async def test_first_principles_guidance(self):
         result = await think_model(
-            model_name="first_principles", problem="Why is the build slow?",
+            model_name="first_principles",
+            problem="Why is the build slow?",
         )
         assert "First Principles Thinking" in result
         assert "framework loaded" in result
@@ -593,7 +569,6 @@ class TestThinkModelTool:
         assert "Strengths" in result
         assert "Threats" in result
 
-
     @pytest.mark.anyio
     async def test_pre_mortem_guidance(self):
         result = await think_model(
@@ -636,8 +611,10 @@ class TestThinkModelTool:
     async def test_items_batch_three(self):
         items = [
             {
-                "id": f"p{i}", "problem": f"sub-problem {i}",
-                "steps": [f"step {i}.1"], "reasoning": "because",
+                "id": f"p{i}",
+                "problem": f"sub-problem {i}",
+                "steps": [f"step {i}.1"],
+                "reasoning": "because",
                 "conclusion": f"therefore {i}",
             }
             for i in range(3)
@@ -652,10 +629,14 @@ class TestThinkModelTool:
         with pytest.raises(ValueError, match="missing required 'reasoning'"):
             await think_model(
                 model_name="first_principles",
-                items=[{
-                    "id": "x", "problem": "p", "steps": ["s"],
-                    "conclusion": "c",
-                }],
+                items=[
+                    {
+                        "id": "x",
+                        "problem": "p",
+                        "steps": ["s"],
+                        "conclusion": "c",
+                    }
+                ],
             )
 
     @pytest.mark.anyio
@@ -663,10 +644,15 @@ class TestThinkModelTool:
         with pytest.raises(ValueError, match="missing required 'steps'"):
             await think_model(
                 model_name="first_principles",
-                items=[{
-                    "id": "x", "problem": "p", "steps": [],
-                    "reasoning": "r", "conclusion": "c",
-                }],
+                items=[
+                    {
+                        "id": "x",
+                        "problem": "p",
+                        "steps": [],
+                        "reasoning": "r",
+                        "conclusion": "c",
+                    }
+                ],
             )
 
     @pytest.mark.anyio
@@ -676,12 +662,18 @@ class TestThinkModelTool:
                 model_name="first_principles",
                 items=[
                     {
-                        "id": "dup", "problem": "p1", "steps": ["s"],
-                        "reasoning": "r", "conclusion": "c",
+                        "id": "dup",
+                        "problem": "p1",
+                        "steps": ["s"],
+                        "reasoning": "r",
+                        "conclusion": "c",
                     },
                     {
-                        "id": "dup", "problem": "p2", "steps": ["s"],
-                        "reasoning": "r", "conclusion": "c",
+                        "id": "dup",
+                        "problem": "p2",
+                        "steps": ["s"],
+                        "reasoning": "r",
+                        "conclusion": "c",
                     },
                 ],
             )
@@ -691,10 +683,15 @@ class TestThinkModelTool:
         with pytest.raises(ValueError, match="explicit unified session_id"):
             await think_model(
                 model_name="first_principles",
-                items=[{
-                    "id": "x", "problem": "p", "steps": ["s"],
-                    "reasoning": "r", "conclusion": "c",
-                }],
+                items=[
+                    {
+                        "id": "x",
+                        "problem": "p",
+                        "steps": ["s"],
+                        "reasoning": "r",
+                        "conclusion": "c",
+                    }
+                ],
                 auto_graph=True,
             )
 
@@ -707,7 +704,7 @@ class TestThinkModelTool:
         for line in r1.split("\n"):
             line = line.strip()
             if line.startswith("session_id:"):
-                sid = line[len("session_id:"):].strip()
+                sid = line[len("session_id:") :].strip()
                 break
         assert sid
 
@@ -717,12 +714,18 @@ class TestThinkModelTool:
             auto_graph=True,
             items=[
                 {
-                    "id": "concept_a", "problem": "P A", "steps": ["s1"],
-                    "reasoning": "because", "conclusion": "therefore A",
+                    "id": "concept_a",
+                    "problem": "P A",
+                    "steps": ["s1"],
+                    "reasoning": "because",
+                    "conclusion": "therefore A",
                 },
                 {
-                    "id": "concept_b", "problem": "P B", "steps": ["s1"],
-                    "reasoning": "because", "conclusion": "therefore B",
+                    "id": "concept_b",
+                    "problem": "P B",
+                    "steps": ["s1"],
+                    "reasoning": "because",
+                    "conclusion": "therefore B",
                     "connects_to": ["concept_a"],
                 },
             ],
@@ -736,8 +739,10 @@ class TestThinkDebugTool:
     @pytest.mark.anyio
     async def test_debug_approach(self):
         result = await think_debug(
-            approach_name="binary_search", issue="Performance regression",
-            steps=["Bisect commits"], resolution="Found commit X.",
+            approach_name="binary_search",
+            issue="Performance regression",
+            steps=["Bisect commits"],
+            resolution="Found commit X.",
         )
         assert "Approach: binary_search" in result
 
@@ -750,27 +755,35 @@ class TestThinkDebugTool:
 
     @pytest.mark.anyio
     async def test_items_batch(self):
-        r = await think_debug(items=[
-            {
-                "id": "bug1", "approach": "binary_search",
-                "issue": "auth fails on token refresh",
-                "steps": ["bisect commits"],
-                "findings": "regression in commit abc",
-                "resolution": "revert abc, retry",
-            },
-        ])
+        r = await think_debug(
+            items=[
+                {
+                    "id": "bug1",
+                    "approach": "binary_search",
+                    "issue": "auth fails on token refresh",
+                    "steps": ["bisect commits"],
+                    "findings": "regression in commit abc",
+                    "resolution": "revert abc, retry",
+                },
+            ]
+        )
         assert "Debugs: 1" in r and "bug1" in r
 
     @pytest.mark.anyio
     async def test_items_invalid_approach_rejected(self):
         with pytest.raises(ValueError, match="invalid"):
-            await think_debug(items=[
-                {
-                    "id": "x", "approach": "magic",
-                    "issue": "i", "steps": ["s"],
-                    "findings": "f", "resolution": "r",
-                },
-            ])
+            await think_debug(
+                items=[
+                    {
+                        "id": "x",
+                        "approach": "magic",
+                        "issue": "i",
+                        "steps": ["s"],
+                        "findings": "f",
+                        "resolution": "r",
+                    },
+                ]
+            )
 
 
 @pytest.mark.usefixtures("_init_session_manager")
@@ -778,9 +791,12 @@ class TestThinkArgueTool:
     @pytest.mark.anyio
     async def test_argumentation_chain(self):
         result = await think_argue(
-            claim="DuckDB is better", premises=["Column-oriented"],
-            conclusion="Choose DuckDB.", argument_type="thesis",
-            confidence=0.8, next_argument_needed=True,
+            claim="DuckDB is better",
+            premises=["Column-oriented"],
+            conclusion="Choose DuckDB.",
+            argument_type="thesis",
+            confidence=0.8,
+            next_argument_needed=True,
         )
         assert "Type: thesis" in result
 
@@ -788,8 +804,11 @@ class TestThinkArgueTool:
     async def test_invalid_argument_type(self):
         with pytest.raises(ValueError, match="Invalid argument_type"):
             await think_argue(
-                claim="test", premises=[], conclusion="",
-                argument_type="invalid", confidence=0.5,
+                claim="test",
+                premises=[],
+                conclusion="",
+                argument_type="invalid",
+                confidence=0.5,
                 next_argument_needed=False,
             )
 
@@ -820,8 +839,10 @@ class TestThinkScienceTool:
     @pytest.mark.anyio
     async def test_scientific_inquiry(self):
         result = await think_science(
-            stage="hypothesis", inquiry_id="perf-test",
-            iteration=1, next_stage_needed=True,
+            stage="hypothesis",
+            inquiry_id="perf-test",
+            iteration=1,
+            next_stage_needed=True,
             hypothesis={"statement": "Index will fix it", "variables": []},
         )
         assert "Inquiry: perf-test" in result
@@ -864,9 +885,12 @@ class TestThinkMonitorTool:
     @pytest.mark.anyio
     async def test_metacognitive_monitoring(self):
         result = await think_monitor(
-            task="Code review", stage="knowledge-assessment",
-            overall_confidence=0.7, monitoring_id="rm",
-            iteration=1, next_assessment_needed=True,
+            task="Code review",
+            stage="knowledge-assessment",
+            overall_confidence=0.7,
+            monitoring_id="rm",
+            iteration=1,
+            next_assessment_needed=True,
             uncertainty_areas=["Coverage", "Edge cases"],
         )
         assert "Confidence: 0.70" in result
@@ -875,9 +899,12 @@ class TestThinkMonitorTool:
     @pytest.mark.anyio
     async def test_knowledge_assessment(self):
         result = await think_monitor(
-            task="Evaluate Python", stage="knowledge-assessment",
-            overall_confidence=0.85, monitoring_id="ka-1",
-            iteration=1, next_assessment_needed=False,
+            task="Evaluate Python",
+            stage="knowledge-assessment",
+            overall_confidence=0.85,
+            monitoring_id="ka-1",
+            iteration=1,
+            next_assessment_needed=False,
             knowledge_assessment={
                 "domain": "Python async",
                 "knowledgeLevel": "proficient",
@@ -892,11 +919,15 @@ class TestThinkMonitorTool:
     async def test_invalid_knowledge_level(self):
         with pytest.raises(ValueError, match="Invalid knowledgeLevel"):
             await think_monitor(
-                task="t", stage="knowledge-assessment",
-                overall_confidence=0.5, monitoring_id="x",
-                iteration=0, next_assessment_needed=False,
+                task="t",
+                stage="knowledge-assessment",
+                overall_confidence=0.5,
+                monitoring_id="x",
+                iteration=0,
+                next_assessment_needed=False,
                 knowledge_assessment={
-                    "domain": "t", "knowledgeLevel": "god-tier",
+                    "domain": "t",
+                    "knowledgeLevel": "god-tier",
                 },
             )
 
@@ -914,23 +945,30 @@ class TestThinkMonitorTool:
     GOOD_CLAIMS = [
         {
             "claim": "rRNA is the most abundant RNA",
-            "status": "fact", "confidence": 0.95, "evidence": "textbook",
+            "status": "fact",
+            "confidence": 0.95,
+            "evidence": "textbook",
         },
         {
             "claim": "X causes Y",
-            "status": "speculation", "confidence": 0.4,
+            "status": "speculation",
+            "confidence": 0.4,
             "evidence": "weak correlation",
         },
     ]
 
     @pytest.mark.anyio
     async def test_items_basic(self):
-        r = await think_monitor(items=[
-            {
-                "id": "a1", "task": "Analyze RNA pathways",
-                "knowledge": self.GOOD_K, "claims": self.GOOD_CLAIMS,
-            },
-        ])
+        r = await think_monitor(
+            items=[
+                {
+                    "id": "a1",
+                    "task": "Analyze RNA pathways",
+                    "knowledge": self.GOOD_K,
+                    "claims": self.GOOD_CLAIMS,
+                },
+            ]
+        )
         assert "Assessments: 1" in r
         assert "a1" in r
 
@@ -938,37 +976,48 @@ class TestThinkMonitorTool:
     async def test_items_empty_limitations_rejected(self):
         bad_k = {**self.GOOD_K, "limitations": []}
         with pytest.raises(ValueError, match="non-empty"):
-            await think_monitor(items=[
-                {
-                    "id": "x", "task": "t",
-                    "knowledge": bad_k, "claims": self.GOOD_CLAIMS,
-                },
-            ])
+            await think_monitor(
+                items=[
+                    {
+                        "id": "x",
+                        "task": "t",
+                        "knowledge": bad_k,
+                        "claims": self.GOOD_CLAIMS,
+                    },
+                ]
+            )
 
     @pytest.mark.anyio
     async def test_items_invalid_level_rejected(self):
         bad_k = {**self.GOOD_K, "level": "wizard"}
         with pytest.raises(ValueError, match="level must be one of"):
-            await think_monitor(items=[
-                {
-                    "id": "x", "task": "t",
-                    "knowledge": bad_k, "claims": self.GOOD_CLAIMS,
-                },
-            ])
+            await think_monitor(
+                items=[
+                    {
+                        "id": "x",
+                        "task": "t",
+                        "knowledge": bad_k,
+                        "claims": self.GOOD_CLAIMS,
+                    },
+                ]
+            )
 
     @pytest.mark.anyio
     async def test_items_invalid_claim_status_rejected(self):
         bad_claims = [
-            {"claim": "c", "status": "guess", "confidence": 0.5,
-             "evidence": "e"},
+            {"claim": "c", "status": "guess", "confidence": 0.5, "evidence": "e"},
         ]
         with pytest.raises(ValueError, match="status must be one of"):
-            await think_monitor(items=[
-                {
-                    "id": "x", "task": "t",
-                    "knowledge": self.GOOD_K, "claims": bad_claims,
-                },
-            ])
+            await think_monitor(
+                items=[
+                    {
+                        "id": "x",
+                        "task": "t",
+                        "knowledge": self.GOOD_K,
+                        "claims": bad_claims,
+                    },
+                ]
+            )
 
 
 @pytest.mark.usefixtures("_init_session_manager")
@@ -988,10 +1037,8 @@ class TestThinkGraphBatch:
         )
         assert "Batch: 3 children created" in r
         # All three children IDs returned
-        children_line = next(
-            (ln for ln in r.split("\n") if ln.startswith("Children: ")), ""
-        )
-        cids = [c.strip() for c in children_line[len("Children: "):].split(",")]
+        children_line = next((ln for ln in r.split("\n") if ln.startswith("Children: ")), "")
+        cids = [c.strip() for c in children_line[len("Children: ") :].split(",")]
         assert len(cids) == 3
         # Each ID is a 10-char hex
         for cid in cids:
@@ -1017,10 +1064,14 @@ class TestThinkGraphBatch:
         parent_id = _extract_field(r, "Node:")
         # Add only 2 children
         await think_graph(
-            thought="child A", parent_id=parent_id, session_id=sid,
+            thought="child A",
+            parent_id=parent_id,
+            session_id=sid,
         )
         await think_graph(
-            thought="child B", parent_id=parent_id, session_id=sid,
+            thought="child B",
+            parent_id=parent_id,
+            session_id=sid,
         )
         # Synthesize — should warn about 2 != 4
         synth = await think_graph(
@@ -1079,8 +1130,11 @@ class TestThinkArgueChain:
             await think_argue(
                 chain=[
                     {
-                        "type": "thesis", "claim": "c", "premises": ["p"],
-                        "conclusion": "x", "responds_to_index": 5,
+                        "type": "thesis",
+                        "claim": "c",
+                        "premises": ["p"],
+                        "conclusion": "x",
+                        "responds_to_index": 5,
                     },
                 ],
             )
@@ -1093,7 +1147,8 @@ class TestThinkArgueChain:
             await think_argue(
                 chain=[
                     {
-                        "type": "thesis", "claim": "c",
+                        "type": "thesis",
+                        "claim": "c",
                         "conclusion": "x",
                     },
                 ],
@@ -1110,9 +1165,7 @@ class TestThinkSummarizeTool:
         assert "Thought Graphs" in summary
 
     @pytest.mark.anyio
-    async def test_summarize_wrong_session_type(
-        self, session_manager: SessionManager
-    ):
+    async def test_summarize_wrong_session_type(self, session_manager: SessionManager):
         info = session_manager.create_session("sql")
         with pytest.raises(ValueError, match="not think"):
             await think_summarize(info.session_id)
@@ -1127,18 +1180,16 @@ class TestThinkSummarizeTool:
         # Create 25 more branch trees so we exceed the cap of 5
         for i in range(1, 26):
             await think_graph(
-                thought=f"Tree {i}", action="branch", session_id=sid,
+                thought=f"Tree {i}",
+                action="branch",
+                session_id=sid,
             )
         summary = await think_summarize(sid, max_items_per_category=5)
         assert "Thought Graphs" in summary
         # Count lines inside Thought Graphs section beginning with "- "
         sections = summary.split("\n\n")
-        graphs_section = next(
-            (s for s in sections if "Thought Graphs" in s), ""
-        )
-        item_lines = [
-            ln for ln in graphs_section.split("\n") if ln.startswith("- ")
-        ]
+        graphs_section = next((s for s in sections if "Thought Graphs" in s), "")
+        item_lines = [ln for ln in graphs_section.split("\n") if ln.startswith("- ")]
         # 5 shown + 1 "... (N more)" footer = 6 total
         assert len(item_lines) <= 6, item_lines
         assert any("more)" in ln for ln in item_lines)
@@ -1154,9 +1205,7 @@ class TestThinkDestroyTool:
         assert "Destroyed" in result
 
     @pytest.mark.anyio
-    async def test_destroy_wrong_session_type(
-        self, session_manager: SessionManager
-    ):
+    async def test_destroy_wrong_session_type(self, session_manager: SessionManager):
         info = session_manager.create_session("sql")
         with pytest.raises(ValueError, match="not think"):
             await think_destroy_session(info.session_id)
@@ -1189,47 +1238,65 @@ class TestInterferenceProtocol:
         pid = _extract_field(r, "Protocol:")
 
         await think_interfere(
-            action="add_frame", session_id=sid, protocol_id=pid,
+            action="add_frame",
+            session_id=sid,
+            protocol_id=pid,
             frame="Data is passive; queries are active",
         )
 
         for dom, law_, iso in [
-            ("Holography", "Every fragment encodes the whole",
-             "Both have local parts with global info"),
-            ("Immunology", "Identity without central controller",
-             "Both maintain coherence without coordination"),
-            ("Holarchy", "Every level is whole and part",
-             "Both have recursive self-similar structure"),
+            (
+                "Holography",
+                "Every fragment encodes the whole",
+                "Both have local parts with global info",
+            ),
+            (
+                "Immunology",
+                "Identity without central controller",
+                "Both maintain coherence without coordination",
+            ),
+            (
+                "Holarchy",
+                "Every level is whole and part",
+                "Both have recursive self-similar structure",
+            ),
         ]:
             r = await think_interfere(
-                action="add_source", session_id=sid, protocol_id=pid,
-                source_domain=dom, law=law_, isomorphism=iso,
+                action="add_source",
+                session_id=sid,
+                protocol_id=pid,
+                source_domain=dom,
+                law=law_,
+                isomorphism=iso,
             )
         assert "Sources: 3" in r
 
         for i in range(5):
             r = await think_interfere(
-                action="add_fragment", session_id=sid, protocol_id=pid,
+                action="add_fragment",
+                session_id=sid,
+                protocol_id=pid,
                 fragment=f"Fragment {i}: It would have to...",
             )
         assert "Phase: saturated" in r
 
         r = await think_interfere(
-            action="crystallize", session_id=sid, protocol_id=pid,
+            action="crystallize",
+            session_id=sid,
+            protocol_id=pid,
             name="Holographic Compute Substrate",
             properties=[
-                {"text": "Node is data+query+processor",
-                 "novel": True, "source_laws": [0, 2]},
-                {"text": "Consistency from resonance",
-                 "novel": True, "source_laws": [0, 1]},
-                {"text": "No observer boundary",
-                 "novel": True, "source_laws": [1, 2]},
+                {"text": "Node is data+query+processor", "novel": True, "source_laws": [0, 2]},
+                {"text": "Consistency from resonance", "novel": True, "source_laws": [0, 1]},
+                {"text": "No observer boundary", "novel": True, "source_laws": [1, 2]},
             ],
         )
         assert "Phase: crystallized" in r
 
         r = await think_interfere(
-            action="add_necessity", session_id=sid, protocol_id=pid,
+            action="add_necessity",
+            session_id=sid,
+            protocol_id=pid,
             conclusion="Local stateless computation",
             prerequisites=[
                 {"claim": "Prereq 1", "status": "untested"},
@@ -1239,20 +1306,26 @@ class TestInterferenceProtocol:
         assert "Phase: necessities_derived" in r
 
         r = await think_interfere(
-            action="stress_test", session_id=sid, protocol_id=pid,
+            action="stress_test",
+            session_id=sid,
+            protocol_id=pid,
             audit_type="first_principles",
             audit_result="No violations found.",
         )
         assert "Audits: 1/4" in r
 
         r = await think_interfere(
-            action="finalize", session_id=sid, protocol_id=pid,
+            action="finalize",
+            session_id=sid,
+            protocol_id=pid,
             verdict="survives",
         )
         assert "Phase: stress_tested" in r
 
         r = await think_interfere(
-            action="recurse", session_id=sid, protocol_id=pid,
+            action="recurse",
+            session_id=sid,
+            protocol_id=pid,
             new_domain="distributed consensus",
             concept_as_law="Nodes store+query+compute without coordination",
         )
@@ -1260,40 +1333,50 @@ class TestInterferenceProtocol:
 
     @pytest.mark.anyio
     async def test_reject_fragment_before_2_sources(self):
-        r = await think_interfere(
-            action="set_domain", target_domain="test"
-        )
+        r = await think_interfere(action="set_domain", target_domain="test")
         sid = _extract_field(r, "Session:")
         pid = _extract_field(r, "Protocol:")
         await think_interfere(
-            action="add_source", session_id=sid, protocol_id=pid,
-            source_domain="A", law="law A", isomorphism="iso A",
+            action="add_source",
+            session_id=sid,
+            protocol_id=pid,
+            source_domain="A",
+            law="law A",
+            isomorphism="iso A",
         )
         r = await think_interfere(
-            action="add_fragment", session_id=sid, protocol_id=pid,
+            action="add_fragment",
+            session_id=sid,
+            protocol_id=pid,
             fragment="test",
         )
         assert "REJECTED" in r
 
     @pytest.mark.anyio
     async def test_reject_mashup_not_emergence(self):
-        r = await think_interfere(
-            action="set_domain", target_domain="test"
-        )
+        r = await think_interfere(action="set_domain", target_domain="test")
         sid = _extract_field(r, "Session:")
         pid = _extract_field(r, "Protocol:")
         for d in ["A", "B"]:
             await think_interfere(
-                action="add_source", session_id=sid, protocol_id=pid,
-                source_domain=d, law=f"{d} law", isomorphism=f"iso {d}",
+                action="add_source",
+                session_id=sid,
+                protocol_id=pid,
+                source_domain=d,
+                law=f"{d} law",
+                isomorphism=f"iso {d}",
             )
         for i in range(5):
             await think_interfere(
-                action="add_fragment", session_id=sid, protocol_id=pid,
+                action="add_fragment",
+                session_id=sid,
+                protocol_id=pid,
                 fragment=f"Fragment {i}",
             )
         r = await think_interfere(
-            action="crystallize", session_id=sid, protocol_id=pid,
+            action="crystallize",
+            session_id=sid,
+            protocol_id=pid,
             name="Mashup",
             properties=[
                 {"text": "P1", "novel": True, "source_laws": [0]},
@@ -1309,23 +1392,29 @@ class TestInterferenceProtocol:
 
     @pytest.mark.anyio
     async def test_necessity_chain_broken(self):
-        r = await think_interfere(
-            action="set_domain", target_domain="test"
-        )
+        r = await think_interfere(action="set_domain", target_domain="test")
         sid = _extract_field(r, "Session:")
         pid = _extract_field(r, "Protocol:")
         for d in ["A", "B"]:
             await think_interfere(
-                action="add_source", session_id=sid, protocol_id=pid,
-                source_domain=d, law=f"{d} law", isomorphism=f"iso {d}",
+                action="add_source",
+                session_id=sid,
+                protocol_id=pid,
+                source_domain=d,
+                law=f"{d} law",
+                isomorphism=f"iso {d}",
             )
         for i in range(5):
             await think_interfere(
-                action="add_fragment", session_id=sid, protocol_id=pid,
+                action="add_fragment",
+                session_id=sid,
+                protocol_id=pid,
                 fragment=f"Fragment {i}",
             )
         await think_interfere(
-            action="crystallize", session_id=sid, protocol_id=pid,
+            action="crystallize",
+            session_id=sid,
+            protocol_id=pid,
             name="Concept",
             properties=[
                 {"text": "P1", "novel": True, "source_laws": [0, 1]},
@@ -1333,7 +1422,9 @@ class TestInterferenceProtocol:
             ],
         )
         await think_interfere(
-            action="add_necessity", session_id=sid, protocol_id=pid,
+            action="add_necessity",
+            session_id=sid,
+            protocol_id=pid,
             conclusion="Test",
             prerequisites=[
                 {"claim": "A", "status": "untested"},
@@ -1341,25 +1432,37 @@ class TestInterferenceProtocol:
             ],
         )
         await think_interfere(
-            action="update_necessity", session_id=sid, protocol_id=pid,
-            chain_index=0, prereq_index=0, new_status="fails",
+            action="update_necessity",
+            session_id=sid,
+            protocol_id=pid,
+            chain_index=0,
+            prereq_index=0,
+            new_status="fails",
         )
         r = await think_interfere(
-            action="update_necessity", session_id=sid, protocol_id=pid,
-            chain_index=0, prereq_index=1, new_status="fails",
+            action="update_necessity",
+            session_id=sid,
+            protocol_id=pid,
+            chain_index=0,
+            prereq_index=1,
+            new_status="fails",
         )
         assert "CHAIN BROKEN" in r
 
     @pytest.mark.anyio
     async def test_state_query(self):
         r = await think_interfere(
-            action="set_domain", target_domain="test domain",
+            action="set_domain",
+            target_domain="test domain",
         )
         sid = _extract_field(r, "Session:")
         pid = _extract_field(r, "Protocol:")
         await think_interfere(
-            action="add_source", session_id=sid, protocol_id=pid,
-            source_domain="Physics", law="E=mc2",
+            action="add_source",
+            session_id=sid,
+            protocol_id=pid,
+            source_domain="Physics",
+            law="E=mc2",
             isomorphism="Both are energy systems",
         )
         state = await think_interfere_state(session_id=sid, protocol_id=pid)
@@ -1369,18 +1472,22 @@ class TestInterferenceProtocol:
     @pytest.mark.anyio
     async def test_multi_protocol_isolation(self):
         r1 = await think_interfere(
-            action="set_domain", target_domain="domain A",
+            action="set_domain",
+            target_domain="domain A",
         )
         sid = _extract_field(r1, "Session:")
         pid1 = _extract_field(r1, "Protocol:")
         r2 = await think_interfere(
-            action="set_domain", target_domain="domain B",
+            action="set_domain",
+            target_domain="domain B",
             session_id=sid,
         )
         pid2 = _extract_field(r2, "Protocol:")
         assert pid1 != pid2
         await think_interfere(
-            action="add_frame", session_id=sid, protocol_id=pid1,
+            action="add_frame",
+            session_id=sid,
+            protocol_id=pid1,
             frame="Frame for A only",
         )
         state2 = await think_interfere_state(session_id=sid, protocol_id=pid2)
@@ -1393,7 +1500,8 @@ class TestThinkGraphMinChildren:
     async def test_below_min_children_rejected(self):
         with pytest.raises(ValueError, match="min_children=5"):
             await think_graph(
-                thought="root", action="branch",
+                thought="root",
+                action="branch",
                 children=[{"thought": "c1"}, {"thought": "c2"}],
                 min_children=5,
             )
@@ -1401,7 +1509,8 @@ class TestThinkGraphMinChildren:
     @pytest.mark.anyio
     async def test_at_min_children_succeeds(self):
         r = await think_graph(
-            thought="root", action="branch",
+            thought="root",
+            action="branch",
             children=[{"thought": f"c{i}"} for i in range(5)],
             min_children=5,
         )
@@ -1423,11 +1532,227 @@ class TestThinkRefsQuery:
         from aismartbuddy.tools.refs import think_refs_query
 
         r1 = await think_graph(
-            thought="leaf", refs=["scaffold_item_42"],
+            thought="leaf",
+            refs=["scaffold_item_42"],
         )
         sid = _extract_field(r1, "Session:")
         r = await think_refs_query(
-            entity_id="scaffold_item_42", session_id=sid,
+            entity_id="scaffold_item_42",
+            session_id=sid,
         )
         assert "Total refs: 1" in r
         assert "thought_nodes" in r
+
+
+@pytest.mark.usefixtures("_init_session_manager")
+class TestRuleRegistryAndValidation:
+    @pytest.mark.anyio
+    async def test_rule_profile_lifecycle_and_validation(self):
+        created = await think_rules(
+            action="create_profile",
+            profile_id="security-rules",
+            name="Security Rules",
+            description="High-priority security constraints",
+        )
+        sid = _extract_field(created, "Session:")
+        assert "Status: created" in created
+
+        added = await think_rules(
+            action="add_rules_batch",
+            session_id=sid,
+            profile_id="security-rules",
+            rules=[
+                {
+                    "id": "encrypt-data",
+                    "text": "Encryption at rest is required",
+                    "weight": 5.0,
+                    "kind": "hard",
+                    "conflicts_with": ["debug-logging"],
+                },
+                {
+                    "id": "debug-logging",
+                    "text": "Verbose plaintext debug logging is required",
+                    "weight": 1.0,
+                    "kind": "soft",
+                    "conflicts_with": ["encrypt-data"],
+                },
+            ],
+        )
+        assert "Rules added: 2" in added
+
+        updated = await think_rules(
+            action="update_weights_batch",
+            session_id=sid,
+            profile_id="security-rules",
+            updates=[{"rule_id": "debug-logging", "weight": 2.5}],
+        )
+        assert "Weights updated: 1" in updated
+
+        shown = await think_rules(
+            action="show_profile",
+            session_id=sid,
+            profile_id="security-rules",
+        )
+        assert "debug-logging: [soft] w=2.5" in shown
+
+        scaffold = await think_model(
+            session_id=sid,
+            model_name="design_review",
+            items=[
+                {
+                    "id": "plan_a",
+                    "problem": "Design an auth subsystem",
+                    "steps": ["define trust boundaries"],
+                    "reasoning": "Need security review coverage.",
+                    "conclusion": "Proceed with explicit security controls.",
+                }
+            ],
+            rule_profile_ids=["security-rules"],
+        )
+        assert "plan_a" in scaffold
+
+        validation = await think_validate(
+            session_id=sid,
+            subject_id="plan_a",
+            subject_kind="model",
+            assessments=[
+                {
+                    "rule_id": "encrypt-data",
+                    "status": "violates",
+                    "note": "Storage layer still plaintext",
+                },
+                {
+                    "rule_id": "debug-logging",
+                    "status": "uncertain",
+                    "note": "Logging mode not fully decided yet",
+                },
+            ],
+            use_bound_profiles=True,
+        )
+        assert "Hard gates: FAIL" in validation
+        assert "Conflicts: conflict-" in validation
+        assert "Nuance:" in validation
+
+        refs = await think_refs_query(entity_id="security-rules", session_id=sid)
+        assert "models" in refs
+        assert "rule_profiles" in refs
+        assert "validations" in refs
+
+        summary = await think_summarize(sid)
+        assert "Rule Validation" in summary
+        assert "security-rules" in summary
+
+    @pytest.mark.anyio
+    async def test_pinned_snapshot_stays_stable_after_weight_changes(self):
+        created = await think_rules(
+            action="create_profile",
+            profile_id="design-rules",
+            name="Design Rules",
+        )
+        sid = _extract_field(created, "Session:")
+        await think_rules(
+            action="add_rules_batch",
+            session_id=sid,
+            profile_id="design-rules",
+            rules=[
+                {
+                    "id": "nuance",
+                    "text": "Preserve nuance for high-risk decisions",
+                    "weight": 4.0,
+                    "kind": "soft",
+                }
+            ],
+        )
+        graph_r = await think_graph(
+            thought="Review the original architecture plan",
+            session_id=sid,
+        )
+        node_id = _extract_field(graph_r, "Node:")
+        pin = await think_rules(
+            action="pin_snapshot",
+            session_id=sid,
+            profile_id="design-rules",
+            subject_id=node_id,
+            subject_kind="thought",
+            label="baseline",
+        )
+        snapshot_id = _extract_field(pin, "Snapshot:")
+        assert snapshot_id.startswith("design-rules-snap-")
+
+        await think_rules(
+            action="update_weights_batch",
+            session_id=sid,
+            profile_id="design-rules",
+            updates=[{"rule_id": "nuance", "weight": 9.0}],
+        )
+        validation = await think_validate(
+            session_id=sid,
+            subject_id=node_id,
+            subject_kind="thought",
+            assessments=[{"rule_id": "nuance", "status": "violates"}],
+        )
+        assert "Weighted gaps: nuance[violates]:4.0" in validation
+
+        profile = await think_rules(
+            action="show_profile",
+            session_id=sid,
+            profile_id="design-rules",
+        )
+        assert "w=9.0" in profile
+
+    @pytest.mark.anyio
+    async def test_rule_bound_subjects_materialize_graph_nodes_and_links(self):
+        from aismartbuddy.tools.graph import graph_query
+        from aismartbuddy.tools.infra import session_create
+
+        parent = await session_create(backends=["think", "graph"], mode="analyze")
+        sid = _extract_field(parent, "session_id:")
+        await think_rules(
+            action="create_profile",
+            session_id=sid,
+            profile_id="arch-rules",
+            name="Architecture Rules",
+        )
+        await think_rules(
+            action="add_rules_batch",
+            session_id=sid,
+            profile_id="arch-rules",
+            rules=[
+                {
+                    "id": "least-privilege",
+                    "text": "Use least privilege everywhere",
+                    "weight": 3.0,
+                    "kind": "soft",
+                }
+            ],
+        )
+        result = await think_model(
+            session_id=sid,
+            model_name="design_review",
+            items=[
+                {
+                    "id": "plan_graph",
+                    "problem": "Model the API gateway",
+                    "steps": ["review trust zones"],
+                    "reasoning": "Needs rule-aware graph links.",
+                    "conclusion": "Gateway must preserve least privilege.",
+                }
+            ],
+            rule_profile_ids=["arch-rules"],
+        )
+        assert "plan_graph" in result
+
+        graph = await graph_query(
+            session_id=sid,
+            query=(
+                "MATCH (n:KnowledgeNode) "
+                "WHERE n.name IN ["
+                "'model:plan_graph', "
+                "'rule_profile:arch-rules', "
+                "'rule:least-privilege'] "
+                "RETURN n.name;"
+            ),
+        )
+        assert "model:plan_graph" in graph
+        assert "rule_profile:arch-rules" in graph
+        assert "rule:least-privilege" in graph

@@ -1,0 +1,14 @@
+{
+  "rubric_id": "assay_boundary_review",
+  "description": "Assay-boundary review — tissue limits, directness of measurement, and unsupported jumps.",
+  "dimensions": [
+    {"id": "measurement_directness", "description": "Distinguishes measured analytes from inferred downstream effects", "weight": 1.0, "required": true},
+    {"id": "tissue_validity", "description": "Checks whether the tissue or sample type supports the claim", "weight": 1.0, "required": true},
+    {"id": "unsupported_jumps", "description": "Flags jumps from expression to function, protein, or clinical action", "weight": 1.0, "required": true},
+    {"id": "follow_up_assays", "description": "Names the next assay needed to validate unsupported claims", "weight": 0.7, "required": false}
+  ],
+  "severity_levels": ["critical", "high", "moderate", "low"],
+  "severity_deductions": {"critical": 3.0, "high": 2.0, "moderate": 1.0, "low": 0.5},
+  "pass_threshold": 8.0,
+  "scoring_strategy": "weighted_deduction"
+}

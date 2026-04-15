@@ -170,6 +170,16 @@ async def graph_import(
 
     For nodes: provide table_name, data (CSV), and schema.
     For relationships: also provide from_table and to_table.
+    Keep CSV rows general-purpose and reusable across domains; common shapes
+    include entity-score tables and edge lists derived from imported SQL data.
+
+    Reusable node input shapes:
+    - entity-score table: `entity,score,direction,panel,source`
+    - ranked list: `entity,rank,metric,source`
+
+    Reusable relationship input shapes:
+    - edge list: `from,to,relation,weight,source`
+    - pathway membership: `from,to,panel,source`
 
     Args:
         session_id: Session token from graph_create_session.
@@ -331,6 +341,90 @@ async def graph_neighbors(
     if not rows:
         return f"No neighbors found for {node_type} '{node_name}' within {depth} hops."
     return format_result(columns, rows, mgr.max_rows, mgr.max_chars, "table")
+
+
+@size_guarded
+async def graph_focus_summary(
+    session_id: str,
+    node_names: list[str],
+    node_type: str,
+    depth: int = 1,
+    direction: str = "both",
+) -> str:
+    """Summarize multiple graph neighborhoods in one call.
+
+    Use this when you want focused inspection around several important nodes
+    without spending one round trip per `graph_neighbors` call.
+
+    Args:
+        session_id: Session token from graph_create_session.
+        node_names: Node names to inspect (up to 10).
+        node_type: Node table name (e.g., "Gene", "Pathway", "KnowledgeNode").
+        depth: How many hops to explore around each node (default 1, max 5).
+        direction: "both" (default), "outgoing", or "incoming".
+
+    Returns:
+        Compact multi-node neighborhood summary.
+    """
+    if not node_names:
+        raise ValueError("node_names must be non-empty")
+    mgr, info = _require_graph_session(session_id)
+    _validate_id(node_type, "node_type")
+    depth = min(depth, 5)
+    names = []
+    seen: set[str] = set()
+    for raw in node_names[:10]:
+        name = str(raw).strip()
+        if name and name not in seen:
+            seen.add(name)
+            names.append(name)
+    if not names:
+        raise ValueError("node_names must contain at least one non-empty name")
+
+    sections = [
+        "## Graph Focus Summary",
+        f"Node type: {node_type} | Depth: {depth} | Direction: {direction}",
+        f"Nodes requested: {', '.join(names)}",
+    ]
+
+    for node_name in names:
+        safe_name = _escape_cypher_string(node_name)
+        if direction == "outgoing":
+            pattern = (
+                f"(start:{node_type} {{name: '{safe_name}'}})"
+                f"-[r*1..{depth}]->(neighbor)"
+            )
+        elif direction == "incoming":
+            pattern = (
+                f"(neighbor)-[r*1..{depth}]->"
+                f"(start:{node_type} {{name: '{safe_name}'}})"
+            )
+        else:
+            pattern = (
+                f"(start:{node_type} {{name: '{safe_name}'}})"
+                f"-[r*1..{depth}]-(neighbor)"
+            )
+
+        cypher = (
+            f"MATCH p = {pattern} "
+            "RETURN DISTINCT labels(neighbor) AS type, "
+            "neighbor.name AS name, length(p) AS hops "
+            "ORDER BY hops, name LIMIT 20;"
+        )
+        columns, rows = await run_with_lock(
+            info, lambda c=cypher: info.engine.execute(c)
+        )
+        sections.append(f"\n### {node_name}")
+        if not rows:
+            sections.append(
+                f"No neighbors found for {node_type} '{node_name}' within {depth} hops."
+            )
+            continue
+        sections.append(
+            format_result(columns, rows, mgr.max_rows, mgr.max_chars, "table")
+        )
+
+    return "\n".join(sections)
 
 
 async def graph_find_connections(

@@ -26,8 +26,11 @@ from aismartbuddy.engines.thinking_engine import (
     InterferenceRecord,
     ModelRecord,
     MonitorRecord,
+    RuleItem,
+    RuleProfile,
     ThinkingEngine,
     ThoughtNode,
+    ValidationAssessment,
 )
 from aismartbuddy.identity import resolve_identity
 from aismartbuddy.tools import get_session_manager, size_guarded
@@ -37,93 +40,134 @@ if TYPE_CHECKING:
 
 # ── Valid enum values ────────────────────────────────────────
 
-_MODEL_NAMES = frozenset({
-    "first_principles",
-    "opportunity_cost",
-    "error_propagation",
-    "rubber_duck",
-    "pareto_principle",
-    "assumptions_xray",
-    "fishbone",
-    "value_of_info",
-    "swot",
-    "pre_mortem",
-    "design_review",
-    "complexity",
-    "root_cause",
-})
+_MODEL_NAMES = frozenset(
+    {
+        "first_principles",
+        "opportunity_cost",
+        "error_propagation",
+        "rubber_duck",
+        "pareto_principle",
+        "assumptions_xray",
+        "fishbone",
+        "value_of_info",
+        "swot",
+        "pre_mortem",
+        "design_review",
+        "complexity",
+        "root_cause",
+    }
+)
 
-_DEBUG_APPROACHES = frozenset({
-    "binary_search",
-    "reverse_engineering",
-    "divide_conquer",
-    "backtracking",
-    "cause_elimination",
-    "program_slicing",
-})
+_DEBUG_APPROACHES = frozenset(
+    {
+        "binary_search",
+        "reverse_engineering",
+        "divide_conquer",
+        "backtracking",
+        "cause_elimination",
+        "program_slicing",
+    }
+)
 
-_ARGUMENT_TYPES = frozenset({
-    "thesis",
-    "antithesis",
-    "synthesis",
-    "objection",
-    "rebuttal",
-})
+_ARGUMENT_TYPES = frozenset(
+    {
+        "thesis",
+        "antithesis",
+        "synthesis",
+        "objection",
+        "rebuttal",
+    }
+)
 
-_SCIENCE_STAGES = frozenset({
-    "observation",
-    "question",
-    "hypothesis",
-    "experiment",
-    "analysis",
-    "conclusion",
-    "iteration",
-})
+_SCIENCE_STAGES = frozenset(
+    {
+        "observation",
+        "question",
+        "hypothesis",
+        "experiment",
+        "analysis",
+        "conclusion",
+        "iteration",
+    }
+)
 
-_MONITOR_STAGES = frozenset({
-    "knowledge-assessment",
-    "planning",
-    "execution",
-    "monitoring",
-    "evaluation",
-    "reflection",
-    # items[] strict-form records use this stage value for one-shot
-    # self-assessment (distinct from the iterative monitoring stages above).
-    "self-assess",
-})
+_MONITOR_STAGES = frozenset(
+    {
+        "knowledge-assessment",
+        "planning",
+        "execution",
+        "monitoring",
+        "evaluation",
+        "reflection",
+        # items[] strict-form records use this stage value for one-shot
+        # self-assessment (distinct from the iterative monitoring stages above).
+        "self-assess",
+    }
+)
 
-_DECISION_STAGES = frozenset({
-    "problem-definition",
-    "options",
-    "criteria",
-    "evaluation",
-    "analysis",
-    "recommendation",
-})
+_DECISION_STAGES = frozenset(
+    {
+        "problem-definition",
+        "options",
+        "criteria",
+        "evaluation",
+        "analysis",
+        "recommendation",
+    }
+)
 
-_DECISION_TYPES = frozenset({
-    "expected-utility",
-    "multi-criteria",
-    "maximin",
-    "minimax-regret",
-    "satisficing",
-})
+_DECISION_TYPES = frozenset(
+    {
+        "expected-utility",
+        "multi-criteria",
+        "maximin",
+        "minimax-regret",
+        "satisficing",
+    }
+)
 
-_KNOWLEDGE_LEVELS = frozenset({
-    "expert",
-    "proficient",
-    "familiar",
-    "basic",
-    "minimal",
-    "none",
-})
+_KNOWLEDGE_LEVELS = frozenset(
+    {
+        "expert",
+        "proficient",
+        "familiar",
+        "basic",
+        "minimal",
+        "none",
+    }
+)
 
-_SUGGESTED_ASSESSMENTS = frozenset({
-    "knowledge",
-    "claim",
-    "reasoning",
-    "overall",
-})
+_SUGGESTED_ASSESSMENTS = frozenset(
+    {
+        "knowledge",
+        "claim",
+        "reasoning",
+        "overall",
+    }
+)
+_RULE_ACTIONS = frozenset(
+    {
+        "create_profile",
+        "add_rules_batch",
+        "update_weights_batch",
+        "deprecate_rules_batch",
+        "list_profiles",
+        "show_profile",
+        "bind_profile",
+        "pin_snapshot",
+        "resolve_conflicts",
+    }
+)
+_RULE_KINDS = frozenset({"hard", "soft"})
+_RULE_STATUSES = frozenset({"active", "superseded"})
+_VALIDATION_STATUSES = frozenset(
+    {
+        "satisfies",
+        "violates",
+        "uncertain",
+        "not_applicable",
+    }
+)
 
 
 # ── Helpers ──────────────────────────────────────────────────
@@ -175,34 +219,281 @@ def _validate_enum(value: str, valid: frozenset[str], label: str) -> str:
     return value
 
 
+def _rule_bindings_from_profile_ids(
+    engine: ThinkingEngine,
+    rule_profile_ids: list[str] | None,
+) -> list[dict]:
+    """Validate explicit rule profile ids and convert to bindings."""
+    bindings: list[dict] = []
+    seen: set[str] = set()
+    for profile_id in rule_profile_ids or []:
+        if profile_id in seen:
+            continue
+        if engine.get_rule_profile(profile_id) is None:
+            raise ValueError(f"Rule profile '{profile_id}' not found")
+        seen.add(profile_id)
+        bindings.append({"profile_id": profile_id, "snapshot_id": None})
+    return bindings
+
+
+def _format_rule_validation_summary(summary: dict) -> str:
+    """Render a compact human-readable validation summary."""
+    if not summary.get("bindings"):
+        return "Rule validation: no bound profiles"
+    lines = [
+        "Rule validation:",
+        (f"- Bound profiles: {', '.join(b['profile_id'] for b in summary['bindings'])}"),
+    ]
+    if summary.get("latest_validation_id"):
+        lines.append(
+            f"- Latest validation: {summary['latest_validation_id']}"
+            f" | hard_gates={'pass' if summary['passed_hard_gates'] else 'fail'}"
+            + (
+                f" | weighted_score={summary['weighted_score']:.1f}"
+                if summary.get("weighted_score") is not None
+                else ""
+            )
+        )
+    if summary.get("hard_failures"):
+        lines.append(f"- Hard failures: {', '.join(summary['hard_failures'])}")
+    if summary.get("uncovered_rules"):
+        lines.append(
+            f"- Uncovered rules: {', '.join(summary['uncovered_rules'][:8])}"
+            + (" ..." if len(summary["uncovered_rules"]) > 8 else "")
+        )
+    if summary.get("conflicts"):
+        lines.append(f"- Unresolved conflicts: {', '.join(summary['conflicts'])}")
+    if summary.get("nuance_notes"):
+        lines.append(f"- Nuance notes: {' | '.join(summary['nuance_notes'][:3])}")
+    return "\n".join(lines)
+
+
+async def _materialize_rule_graph(
+    session_id: str | None,
+    *,
+    profile: RuleProfile | None = None,
+    rules: list[RuleItem] | None = None,
+    validation=None,
+) -> None:
+    """Best-effort graph materialization for rules and validations."""
+    if not session_id:
+        return
+    mgr = get_session_manager()
+    if session_id not in getattr(mgr, "_parent_sessions", {}):
+        return
+    try:
+        from aismartbuddy.tools.graph import graph_knowledge_add, graph_knowledge_relate
+
+        if profile is not None:
+            profile_node = f"rule_profile:{profile.id}"
+            await graph_knowledge_add(
+                session_id=session_id,
+                entity=profile_node,
+                entity_type="concept",
+                properties={
+                    "name": profile.name,
+                    "description": profile.description,
+                    "rules": len(profile.rules),
+                },
+                confidence=1.0,
+                source="think_rules",
+            )
+            for rule in rules or profile.rules:
+                rule_node = f"rule:{rule.id}"
+                await graph_knowledge_add(
+                    session_id=session_id,
+                    entity=rule_node,
+                    entity_type="fact",
+                    properties={
+                        "text": rule.text,
+                        "weight": rule.weight,
+                        "kind": rule.kind,
+                        "status": rule.status,
+                    },
+                    confidence=1.0,
+                    source="think_rules",
+                )
+                await graph_knowledge_relate(
+                    session_id=session_id,
+                    from_name=rule_node,
+                    to_name=profile_node,
+                    relation="part_of",
+                    weight=1.0,
+                    justification="rule belongs to profile",
+                    source="think_rules",
+                )
+                for conflict_id in rule.conflicts_with:
+                    try:
+                        await graph_knowledge_relate(
+                            session_id=session_id,
+                            from_name=rule_node,
+                            to_name=f"rule:{conflict_id}",
+                            relation="contradicts",
+                            weight=1.0,
+                            justification="declared rule conflict",
+                            source="think_rules",
+                        )
+                    except Exception:
+                        continue
+        if validation is not None:
+            v_node = f"validation:{validation.id}"
+            await graph_knowledge_add(
+                session_id=session_id,
+                entity=v_node,
+                entity_type="insight",
+                properties={
+                    "subject_id": validation.subject_id,
+                    "subject_kind": validation.subject_kind,
+                    "weighted_score": validation.weighted_score,
+                    "passed_hard_gates": validation.passed_hard_gates,
+                },
+                confidence=1.0,
+                source="think_validate",
+            )
+            target = f"{validation.subject_kind}:{validation.subject_id}"
+            try:
+                await graph_knowledge_relate(
+                    session_id=session_id,
+                    from_name=v_node,
+                    to_name=target,
+                    relation="applies_to",
+                    weight=1.0,
+                    justification="validation target",
+                    source="think_validate",
+                )
+            except Exception:
+                pass
+            for binding in validation.rule_bindings:
+                try:
+                    await graph_knowledge_relate(
+                        session_id=session_id,
+                        from_name=v_node,
+                        to_name=f"rule_profile:{binding['profile_id']}",
+                        relation="derived_from",
+                        weight=1.0,
+                        justification="validation used rule profile",
+                        source="think_validate",
+                    )
+                except Exception:
+                    continue
+    except Exception:
+        return
+
+
+def _parent_graph_session_id(session_id: str | None) -> str | None:
+    """Return the parent session id only when it exposes graph backend state."""
+    if not session_id:
+        return None
+    mgr = get_session_manager()
+    if session_id in getattr(mgr, "_parent_sessions", {}):
+        return session_id
+    return None
+
+
+async def _materialize_subject_rule_bindings(
+    engine: ThinkingEngine,
+    session_id: str | None,
+    *,
+    subject_kind: str,
+    subject_id: str,
+    subject_label: str,
+    bindings: list[dict],
+    source: str,
+) -> None:
+    """Best-effort graph materialization for a rule-bound subject."""
+    parent_session_id = _parent_graph_session_id(session_id)
+    if not parent_session_id or not bindings:
+        return
+    try:
+        from aismartbuddy.tools.graph import graph_knowledge_add, graph_knowledge_relate
+
+        subject_node = f"{subject_kind}:{subject_id}"
+        await graph_knowledge_add(
+            session_id=parent_session_id,
+            entity=subject_node,
+            entity_type="insight" if subject_kind != "holon" else "entity",
+            properties={"label": subject_label[:200], "subject_kind": subject_kind},
+            confidence=1.0,
+            source=source,
+        )
+
+        profiles_seen: set[str] = set()
+        rules_seen: set[str] = set()
+        for binding in bindings:
+            profile_id = binding["profile_id"]
+            if profile_id in profiles_seen:
+                continue
+            profiles_seen.add(profile_id)
+            profile = engine.get_rule_profile(profile_id)
+            if profile is None:
+                continue
+            await _materialize_rule_graph(parent_session_id, profile=profile)
+            await graph_knowledge_relate(
+                session_id=parent_session_id,
+                from_name=subject_node,
+                to_name=f"rule_profile:{profile_id}",
+                relation="requires",
+                weight=1.0,
+                justification="subject is governed by this rule profile",
+                source=source,
+            )
+
+        for profile_id, _, rule in engine.get_effective_rules(bindings):
+            if rule.id in rules_seen:
+                continue
+            rules_seen.add(rule.id)
+            try:
+                await graph_knowledge_relate(
+                    session_id=parent_session_id,
+                    from_name=subject_node,
+                    to_name=f"rule:{rule.id}",
+                    relation="requires",
+                    weight=max(0.1, float(rule.weight)),
+                    justification=f"subject is governed by rule profile {profile_id}",
+                    source=source,
+                )
+            except Exception:
+                continue
+    except Exception:
+        return
+
+
 # ── Thought Graph constants ──────────────────────────────────
 
-_GRAPH_ACTIONS = frozenset({
-    "think",
-    "branch",
-    "revise",
-    "synthesize",
-})
+_GRAPH_ACTIONS = frozenset(
+    {
+        "think",
+        "branch",
+        "revise",
+        "synthesize",
+    }
+)
 
-_VALIDATE_CHECK_TYPES = frozenset({
-    "coverage",
-    "contradictions",
-    "gaps",
-    "leaps",
-    "completeness",
-    "dependencies",
-})
+_VALIDATE_CHECK_TYPES = frozenset(
+    {
+        "coverage",
+        "contradictions",
+        "gaps",
+        "leaps",
+        "completeness",
+        "dependencies",
+    }
+)
 
-_VALIDATE_RESULTS = frozenset({
-    "pass",
-    "fail",
-    "warning",
-})
+_VALIDATE_RESULTS = frozenset(
+    {
+        "pass",
+        "fail",
+        "warning",
+    }
+)
 
-_DELEGATE_ACTIONS = frozenset({
-    "package",
-    "receive",
-})
+_DELEGATE_ACTIONS = frozenset(
+    {
+        "package",
+        "receive",
+    }
+)
 
 
 # ── Tool: Thought Graph ─────────────────────────────────────
@@ -238,6 +529,7 @@ async def think_graph(
     children: list[dict] | None = None,
     expected_children: int | None = None,
     min_children: int | None = None,
+    rule_profile_ids: list[str] | None = None,
     ctx: _MCPContext | None = None,
 ) -> str:
     """Thought graph — structured thinking with progressive complexity.
@@ -295,9 +587,7 @@ async def think_graph(
     """
     _validate_enum(action, _GRAPH_ACTIONS, "action")
 
-    _, info = await anyio.to_thread.run_sync(
-        lambda: _get_or_create_think_session(session_id, ctx)
-    )
+    _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
     engine = _engine(info)
     sid = info.session_id
 
@@ -330,8 +620,7 @@ async def think_graph(
     elif tree_id and tree_id in engine.thought_trees:
         # Existing tree — must add as child, not replace root
         raise ValueError(
-            f"Tree '{tree_id}' already has a root. "
-            "Use parent_id to add nodes to an existing tree."
+            f"Tree '{tree_id}' already has a root. Use parent_id to add nodes to an existing tree."
         )
     else:
         effective_tree_id = tree_id or uuid.uuid4().hex[:10]
@@ -348,6 +637,7 @@ async def think_graph(
         parent_id=parent_id,
         depends_on=depends_on or [],
         refs=refs or [],
+        rule_bindings=_rule_bindings_from_profile_ids(engine, rule_profile_ids),
         depth=depth,
         metadata=parent_meta,
     )
@@ -375,8 +665,7 @@ async def think_graph(
                 actual = len(parent.children)
                 if actual != int(exp):
                     synth_warning = (
-                        f"\n⚠ Synthesis: parent expected {exp} children,"
-                        f" found {actual}."
+                        f"\n⚠ Synthesis: parent expected {exp} children, found {actual}."
                     )
 
     # Build output
@@ -389,10 +678,7 @@ async def think_graph(
     path_str = _build_path_string(engine, nid)
     parts = [
         f"Session: {sid} | Tree: {effective_tree_id} | Node: {nid}",
-        (
-            f"Action: {action} | Depth: {depth}"
-            f" | Children: {len(child_ids)} | Siblings: {siblings}"
-        ),
+        (f"Action: {action} | Depth: {depth} | Children: {len(child_ids)} | Siblings: {siblings}"),
     ]
     if parent_id:
         parts.append(f"Parent: {parent_id} | Path: {path_str}")
@@ -400,6 +686,15 @@ async def think_graph(
         parts.append(f"Batch: {len(child_ids)} children created")
         parts.append("Children: " + ", ".join(child_ids))
     parts.append("Status: added" + synth_warning)
+    await _materialize_subject_rule_bindings(
+        engine,
+        session_id,
+        subject_kind="thought",
+        subject_id=nid,
+        subject_label=thought,
+        bindings=parent_node.rule_bindings,
+        source="think_graph",
+    )
     return "\n".join(parts)
 
 
@@ -452,9 +747,7 @@ async def think_graph_delegate(
         for i, n in enumerate(path):
             indent = "  " * i
             marker = "[THIS NODE] " if n.id == node_id else ""
-            context_lines.append(
-                f"{indent}> {marker}{n.content[:80]}"
-            )
+            context_lines.append(f"{indent}> {marker}{n.content[:80]}")
 
         subtree = engine.get_subtree_nodes(node_id)
         child_count = len(subtree) - 1  # exclude self
@@ -468,8 +761,7 @@ async def think_graph_delegate(
         return (
             f"Session: {session_id} | Node: {node_id}"
             f" | Delegation: packaged\n"
-            f"Context depth: {len(path)} nodes\n"
-            + "\n".join(context_lines)
+            f"Context depth: {len(path)} nodes\n" + "\n".join(context_lines)
         )
 
     # action == "receive"
@@ -507,6 +799,7 @@ async def think_decide(
     evaluations: list[dict] | None = None,
     recommendation: str | None = None,
     items: list[dict] | None = None,
+    rule_profile_ids: list[str] | None = None,
     ctx: _MCPContext | None = None,
 ) -> str:
     """[SCAFFOLD] Multi-criteria decision analysis (1..N decisions).
@@ -529,9 +822,7 @@ async def think_decide(
 
     Returns: decision ids[] in items[] mode, or single-form status.
     """
-    _, info = await anyio.to_thread.run_sync(
-        lambda: _get_or_create_think_session(session_id, ctx)
-    )
+    _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
     engine = _engine(info)
 
     # ── Items[] strict batch path ────────────────────────────
@@ -555,8 +846,7 @@ async def think_decide(
 
         validate_items(
             items,
-            required=["decision_statement", "options", "criteria",
-                      "recommendation"],
+            required=["decision_statement", "options", "criteria", "recommendation"],
             tool="think_decide",
             item_validators={
                 "options": _check_options,
@@ -565,6 +855,7 @@ async def think_decide(
         )
 
         ids: list[str] = []
+        bindings = _rule_bindings_from_profile_ids(engine, rule_profile_ids)
         with engine.state_lock:
             for it in items:
                 rec = DecisionRecord(
@@ -577,9 +868,20 @@ async def think_decide(
                     criteria=list(it["criteria"]),
                     evaluations=list(it.get("evaluations") or []),
                     recommendation=it["recommendation"],
+                    rule_bindings=list(bindings),
                 )
                 engine.upsert_decision(rec)
                 ids.append(it["id"])
+        for it in items:
+            await _materialize_subject_rule_bindings(
+                engine,
+                session_id,
+                subject_kind="decision",
+                subject_id=it["id"],
+                subject_label=it["decision_statement"],
+                bindings=bindings,
+                source="think_decide",
+            )
 
         return (
             f"Session: {info.session_id} | Decisions: {len(ids)}\n"
@@ -591,9 +893,7 @@ async def think_decide(
     _validate_enum(analysis_type, _DECISION_TYPES, "analysis_type")
     _validate_enum(stage, _DECISION_STAGES, "stage")
     if not decision_statement or not options or not decision_id:
-        raise ValueError(
-            "single-form requires decision_statement, options, decision_id"
-        )
+        raise ValueError("single-form requires decision_statement, options, decision_id")
 
     record = DecisionRecord(
         decision_id=decision_id,
@@ -605,8 +905,18 @@ async def think_decide(
         criteria=criteria or [],
         evaluations=evaluations or [],
         recommendation=recommendation or "",
+        rule_bindings=_rule_bindings_from_profile_ids(engine, rule_profile_ids),
     )
     engine.upsert_decision(record)
+    await _materialize_subject_rule_bindings(
+        engine,
+        session_id,
+        subject_kind="decision",
+        subject_id=decision_id,
+        subject_label=decision_statement,
+        bindings=record.rule_bindings,
+        source="think_decide",
+    )
 
     parts = [
         f"Session: {info.session_id}",
@@ -745,6 +1055,7 @@ async def think_model(
     conclusion: str | None = None,
     items: list[dict] | None = None,
     auto_graph: bool = False,
+    rule_profile_ids: list[str] | None = None,
     ctx: _MCPContext | None = None,
 ) -> str:
     """[SCAFFOLD] Apply a mental model to 1..N problems. Call FIRST.
@@ -753,6 +1064,12 @@ async def think_model(
     sub-problems with the same model; you want the schema to FORCE structure.
     Do NOT use when: mid-elaboration (use think_graph); you already finished
     the reasoning and just want to record it (that's ceremony — skip).
+    For assay-heavy data, import/profile first, then scaffold:
+    `sql_import` / `sql_import_batch` → `data_profile` / `data_anomalies` →
+    `extract_findings_from_sql` → `think_model`.
+    Separate measured signal from inferred mechanism. Use `items[]` and
+    `refs/connects_to` when you need an audit trail across later claims,
+    findings, and graph materialization.
 
     Two forms:
       items[]: STRICT batch — each item must have id/problem/steps/reasoning/
@@ -766,6 +1083,13 @@ async def think_model(
     pareto_principle, assumptions_xray, fishbone, value_of_info, swot,
     pre_mortem, design_review, complexity, root_cause.
 
+    Good fits for omics / assay interpretation:
+    - measurement-boundary review
+    - confounder x-ray
+    - signal vs mechanism decomposition
+    - cross-domain bridge mapping
+    - intervention coverage / loop-breaking coverage
+
     Args:
       model_name: which mental model to apply.
       items: STRICT — each item dict needs id, problem, steps[≥1], reasoning,
@@ -773,15 +1097,14 @@ async def think_model(
       problem, steps, reasoning, conclusion: single-item form fields.
       auto_graph: when True + parent session has graph backend, materialise
         each item as a KnowledgeNode + connects_to edges in one round trip.
+      rule_profile_ids: optional reusable rule profiles to bind to each record.
       session_id: omit to auto-create think session.
 
     Returns: item_ids[] (+ graph node count if auto_graph) or single-item status.
     """
     _validate_enum(model_name, _MODEL_NAMES, "model_name")
 
-    _, info = await anyio.to_thread.run_sync(
-        lambda: _get_or_create_think_session(session_id, ctx)
-    )
+    _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
     engine = _engine(info)
 
     # ── Items[] strict batch path ────────────────────────────
@@ -796,6 +1119,7 @@ async def think_model(
         from aismartbuddy.tools import collect_item_refs
 
         item_ids: list[str] = []
+        bindings = _rule_bindings_from_profile_ids(engine, rule_profile_ids)
         with engine.state_lock:
             for it in items:
                 rec = ModelRecord(
@@ -806,9 +1130,20 @@ async def think_model(
                     conclusion=it["conclusion"],
                     record_id=it["id"],
                     refs=collect_item_refs(it),
+                    rule_bindings=list(bindings),
                 )
                 engine.add_model(rec)
                 item_ids.append(it["id"])
+        for it in items:
+            await _materialize_subject_rule_bindings(
+                engine,
+                session_id,
+                subject_kind="model",
+                subject_id=it["id"],
+                subject_label=it["problem"],
+                bindings=bindings,
+                source="think_model",
+            )
 
         graph_count = 0
         if auto_graph:
@@ -818,15 +1153,15 @@ async def think_model(
                     "session_create(backends=['think','graph'])."
                 )
             graph_count = await materialize_auto_graph(
-                session_id, items,
+                session_id,
+                items,
                 source_tag=f"think_model:{model_name}",
                 entity_type="concept",
                 description_field="conclusion",
             )
 
         out = [
-            f"Session: {info.session_id} | Model: {model_name} | "
-            f"Items: {len(item_ids)}",
+            f"Session: {info.session_id} | Model: {model_name} | Items: {len(item_ids)}",
             f"Item IDs: {', '.join(item_ids)}",
         ]
         if auto_graph:
@@ -841,6 +1176,8 @@ async def think_model(
         steps=steps or [],
         reasoning=reasoning or "",
         conclusion=conclusion or "",
+        record_id=uuid.uuid4().hex[:10] if rule_profile_ids else "",
+        rule_bindings=_rule_bindings_from_profile_ids(engine, rule_profile_ids),
     )
     engine.add_model(record)
 
@@ -852,6 +1189,8 @@ async def think_model(
     header = " | ".join(parts)
 
     lines = [header]
+    if record.record_id:
+        lines.append(f"Record ID: {record.record_id}")
     if not steps and not conclusion:
         # No steps yet — return framework guidance to help the AI
         lines.append(_MODEL_GUIDANCE[model_name])
@@ -860,6 +1199,15 @@ async def think_model(
         lines.append(f"Conclusion: {conclusion[:200]}")
     else:
         lines.append("Status: applied")
+    await _materialize_subject_rule_bindings(
+        engine,
+        session_id,
+        subject_kind="model",
+        subject_id=record.record_id or uuid.uuid4().hex[:8],
+        subject_label=problem or model_name,
+        bindings=record.rule_bindings,
+        source="think_model",
+    )
     return "\n".join(lines)
 
 
@@ -893,9 +1241,7 @@ async def think_debug(
 
     Returns: debug ids[] (items[] mode) or single status.
     """
-    _, info = await anyio.to_thread.run_sync(
-        lambda: _get_or_create_think_session(session_id, ctx)
-    )
+    _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
     engine = _engine(info)
 
     # ── Items[] strict batch path ────────────────────────────
@@ -1014,9 +1360,7 @@ async def think_argue(
         Single mode: compact status with argumentation chain progress.
         Batch mode: chain_id + ordered list of argument_ids.
     """
-    _, info = await anyio.to_thread.run_sync(
-        lambda: _get_or_create_think_session(session_id, ctx)
-    )
+    _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
     engine = _engine(info)
 
     # ── Batch chain mode ─────────────────────────────────
@@ -1034,9 +1378,7 @@ async def think_argue(
             if not entry.get("conclusion"):
                 raise ValueError(f"chain[{i}] missing 'conclusion'")
             if not isinstance(entry.get("premises"), list):
-                raise ValueError(
-                    f"chain[{i}] 'premises' must be a list[str]"
-                )
+                raise ValueError(f"chain[{i}] 'premises' must be a list[str]")
             if not entry["premises"]:
                 raise ValueError(f"chain[{i}] 'premises' must be non-empty")
 
@@ -1051,8 +1393,7 @@ async def think_argue(
                 if rt_idx is not None:
                     if not (0 <= int(rt_idx) < i):
                         raise ValueError(
-                            f"chain[{i}].responds_to_index={rt_idx} "
-                            "must reference a prior entry"
+                            f"chain[{i}].responds_to_index={rt_idx} must reference a prior entry"
                         )
                     rt = ids[int(rt_idx)]
                 etype = entry.get("type") or entry.get("argument_type")
@@ -1181,6 +1522,10 @@ async def think_science(
 
     Use when: claim that needs testing; multiple competing hypotheses to record.
     Do NOT use when: post-hoc result logging (use think_graph).
+    For biology or assay-heavy interpretation, use this to force competing
+    hypotheses, explicit falsifiability criteria, and missing-data tests
+    after you have profiled the imported table. Prefer multiple `items[]`
+    entries over a single favorite narrative.
 
     items[]: STRICT batch — each item: id, observation, question, hypothesis
       {statement, variables[{name, role∈{independent,dependent,controlled}}],
@@ -1201,9 +1546,7 @@ async def think_science(
 
     Returns: hypothesis_ids[] in items[] mode, or single-stage status.
     """
-    _, info = await anyio.to_thread.run_sync(
-        lambda: _get_or_create_think_session(session_id, ctx)
-    )
+    _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
     engine = _engine(info)
 
     # ── Items[] strict batch path ────────────────────────────
@@ -1239,12 +1582,10 @@ async def think_science(
                     "session_create(backends=['think','graph'])."
                 )
             # Build description from hypothesis.statement
-            normalized = [
-                {**it, "_desc": it["hypothesis"]["statement"]}
-                for it in items
-            ]
+            normalized = [{**it, "_desc": it["hypothesis"]["statement"]} for it in items]
             graph_count = await materialize_auto_graph(
-                session_id, normalized,
+                session_id,
+                normalized,
                 source_tag="think_science",
                 entity_type="question",
                 description_field="_desc",
@@ -1294,7 +1635,10 @@ async def think_science(
 
 _CLAIM_STATUSES = frozenset({"fact", "inference", "speculation", "uncertain"})
 _STATUS_WEIGHT = {
-    "fact": 1.0, "inference": 0.75, "speculation": 0.5, "uncertain": 0.25,
+    "fact": 1.0,
+    "inference": 0.75,
+    "speculation": 0.5,
+    "uncertain": 0.25,
 }
 
 
@@ -1358,6 +1702,9 @@ async def think_monitor(
     Use when: honest calibration AFTER an analysis (limitations + claim
     certainty); batch-assessing N tasks with the items[] form.
     Do NOT use when: mid-elaboration (use think_graph metadata).
+    For assay-heavy or omics-style work, use this to record tissue-validity
+    limits, cell-composition confounding, assay-boundary constraints, and
+    mechanistic-overreach risks before conclusions or scoring.
 
     items[]: STRICT batch — each item: id, task, knowledge {domain, level∈
       {expert,proficient,familiar,basic,minimal,none}, confidence,
@@ -1384,9 +1731,7 @@ async def think_monitor(
     knowledge_assessment. The items[] form uses the short names
     `level` / `confidence` / `limitations` — stick to ONE form per call.
     """
-    _, info = await anyio.to_thread.run_sync(
-        lambda: _get_or_create_think_session(session_id, ctx)
-    )
+    _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
     engine = _engine(info)
 
     # ── Items[] strict batch path ────────────────────────────
@@ -1408,10 +1753,7 @@ async def think_monitor(
             for it in items:
                 k = it["knowledge"]
                 cl = it["claims"]
-                weighted = sum(
-                    float(c["confidence"]) * _STATUS_WEIGHT[c["status"]]
-                    for c in cl
-                )
+                weighted = sum(float(c["confidence"]) * _STATUS_WEIGHT[c["status"]] for c in cl)
                 weight_sum = sum(_STATUS_WEIGHT[c["status"]] for c in cl)
                 overall = weighted / weight_sum if weight_sum > 0 else 0.0
                 rec = MonitorRecord(
@@ -1438,11 +1780,10 @@ async def think_monitor(
                     "auto_graph requires explicit unified session_id from "
                     "session_create(backends=['think','graph'])."
                 )
-            normalized = [
-                {**it, "_desc": it["task"]} for it in items
-            ]
+            normalized = [{**it, "_desc": it["task"]} for it in items]
             graph_count = await materialize_auto_graph(
-                session_id, normalized,
+                session_id,
+                normalized,
                 source_tag="think_monitor",
                 entity_type="insight",
                 description_field="_desc",
@@ -1471,8 +1812,7 @@ async def think_monitor(
         if cs is not None:
             if not isinstance(cs, (int, float)) or not (0.0 <= cs <= 1.0):
                 raise ValueError(
-                    f"Invalid confidenceScore: {cs!r}. "
-                    "Must be a number between 0.0 and 1.0"
+                    f"Invalid confidenceScore: {cs!r}. Must be a number between 0.0 and 1.0"
                 )
 
     if suggested_assessments:
@@ -1515,6 +1855,345 @@ async def think_monitor(
     lines = [" | ".join(parts), f"Status: {status}"]
     if suggested_assessments:
         lines.append(f"Next: {', '.join(suggested_assessments)}")
+    return "\n".join(lines)
+
+
+async def think_rules(
+    action: str,
+    session_id: str | None = None,
+    profile_id: str | None = None,
+    name: str | None = None,
+    description: str | None = None,
+    rules: list[dict] | None = None,
+    updates: list[dict] | None = None,
+    rule_ids: list[str] | None = None,
+    refs: list[str] | None = None,
+    subject_id: str | None = None,
+    subject_kind: str | None = None,
+    bindings: list[dict] | None = None,
+    label: str | None = None,
+    conflict_resolutions: list[dict] | None = None,
+    ctx: _MCPContext | None = None,
+) -> str:
+    """[SCAFFOLD] Manage weighted reusable rule profiles for long-running plans.
+
+    Use when: you need persistent weighted requirements, design rules, security
+    constraints, or plan-specific validation criteria that survive compaction,
+    branch changes, and related subplans.
+
+    Actions:
+      create_profile: define a reusable rule profile.
+      add_rules_batch: strict batch add of rules to a profile.
+      update_weights_batch: strict batch update of numeric weights.
+      deprecate_rules_batch: mark rules superseded without deleting history.
+      list_profiles: list known profiles in the session.
+      show_profile: show one profile, its rules, and snapshots.
+      bind_profile: bind one or more profiles to a thought/model/decision/holon/evaluation.
+      pin_snapshot: freeze current profile state into a snapshot; optionally bind it.
+      resolve_conflicts: explicitly resolve open rule conflicts.
+    """
+    _validate_enum(action, _RULE_ACTIONS, "action")
+    _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
+    engine = _engine(info)
+
+    if action == "create_profile":
+        if not profile_id or not name:
+            raise ValueError("profile_id and name are required for create_profile")
+        record = RuleProfile(
+            id=profile_id,
+            name=name,
+            description=description or "",
+            refs=list(dict.fromkeys(list(refs or []))),
+        )
+        engine.upsert_rule_profile(record)
+        await _materialize_rule_graph(session_id, profile=record)
+        return (
+            f"Session: {info.session_id} | Rule profile: {profile_id}\n"
+            f"Name: {name}\n"
+            "Status: created"
+        )
+
+    if action == "list_profiles":
+        profiles = sorted(engine.get_rule_profiles(), key=lambda p: p.created_at)
+        if not profiles:
+            return f"Session: {info.session_id}\nNo rule profiles defined."
+        lines = [f"Session: {info.session_id}", f"Rule profiles ({len(profiles)}):"]
+        for profile in profiles:
+            active_rules = sum(1 for rule in profile.rules if rule.status == "active")
+            lines.append(
+                f"  {profile.id}: {profile.name} | {active_rules} active rules"
+                f" | snapshots={len(profile.snapshots)}"
+            )
+        return "\n".join(lines)
+
+    if not profile_id and action not in {"bind_profile", "resolve_conflicts"}:
+        raise ValueError("profile_id is required for this action")
+
+    if action == "show_profile":
+        profile = engine.get_rule_profile(profile_id)
+        if profile is None:
+            raise ValueError(f"Rule profile '{profile_id}' not found")
+        lines = [
+            f"Session: {info.session_id} | Rule profile: {profile.id}",
+            f"Name: {profile.name}",
+            f"Description: {profile.description or '(none)'}",
+            f"Snapshots: {len(profile.snapshots)}",
+            "Rules:",
+        ]
+        for rule in profile.rules:
+            lines.append(
+                f"  {rule.id}: [{rule.kind}] w={rule.weight} | {rule.status} | {rule.text[:120]}"
+            )
+        return "\n".join(lines)
+
+    if action == "add_rules_batch":
+        from aismartbuddy.tools import validate_items
+
+        validate_items(
+            rules or [],
+            required=["text", "weight", "kind"],
+            tool="think_rules",
+        )
+        parsed: list[RuleItem] = []
+        seen_ids: set[str] = set()
+        for i, rule in enumerate(rules or []):
+            rid = rule["id"]
+            if rid in seen_ids:
+                raise ValueError(f"think_rules.rules[{i}] duplicate id '{rid}'")
+            seen_ids.add(rid)
+            _validate_enum(rule["kind"], _RULE_KINDS, f"rules[{i}].kind")
+            status = rule.get("status", "active")
+            _validate_enum(status, _RULE_STATUSES, f"rules[{i}].status")
+            parsed.append(
+                RuleItem(
+                    id=rid,
+                    text=rule["text"],
+                    weight=float(rule["weight"]),
+                    kind=rule["kind"],
+                    status=status,
+                    rationale=rule.get("rationale", "") or "",
+                    tags=list(rule.get("tags") or []),
+                    refs=list(rule.get("refs") or []),
+                    conflicts_with=list(rule.get("conflicts_with") or []),
+                )
+            )
+        profile = engine.add_rules_batch(profile_id, parsed)
+        await _materialize_rule_graph(session_id, profile=profile, rules=parsed)
+        return (
+            f"Session: {info.session_id} | Rule profile: {profile_id}\n"
+            f"Rules added: {len(parsed)}\n"
+            f"Rule IDs: {', '.join(rule.id for rule in parsed)}\n"
+            "Status: updated"
+        )
+
+    if action == "update_weights_batch":
+        if not updates:
+            raise ValueError("updates must be a non-empty list")
+        for i, update in enumerate(updates):
+            if not isinstance(update, dict):
+                raise ValueError(f"think_rules.updates[{i}] must be a dict")
+            if not update.get("rule_id"):
+                raise ValueError(f"think_rules.updates[{i}] missing 'rule_id'")
+            if "weight" not in update:
+                raise ValueError(f"think_rules.updates[{i}] missing 'weight'")
+        profile = engine.update_rule_weights(profile_id, list(updates or []))
+        return (
+            f"Session: {info.session_id} | Rule profile: {profile_id}\n"
+            f"Weights updated: {len(updates or [])}\n"
+            "Status: updated"
+        )
+
+    if action == "deprecate_rules_batch":
+        if not rule_ids:
+            raise ValueError("rule_ids is required for deprecate_rules_batch")
+        engine.deprecate_rules(profile_id, list(rule_ids))
+        return (
+            f"Session: {info.session_id} | Rule profile: {profile_id}\n"
+            f"Rules superseded: {', '.join(rule_ids)}\n"
+            "Status: updated"
+        )
+
+    if action == "bind_profile":
+        if not subject_id:
+            raise ValueError("subject_id is required for bind_profile")
+        if not bindings:
+            raise ValueError("bindings is required for bind_profile")
+        resolved_kind, bound = engine.bind_rule_profiles(subject_id, subject_kind, bindings)
+        await _materialize_subject_rule_bindings(
+            engine,
+            session_id,
+            subject_kind=resolved_kind,
+            subject_id=subject_id,
+            subject_label=f"bound-{resolved_kind}-{subject_id}",
+            bindings=bound,
+            source="think_rules",
+        )
+        return (
+            f"Session: {info.session_id} | Subject: {subject_id}\n"
+            f"Kind: {resolved_kind} | Bound profiles: "
+            f"{', '.join(b['profile_id'] for b in bound)}\n"
+            "Status: bound"
+        )
+
+    if action == "pin_snapshot":
+        snapshot_id = f"{profile_id}-snap-{uuid.uuid4().hex[:8]}"
+        snapshot = engine.create_rule_snapshot(profile_id, snapshot_id, label or "")
+        if subject_id:
+            resolved_kind, bound = engine.bind_rule_profiles(
+                subject_id,
+                subject_kind,
+                [{"profile_id": profile_id, "snapshot_id": snapshot.id}],
+            )
+            await _materialize_subject_rule_bindings(
+                engine,
+                session_id,
+                subject_kind=resolved_kind,
+                subject_id=subject_id,
+                subject_label=f"bound-{resolved_kind}-{subject_id}",
+                bindings=bound,
+                source="think_rules",
+            )
+        return (
+            f"Session: {info.session_id} | Rule profile: {profile_id}\n"
+            f"Snapshot: {snapshot.id}\n"
+            + (f"Bound to: {subject_id}\n" if subject_id else "")
+            + "Status: pinned"
+        )
+
+    if not conflict_resolutions:
+        raise ValueError("conflict_resolutions is required for resolve_conflicts")
+    resolved = []
+    for i, item in enumerate(conflict_resolutions):
+        conflict_id = item.get("conflict_id")
+        if not conflict_id:
+            raise ValueError(f"conflict_resolutions[{i}] missing 'conflict_id'")
+        resolution_note = item.get("resolution_note", "") or ""
+        resolved.extend(engine.resolve_rule_conflicts([conflict_id], resolution_note))
+    return (
+        f"Session: {info.session_id} | Conflicts resolved: {len(resolved)}\n"
+        f"Conflict IDs: {', '.join(r.id for r in resolved)}\n"
+        "Status: resolved"
+    )
+
+
+async def think_validate(
+    subject_id: str = "",
+    session_id: str | None = None,
+    subject_kind: str | None = None,
+    assessments: list[dict] | None = None,
+    validation_id: str | None = None,
+    rule_profile_ids: list[str] | None = None,
+    use_bound_profiles: bool = True,
+    nuance_notes: list[str] | None = None,
+    refs: list[str] | None = None,
+    items: list[dict] | None = None,
+    ctx: _MCPContext | None = None,
+) -> str:
+    """[ASSESS] Validate a plan/artifact against weighted hard+soft rule profiles.
+
+    Returns a validation record with hard-gate status, weighted score, gaps,
+    uncovered rules, conflicts, and nuance notes. Use this when rules must
+    persist across long chats and related subplans.
+    """
+    _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
+    engine = _engine(info)
+
+    if items is not None:
+        from aismartbuddy.tools import validate_items
+
+        validate_items(
+            items,
+            required=["subject_id"],
+            tool="think_validate",
+        )
+        ids: list[str] = []
+        for i, item in enumerate(items):
+            parsed_assessments: list[ValidationAssessment] = []
+            for j, assessment in enumerate(item.get("assessments") or []):
+                _validate_enum(
+                    assessment["status"],
+                    _VALIDATION_STATUSES,
+                    f"items[{i}].assessments[{j}].status",
+                )
+                parsed_assessments.append(
+                    ValidationAssessment(
+                        rule_id=assessment["rule_id"],
+                        status=assessment["status"],
+                        note=assessment.get("note", "") or "",
+                        refs=list(assessment.get("refs") or []),
+                    )
+                )
+            vid = item.get("validation_id") or uuid.uuid4().hex[:10]
+            record = engine.validate_subject(
+                item["subject_id"],
+                item.get("subject_kind"),
+                parsed_assessments,
+                rule_profile_ids=item.get("rule_profile_ids"),
+                use_bound_profiles=item.get("use_bound_profiles", True),
+                validation_id=vid,
+                refs=item.get("refs"),
+                nuance_notes=item.get("nuance_notes"),
+            )
+            ids.append(record.id)
+            await _materialize_rule_graph(session_id, validation=record)
+        return (
+            f"Session: {info.session_id} | Validations: {len(ids)}\n"
+            f"IDs: {', '.join(ids)}\n"
+            "Status: validated"
+        )
+
+    if not subject_id:
+        raise ValueError("subject_id is required")
+    parsed_assessments = []
+    for i, assessment in enumerate(assessments or []):
+        _validate_enum(assessment["status"], _VALIDATION_STATUSES, f"assessments[{i}].status")
+        parsed_assessments.append(
+            ValidationAssessment(
+                rule_id=assessment["rule_id"],
+                status=assessment["status"],
+                note=assessment.get("note", "") or "",
+                refs=list(assessment.get("refs") or []),
+            )
+        )
+    record = engine.validate_subject(
+        subject_id,
+        subject_kind,
+        parsed_assessments,
+        rule_profile_ids=rule_profile_ids,
+        use_bound_profiles=use_bound_profiles,
+        validation_id=validation_id or uuid.uuid4().hex[:10],
+        refs=refs,
+        nuance_notes=nuance_notes,
+    )
+    await _materialize_rule_graph(session_id, validation=record)
+    lines = [
+        f"Session: {info.session_id} | Validation: {record.id}",
+        f"Subject: {record.subject_kind}:{record.subject_id}",
+        f"Hard gates: {'PASS' if record.passed_hard_gates else 'FAIL'}",
+        f"Weighted score: {record.weighted_score:.1f}",
+        (
+            "Hard failures: "
+            + (", ".join(record.hard_failures) if record.hard_failures else "(none)")
+        ),
+        (
+            "Uncovered rules: "
+            + (", ".join(record.uncovered_rules) if record.uncovered_rules else "(none)")
+        ),
+        (
+            "Conflicts: "
+            + (", ".join(record.conflicting_rules) if record.conflicting_rules else "(none)")
+        ),
+    ]
+    if record.weighted_gaps:
+        lines.append(
+            "Weighted gaps: "
+            + ", ".join(
+                f"{gap['rule_id']}[{gap['status']}]:{gap['weight']}"
+                for gap in record.weighted_gaps[:8]
+            )
+        )
+    if record.nuance_notes:
+        lines.append("Nuance: " + " | ".join(record.nuance_notes[:4]))
     return "\n".join(lines)
 
 
@@ -1604,41 +2283,49 @@ async def think_destroy_session(session_id: str) -> str:
 
 # ── Interference Protocol constants ──────────────────────────
 
-_IP_ACTIONS = frozenset({
-    "set_domain",
-    "add_frame",
-    "add_source",
-    "add_fragment",
-    "add_tension",
-    "crystallize",
-    "add_necessity",
-    "update_necessity",
-    "stress_test",
-    "finalize",
-    "recurse",
-})
+_IP_ACTIONS = frozenset(
+    {
+        "set_domain",
+        "add_frame",
+        "add_source",
+        "add_fragment",
+        "add_tension",
+        "crystallize",
+        "add_necessity",
+        "update_necessity",
+        "stress_test",
+        "finalize",
+        "recurse",
+    }
+)
 
-_IP_AUDIT_TYPES = frozenset({
-    "first_principles",
-    "ecosystem",
-    "contingency",
-    "failure_modes",
-})
+_IP_AUDIT_TYPES = frozenset(
+    {
+        "first_principles",
+        "ecosystem",
+        "contingency",
+        "failure_modes",
+    }
+)
 
-_IP_VERDICTS = frozenset({
-    "survives",
-    "dies",
-    "wounded",
-})
+_IP_VERDICTS = frozenset(
+    {
+        "survives",
+        "dies",
+        "wounded",
+    }
+)
 
 _IP_MIN_SOURCES = 2
 _IP_MIN_FRAGMENTS = 5
 
-_IP_NECESSITY_STATUSES = frozenset({
-    "untested",
-    "holds",
-    "fails",
-})
+_IP_NECESSITY_STATUSES = frozenset(
+    {
+        "untested",
+        "holds",
+        "fails",
+    }
+)
 
 # Phase gate: which phases allow which actions
 _IP_PHASE_GATES: dict[str, set[str]] = {
@@ -1687,9 +2374,7 @@ def _ip_status_output(
 ) -> str:
     """Build compact text output for interference protocol responses."""
     lines = [
-        (
-            f"Session: {session_id} | Protocol: {record.protocol_id}"
-        ),
+        (f"Session: {session_id} | Protocol: {record.protocol_id}"),
         (
             f"Phase: {record.phase} | Iter: {record.iteration}"
             f" | Domain: {record.target_domain or '(not set)'}"
@@ -1810,9 +2495,7 @@ async def think_interfere(
     """
     _validate_enum(action, _IP_ACTIONS, "action")
 
-    _, info = await anyio.to_thread.run_sync(
-        lambda: _get_or_create_think_session(session_id, ctx)
-    )
+    _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
     engine = _engine(info)
     sid = info.session_id
 
@@ -1823,11 +2506,30 @@ async def think_interfere(
     # @_synchronized engine calls safe.
     with engine.state_lock:
         return _think_interfere_locked(
-            engine, sid, action, protocol_id, target_domain, frame,
-            source_domain, law, isomorphism, fragment, tension_laws,
-            tension_description, name, properties, conclusion,
-            prerequisites, chain_index, prereq_index, new_status,
-            audit_type, audit_result, verdict, new_domain, concept_as_law,
+            engine,
+            sid,
+            action,
+            protocol_id,
+            target_domain,
+            frame,
+            source_domain,
+            law,
+            isomorphism,
+            fragment,
+            tension_laws,
+            tension_description,
+            name,
+            properties,
+            conclusion,
+            prerequisites,
+            chain_index,
+            prereq_index,
+            new_status,
+            audit_type,
+            audit_result,
+            verdict,
+            new_domain,
+            concept_as_law,
         )
 
 
@@ -1875,7 +2577,8 @@ def _think_interfere_locked(
         )
         engine.upsert_interference(record)
         return _ip_status_output(
-            sid, record,
+            sid,
+            record,
             f"Domain set: '{target_domain}'. Add suspended frames "
             "and at least 2 source laws from distant domains.",
         )
@@ -1883,8 +2586,7 @@ def _think_interfere_locked(
     # ── All other actions require protocol_id ────────────
     if not protocol_id:
         raise ValueError(
-            "protocol_id is required. Use action='set_domain' to "
-            "start a new protocol."
+            "protocol_id is required. Use action='set_domain' to start a new protocol."
         )
     record = engine.get_interference(protocol_id)
     if record is None:
@@ -1895,7 +2597,8 @@ def _think_interfere_locked(
     if allowed_phases and record.phase not in allowed_phases:
         valid = _IP_VALID_ACTIONS.get(record.phase, [])
         return _ip_status_output(
-            sid, record,
+            sid,
+            record,
             f"REJECTED: '{action}' not allowed in phase "
             f"'{record.phase}'. Valid actions: {', '.join(valid)}",
         )
@@ -1907,32 +2610,35 @@ def _think_interfere_locked(
         record.suspended_frames.append(frame)
         engine.upsert_interference(record)
         return _ip_status_output(
-            sid, record,
+            sid,
+            record,
             f"Frame suspended: '{frame[:80]}'",
         )
 
     # ── add_source ───────────────────────────────────────
     if action == "add_source":
         if not source_domain or not law or not isomorphism:
-            raise ValueError(
-                "source_domain, law, and isomorphism are all "
-                "required for add_source"
-            )
-        record.source_laws.append({
-            "domain": source_domain,
-            "law": law,
-            "isomorphism": isomorphism,
-        })
+            raise ValueError("source_domain, law, and isomorphism are all required for add_source")
+        record.source_laws.append(
+            {
+                "domain": source_domain,
+                "law": law,
+                "isomorphism": isomorphism,
+            }
+        )
         if len(record.source_laws) >= _IP_MIN_SOURCES:
             record.phase = "sources_ready"
         engine.upsert_interference(record)
         return _ip_status_output(
-            sid, record,
+            sid,
+            record,
             f"Source added: [{source_domain}] {law[:60]}. "
             f"Total: {len(record.source_laws)} sources"
-            + (f" (need {_IP_MIN_SOURCES}+, ready for fragments)"
-               if len(record.source_laws) >= _IP_MIN_SOURCES
-               else f" (need {_IP_MIN_SOURCES}+ to proceed)"),
+            + (
+                f" (need {_IP_MIN_SOURCES}+, ready for fragments)"
+                if len(record.source_laws) >= _IP_MIN_SOURCES
+                else f" (need {_IP_MIN_SOURCES}+ to proceed)"
+            ),
         )
 
     # ── add_fragment ─────────────────────────────────────
@@ -1946,50 +2652,46 @@ def _think_interfere_locked(
             record.phase = "saturated"
         engine.upsert_interference(record)
         return _ip_status_output(
-            sid, record,
+            sid,
+            record,
             f"Fragment {len(record.fragments)}/{_IP_MIN_FRAGMENTS}: "
             f"'{fragment[:60]}'"
-            + (" — saturated, ready to crystallize"
-               if record.phase == "saturated" else ""),
+            + (" — saturated, ready to crystallize" if record.phase == "saturated" else ""),
         )
 
     # ── add_tension ──────────────────────────────────────
     if action == "add_tension":
         if tension_laws is None or not tension_description:
-            raise ValueError(
-                "tension_laws and tension_description are "
-                "required for add_tension"
-            )
+            raise ValueError("tension_laws and tension_description are required for add_tension")
         for idx in tension_laws:
             if idx not in range(len(record.source_laws)):
                 raise ValueError(
                     f"tension_laws index {idx} out of range "
                     f"(have {len(record.source_laws)} sources)"
                 )
-        record.tensions.append({
-            "between": tension_laws,
-            "description": tension_description,
-        })
+        record.tensions.append(
+            {
+                "between": tension_laws,
+                "description": tension_description,
+            }
+        )
         engine.upsert_interference(record)
         return _ip_status_output(
-            sid, record,
-            f"Tension recorded between sources "
-            f"{tension_laws}: '{tension_description[:60]}'",
+            sid,
+            record,
+            f"Tension recorded between sources {tension_laws}: '{tension_description[:60]}'",
         )
 
     # ── crystallize ──────────────────────────────────────
     if action == "crystallize":
         if not name or not properties:
-            raise ValueError(
-                "name and properties are required for crystallize"
-            )
+            raise ValueError("name and properties are required for crystallize")
         # Emergence test
-        novel_props = [
-            p for p in properties if p.get("novel", False)
-        ]
+        novel_props = [p for p in properties if p.get("novel", False)]
         if len(novel_props) < 2:
             return _ip_status_output(
-                sid, record,
+                sid,
+                record,
                 f"REJECTED: Need at least 2 novel properties, "
                 f"got {len(novel_props)}. Mark properties as "
                 "novel=True if they require interference.",
@@ -2000,7 +2702,8 @@ def _think_interfere_locked(
             for idx in src_laws:
                 if idx not in range(len(record.source_laws)):
                     return _ip_status_output(
-                        sid, record,
+                        sid,
+                        record,
                         f"REJECTED: Property '{p_text}' "
                         f"references nonexistent source index "
                         f"{idx} (have {len(record.source_laws)} "
@@ -2008,7 +2711,8 @@ def _think_interfere_locked(
                     )
             if len(src_laws) < 2:
                 return _ip_status_output(
-                    sid, record,
+                    sid,
+                    record,
                     f"REJECTED: Novel property "
                     f"'{p_text}' traces to "
                     f"{len(src_laws)} source(s) — need 2+ for "
@@ -2019,7 +2723,8 @@ def _think_interfere_locked(
         record.phase = "crystallized"
         engine.upsert_interference(record)
         return _ip_status_output(
-            sid, record,
+            sid,
+            record,
             f"Crystallized: '{name}' with "
             f"{len(properties)} properties "
             f"({len(novel_props)} novel). "
@@ -2029,23 +2734,21 @@ def _think_interfere_locked(
     # ── add_necessity ────────────────────────────────────
     if action == "add_necessity":
         if not conclusion or not prerequisites:
-            raise ValueError(
-                "conclusion and prerequisites are required "
-                "for add_necessity"
-            )
+            raise ValueError("conclusion and prerequisites are required for add_necessity")
         for p in prerequisites:
             status = p.get("status", "untested")
-            _validate_enum(
-                status, _IP_NECESSITY_STATUSES, "prerequisite status"
-            )
-        record.necessity_chains.append({
-            "conclusion": conclusion,
-            "prerequisites": prerequisites,
-        })
+            _validate_enum(status, _IP_NECESSITY_STATUSES, "prerequisite status")
+        record.necessity_chains.append(
+            {
+                "conclusion": conclusion,
+                "prerequisites": prerequisites,
+            }
+        )
         record.phase = "necessities_derived"
         engine.upsert_interference(record)
         return _ip_status_output(
-            sid, record,
+            sid,
+            record,
             f"Necessity chain added: '{conclusion[:60]}' "
             f"with {len(prerequisites)} prerequisites. "
             f"Total chains: {len(record.necessity_chains)}",
@@ -2053,18 +2756,11 @@ def _think_interfere_locked(
 
     # ── update_necessity ─────────────────────────────────
     if action == "update_necessity":
-        if (
-            chain_index is None
-            or prereq_index is None
-            or not new_status
-        ):
+        if chain_index is None or prereq_index is None or not new_status:
             raise ValueError(
-                "chain_index, prereq_index, and new_status "
-                "are required for update_necessity"
+                "chain_index, prereq_index, and new_status are required for update_necessity"
             )
-        _validate_enum(
-            new_status, _IP_NECESSITY_STATUSES, "new_status"
-        )
+        _validate_enum(new_status, _IP_NECESSITY_STATUSES, "new_status")
         if chain_index not in range(len(record.necessity_chains)):
             raise ValueError(
                 f"chain_index {chain_index} out of range "
@@ -2074,35 +2770,30 @@ def _think_interfere_locked(
         prereqs = chain["prerequisites"]
         if prereq_index not in range(len(prereqs)):
             raise ValueError(
-                f"prereq_index {prereq_index} out of range "
-                f"(chain has {len(prereqs)} prerequisites)"
+                f"prereq_index {prereq_index} out of range (chain has {len(prereqs)} prerequisites)"
             )
         prereqs[prereq_index]["status"] = new_status
         engine.upsert_interference(record)
 
         # Check chain health
-        all_fail = all(
-            p.get("status") == "fails" for p in prereqs
-        )
+        all_fail = all(p.get("status") == "fails" for p in prereqs)
         health = " — CHAIN BROKEN (all prerequisites fail)" if all_fail else ""
         return _ip_status_output(
-            sid, record,
-            f"Updated chain {chain_index} prereq "
-            f"{prereq_index} → {new_status}{health}",
+            sid,
+            record,
+            f"Updated chain {chain_index} prereq {prereq_index} → {new_status}{health}",
         )
 
     # ── stress_test ──────────────────────────────────────
     if action == "stress_test":
         if not audit_type or not audit_result:
-            raise ValueError(
-                "audit_type and audit_result are required "
-                "for stress_test"
-            )
+            raise ValueError("audit_type and audit_result are required for stress_test")
         _validate_enum(audit_type, _IP_AUDIT_TYPES, "audit_type")
         record.audit_results[audit_type] = audit_result
         engine.upsert_interference(record)
         return _ip_status_output(
-            sid, record,
+            sid,
+            record,
             f"Audit recorded: {audit_type}. "
             f"Audits: {len(record.audit_results)}/4 "
             f"({', '.join(record.audit_results.keys())})",
@@ -2117,40 +2808,39 @@ def _think_interfere_locked(
         record.phase = "stress_tested"
         engine.upsert_interference(record)
         return _ip_status_output(
-            sid, record,
+            sid,
+            record,
             f"Verdict: {verdict}. "
             f"Concept '{record.emergent_name}' "
-            + ("survives stress testing. Ready to recurse or "
-               "export." if verdict == "survives"
-               else f"verdict={verdict}. Consider revising or "
-               "accepting limitations."),
+            + (
+                "survives stress testing. Ready to recurse or export."
+                if verdict == "survives"
+                else f"verdict={verdict}. Consider revising or accepting limitations."
+            ),
         )
 
     # ── recurse ──────────────────────────────────────────
     if action == "recurse":
         if not new_domain or not concept_as_law:
-            raise ValueError(
-                "new_domain and concept_as_law are required "
-                "for recurse"
-            )
+            raise ValueError("new_domain and concept_as_law are required for recurse")
         new_pid = uuid.uuid4().hex[:12]
         new_record = InterferenceRecord(
             protocol_id=new_pid,
             phase="domain_set",
             iteration=record.iteration + 1,
             target_domain=new_domain,
-            source_laws=[{
-                "domain": f"[emerged] {record.emergent_name}",
-                "law": concept_as_law,
-                "isomorphism": (
-                    f"Emergent concept from iteration "
-                    f"{record.iteration}"
-                ),
-            }],
+            source_laws=[
+                {
+                    "domain": f"[emerged] {record.emergent_name}",
+                    "law": concept_as_law,
+                    "isomorphism": (f"Emergent concept from iteration {record.iteration}"),
+                }
+            ],
         )
         engine.upsert_interference(new_record)
         return _ip_status_output(
-            sid, new_record,
+            sid,
+            new_record,
             f"Recursion: new protocol {new_pid} (iter "
             f"{new_record.iteration}) for domain "
             f"'{new_domain}'. Pre-loaded with concept "
@@ -2191,71 +2881,47 @@ async def think_interfere_state(
 
     lines = [
         f"Session: {session_id} | Protocol: {protocol_id}",
-        f"Phase: {record.phase} | Iter: {record.iteration}"
-        f" | Domain: {record.target_domain}",
+        f"Phase: {record.phase} | Iter: {record.iteration} | Domain: {record.target_domain}",
     ]
 
     if record.suspended_frames:
-        lines.append(
-            f"\n## Suspended Frames ({len(record.suspended_frames)})"
-        )
+        lines.append(f"\n## Suspended Frames ({len(record.suspended_frames)})")
         for i, f in enumerate(record.suspended_frames):
             lines.append(f"  {i}. {f}")
 
     if record.source_laws:
-        lines.append(
-            f"\n## Source Laws ({len(record.source_laws)})"
-        )
+        lines.append(f"\n## Source Laws ({len(record.source_laws)})")
         for i, s in enumerate(record.source_laws):
-            lines.append(
-                f"  {i}. [{s['domain']}] {s['law']}"
-            )
-            lines.append(
-                f"     Isomorphism: {s['isomorphism']}"
-            )
+            lines.append(f"  {i}. [{s['domain']}] {s['law']}")
+            lines.append(f"     Isomorphism: {s['isomorphism']}")
 
     if record.fragments:
-        lines.append(
-            f"\n## Fragments ({len(record.fragments)})"
-        )
+        lines.append(f"\n## Fragments ({len(record.fragments)})")
         for i, frag in enumerate(record.fragments):
             lines.append(f"  {i}. {frag[:120]}")
 
     if record.tensions:
-        lines.append(
-            f"\n## Tensions ({len(record.tensions)})"
-        )
+        lines.append(f"\n## Tensions ({len(record.tensions)})")
         for t in record.tensions:
-            lines.append(
-                f"  Between sources {t['between']}: "
-                f"{t['description'][:100]}"
-            )
+            lines.append(f"  Between sources {t['between']}: {t['description'][:100]}")
 
     if record.emergent_name:
         lines.append(f"\n## Emergent Concept: {record.emergent_name}")
         for i, p in enumerate(record.emergent_properties):
             novel = " [NOVEL]" if p.get("novel") else ""
             srcs = p.get("source_laws", [])
-            lines.append(
-                f"  {i}. {p['text'][:100]}{novel} (sources: {srcs})"
-            )
+            lines.append(f"  {i}. {p['text'][:100]}{novel} (sources: {srcs})")
 
     if record.necessity_chains:
-        lines.append(
-            f"\n## Necessity Chains ({len(record.necessity_chains)})"
-        )
+        lines.append(f"\n## Necessity Chains ({len(record.necessity_chains)})")
         for ci, chain in enumerate(record.necessity_chains):
             lines.append(f"  Chain {ci}: {chain['conclusion'][:80]}")
             for pi, prereq in enumerate(chain["prerequisites"]):
                 status = prereq.get("status", "untested")
-                lines.append(
-                    f"    {pi}. [{status}] {prereq['claim'][:80]}"
-                )
+                lines.append(f"    {pi}. [{status}] {prereq['claim'][:80]}")
 
     if record.audit_results:
-        lines.append(
-            f"\n## Audit Results ({len(record.audit_results)})"
-        )
+        lines.append(f"\n## Audit Results ({len(record.audit_results)})")
         for atype, aresult in record.audit_results.items():
             lines.append(f"  {atype}: {aresult[:120]}")
 

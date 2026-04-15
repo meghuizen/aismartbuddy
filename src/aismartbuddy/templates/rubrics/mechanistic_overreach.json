@@ -1,0 +1,14 @@
+{
+  "rubric_id": "mechanistic_overreach",
+  "description": "Checks whether an analysis overstates mechanism beyond the measured evidence.",
+  "dimensions": [
+    {"id": "direct_support", "description": "Major mechanistic claims map to direct measurements", "weight": 1.0, "required": true},
+    {"id": "alternative_models", "description": "Competing explanations are considered before committing", "weight": 0.9, "required": true},
+    {"id": "language_calibration", "description": "Uses hypothesis language where proof is absent", "weight": 1.0, "required": true},
+    {"id": "validation_path", "description": "Specifies experiments or assays needed to strengthen weak links", "weight": 0.8, "required": false}
+  ],
+  "severity_levels": ["critical", "high", "moderate", "low"],
+  "severity_deductions": {"critical": 3.0, "high": 2.0, "moderate": 1.0, "low": 0.5},
+  "pass_threshold": 8.0,
+  "scoring_strategy": "weighted_deduction"
+}

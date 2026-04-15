@@ -1,7 +1,7 @@
 """think_refs_query — find all records that reference a given entity_id.
 
 Lets the AI compose across tools by ID rather than text-search. Queries
-the `refs` list on ThoughtNode / HolonNode / EvaluationRecord.
+the `refs` list plus rule bindings / validations across the think backend.
 """
 
 from __future__ import annotations
@@ -38,19 +38,72 @@ async def think_refs_query(
 
     matches: dict[str, list[str]] = {
         "thought_nodes": [],
+        "models": [],
+        "decisions": [],
+        "inquiries": [],
+        "monitors": [],
         "holon_nodes": [],
         "evaluations": [],
+        "rule_profiles": [],
+        "rule_conflicts": [],
+        "validations": [],
     }
     with engine.state_lock:
         for nid, node in engine.thought_nodes.items():
-            if entity_id in node.refs:
+            if entity_id in node.refs or engine._subject_rule_refs(node.rule_bindings, entity_id):
                 matches["thought_nodes"].append(nid)
+        for model in engine.models:
+            if entity_id in model.refs or engine._subject_rule_refs(model.rule_bindings, entity_id):
+                matches["models"].append(model.record_id or f"(anon:{model.model_name})")
+        for did, decision in engine.decisions.items():
+            if entity_id in decision.refs or engine._subject_rule_refs(
+                decision.rule_bindings, entity_id
+            ):
+                matches["decisions"].append(did)
+        for iid, inquiry in engine.inquiries.items():
+            if entity_id in inquiry.refs or engine._subject_rule_refs(
+                inquiry.rule_bindings, entity_id
+            ):
+                matches["inquiries"].append(iid)
+        for mid, monitor in engine.monitors.items():
+            if entity_id in monitor.refs or engine._subject_rule_refs(
+                monitor.rule_bindings, entity_id
+            ):
+                matches["monitors"].append(mid)
         for hid, holon in engine.holon_nodes.items():
-            if entity_id in holon.refs:
+            if entity_id in holon.refs or engine._subject_rule_refs(holon.rule_bindings, entity_id):
                 matches["holon_nodes"].append(hid)
         for eid, ev in engine.evaluations.items():
-            if entity_id in ev.refs:
+            if entity_id in ev.refs or engine._subject_rule_refs(ev.rule_bindings, entity_id):
                 matches["evaluations"].append(eid)
+        for pid, profile in engine.rule_profiles.items():
+            if (
+                entity_id == pid
+                or entity_id in profile.refs
+                or any(entity_id in {rule.id, *rule.refs} for rule in profile.rules)
+            ):
+                matches["rule_profiles"].append(pid)
+        for cid, conflict in engine.rule_conflicts.items():
+            if (
+                entity_id == cid
+                or entity_id in conflict.rule_ids
+                or entity_id in conflict.profile_ids
+            ):
+                matches["rule_conflicts"].append(cid)
+        for vid, validation in engine.validations.items():
+            if (
+                entity_id == vid
+                or entity_id == validation.subject_id
+                or entity_id in validation.refs
+                or entity_id in validation.uncovered_rules
+                or entity_id in validation.hard_failures
+                or entity_id in validation.conflicting_rules
+                or engine._subject_rule_refs(validation.rule_bindings, entity_id)
+                or any(
+                    entity_id == a.rule_id or entity_id in a.refs for a in validation.assessments
+                )
+            ):
+                matches["validations"].append(vid)
 
     total = sum(len(v) for v in matches.values())
     parts = [

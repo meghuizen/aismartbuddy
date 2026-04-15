@@ -142,6 +142,7 @@ mcp = FastMCP(SERVER_NAME, **_mcp_kwargs)
 # Tool registration
 # ──────────────────────────────────────────────
 
+from aismartbuddy.tools.brainstorm import brainstorm  # noqa: E402
 from aismartbuddy.tools.graph import (  # noqa: E402
     graph_analyze,
     graph_compare,
@@ -149,6 +150,7 @@ from aismartbuddy.tools.graph import (  # noqa: E402
     graph_cross_reference,
     graph_destroy_session,
     graph_find_connections,
+    graph_focus_summary,
     graph_import,
     graph_knowledge_add,
     graph_knowledge_infer,
@@ -174,7 +176,6 @@ from aismartbuddy.tools.infra import (  # noqa: E402
 )
 from aismartbuddy.tools.iterate import iterate  # noqa: E402
 from aismartbuddy.tools.meta import suggest_database  # noqa: E402
-from aismartbuddy.tools.refs import think_refs_query  # noqa: E402
 from aismartbuddy.tools.reasoning_v2 import (  # noqa: E402
     argue,
     compare_models,
@@ -196,7 +197,7 @@ from aismartbuddy.tools.reasoning_v2 import (  # noqa: E402
     test_interventions,
     workflow_validate,
 )
-from aismartbuddy.tools.brainstorm import brainstorm  # noqa: E402
+from aismartbuddy.tools.refs import think_refs_query  # noqa: E402
 from aismartbuddy.tools.score import (  # noqa: E402
     rubric_templates,
     score_evaluate,
@@ -226,8 +227,10 @@ from aismartbuddy.tools.think import (  # noqa: E402
     think_interfere_state,
     think_model,
     think_monitor,
+    think_rules,
     think_science,
     think_summarize,
+    think_validate,
 )
 from aismartbuddy.tools.youtube import get_youtube_information  # noqa: E402
 
@@ -260,100 +263,142 @@ _DESTRUCTIVE = {
     "openWorldHint": False,
 }
 
+
 # (function, name, title, annotations)
-_TOOLS: list[tuple] = [
-    (sql_create_session, "sql_create_session", "Create SQL Session", _DEFAULT),
-    (sql_query, "sql_query", "Execute SQL Query", _DEFAULT),
-    (sql_query_next, "sql_query_next", "Next Page of SQL Results", _READONLY),
-    (sql_import, "sql_import", "Import Data into SQL Table", _DEFAULT),
-    (sql_import_batch, "sql_import_batch", "Import Multiple Data Chunks into SQL Table", _DEFAULT),
-    (sql_schema, "sql_schema", "Get SQL Database Schema", _READONLY),
-    (data_profile, "data_profile", "Statistical Data Profile (EXPLORE)", _READONLY),
-    (data_anomalies, "data_anomalies", "Detect Statistical Anomalies (EXPLORE)", _READONLY),
-    (sql_destroy_session, "sql_destroy_session", "Destroy SQL Session", _DESTRUCTIVE),
-    (graph_create_session, "graph_create_session", "Create Graph Session", _DEFAULT),
-    (graph_query, "graph_query", "Execute Cypher Query", _DEFAULT),
-    (graph_query_next, "graph_query_next", "Next Page of Graph Results", _READONLY),
-    (graph_import, "graph_import", "Import Data into Graph", _DEFAULT),
-    (graph_schema, "graph_schema", "Get Graph Database Schema", _READONLY),
-    (graph_destroy_session, "graph_destroy_session", "Destroy Graph Session", _DESTRUCTIVE),
-    (graph_statistics, "graph_statistics", "Graph Overview and Statistics", _READONLY),
-    (graph_neighbors, "graph_neighbors", "Explore Node Neighborhood", _READONLY),
-    (graph_find_connections, "graph_find_connections", "Find Paths Between Nodes", _READONLY),
-    (graph_analyze, "graph_analyze", "Run Graph Analytics", _READONLY),
-    (graph_compare, "graph_compare", "Compare Two Graphs", _READONLY),
-    (graph_cross_reference, "graph_cross_reference", "Cross-Reference Graph Nodes", _READONLY),
-    (graph_knowledge_add, "graph_knowledge_add", "Add Knowledge Entity", _DEFAULT),
-    (graph_knowledge_relate, "graph_knowledge_relate", "Add Knowledge Relationship", _DEFAULT),
-    (knowledge_batch, "knowledge_batch", "Bulk Add Knowledge Nodes and Relations", _DEFAULT),
-    (graph_knowledge_infer, "graph_knowledge_infer", "Run Knowledge Inference", _READONLY),
-    (graph_knowledge_summary, "graph_knowledge_summary", "Knowledge Graph Summary", _READONLY),
-    (suggest_database, "suggest_database", "Suggest SQL or Graph Database", _READONLY),
-    # Unified multi-backend sessions (facade over single-backend children).
-    # Required for auto_graph (which materialises items[] into KnowledgeNode
-    # rows when both think + graph backends are present).
-    (session_create, "session_create", "Create Unified Multi-Backend Session", _DEFAULT),
-    (session_destroy, "session_destroy", "Destroy Unified Session", _DESTRUCTIVE),
-    (
-        get_youtube_information,
-        "get_youtube_information",
-        "Get YouTube Video Information",
-        _READONLY_OPEN,
-    ),
-    # Primary thinking surface
-    (think_create_session, "think_create_session", "Create Thinking Session", _DEFAULT),
-    (think_destroy_session, "think_destroy_session", "Destroy Thinking Session", _DESTRUCTIVE),
-    (think_graph, "think_graph", "Thought Graph", _DEFAULT),
-    (think_graph_delegate, "think_graph_delegate", "Thought Graph Delegation", _DEFAULT),
-    (think_decide, "think_decide", "Decision Framework", _DEFAULT),
-    (think_model, "think_model", "Mental Model Analysis", _DEFAULT),
-    (think_debug, "think_debug", "Systematic Debugging", _DEFAULT),
-    (think_argue, "think_argue", "Structured Argumentation", _DEFAULT),
-    (think_science, "think_science", "Scientific Method Inquiry", _DEFAULT),
-    (think_monitor, "think_monitor", "Knowledge Boundary Assessment", _DEFAULT),
-    (think_summarize, "think_summarize", "Summarize Thinking Session", _READONLY),
-    (think_interfere, "think_interfere", "Interference Protocol", _DEFAULT),
-    (think_interfere_state, "think_interfere_state", "Interference Protocol State", _READONLY),
-    (think_refs_query, "think_refs_query", "Find Cross-References by Entity ID", _READONLY),
-    # V2 reasoning surface
-    (scaffold, "scaffold", "Scaffold Structured Analysis", _DEFAULT),
-    (hypothesize, "hypothesize", "Generate Structured Hypotheses", _DEFAULT),
-    (argue, "argue", "Structured Argument Chain", _DEFAULT),
-    (self_assess, "self_assess", "Knowledge Boundary Assessment", _DEFAULT),
-    (brainstorm, "brainstorm", "Brainstorm (DIVERGE)", _DEFAULT),
-    (iterate, "iterate", "Iterate (ITERATE)", _DEFAULT),
-    (reason_graph, "reason_graph", "Reason Graph", _DEFAULT),
-    (model_system, "model_system", "Model Multi-Scale System", _DEFAULT),
-    (mine_patterns, "mine_patterns", "Mine Structured Patterns", _DEFAULT),
-    (test_interventions, "test_interventions", "Test Interventions", _DEFAULT),
-    (compare_models, "compare_models", "Compare Models", _DEFAULT),
-    (reason_trace, "reason_trace", "Grounded Reason Trace", _DEFAULT),
-    (synthesize_conclusion, "synthesize_conclusion", "Synthesize Grounded Conclusion", _DEFAULT),
-    (reason_index, "reason_index", "Reason Artifact Index", _READONLY),
-    (reason_get, "reason_get", "Get Reason Artifact", _READONLY),
-    (reason_refs, "reason_refs", "Find Reason References", _READONLY),
-    (extract_findings_from_sql, "extract_findings_from_sql", "Extract Findings From SQL", _DEFAULT),
-    (
-        extract_findings_from_graph,
-        "extract_findings_from_graph",
-        "Extract Findings From Graph",
-        _DEFAULT,
-    ),
-    (session_resume, "session_resume", "Resume Structured Reasoning Session", _READONLY),
-    (session_export, "session_export", "Export Structured Reasoning Session", _READONLY),
-    (workflow_validate, "workflow_validate", "Validate Workflow Coverage", _READONLY),
-    # Holonic workspace (multi-level domain modeling)
-    (holon_create, "holon_create", "Create Holon", _DEFAULT),
-    (holon_update, "holon_update", "Update Holon", _DEFAULT),
-    (holon_view, "holon_view", "Navigate Holarchy", _READONLY),
-    (holon_analyze, "holon_analyze", "Analyze Holarchy", _DEFAULT),
-    (holon_query, "holon_query", "Query Holarchy", _READONLY),
-    # Scoring (mechanical evaluation with rubrics)
-    (score_rubric, "score_rubric", "Scoring Rubric", _DEFAULT),
-    (score_evaluate, "score_evaluate", "Evaluate with Score", _DEFAULT),
-    (score_gate, "score_gate", "Scoring Gate Check", _READONLY),
-    (rubric_templates, "rubric_templates", "List/Load Pre-built Rubrics", _DEFAULT),
-]
+def _build_tool_specs(expose_legacy_reasoning_tools: bool | None = None) -> list[tuple]:
+    expose_legacy = (
+        cfg.runtime_config.expose_legacy_reasoning_tools
+        if expose_legacy_reasoning_tools is None
+        else expose_legacy_reasoning_tools
+    )
+    tools: list[tuple] = [
+        (sql_create_session, "sql_create_session", "Create SQL Session", _DEFAULT),
+        (sql_query, "sql_query", "Execute SQL Query", _DEFAULT),
+        (sql_query_next, "sql_query_next", "Next Page of SQL Results", _READONLY),
+        (sql_import, "sql_import", "Import Data into SQL Table", _DEFAULT),
+        (
+            sql_import_batch,
+            "sql_import_batch",
+            "Import Multiple Data Chunks into SQL Table",
+            _DEFAULT,
+        ),
+        (sql_schema, "sql_schema", "Get SQL Database Schema", _READONLY),
+        (data_profile, "data_profile", "Statistical Data Profile (EXPLORE)", _READONLY),
+        (data_anomalies, "data_anomalies", "Detect Statistical Anomalies (EXPLORE)", _READONLY),
+        (sql_destroy_session, "sql_destroy_session", "Destroy SQL Session", _DESTRUCTIVE),
+        (graph_create_session, "graph_create_session", "Create Graph Session", _DEFAULT),
+        (graph_query, "graph_query", "Execute Cypher Query", _DEFAULT),
+        (graph_query_next, "graph_query_next", "Next Page of Graph Results", _READONLY),
+        (graph_import, "graph_import", "Import Data into Graph", _DEFAULT),
+        (graph_schema, "graph_schema", "Get Graph Database Schema", _READONLY),
+        (graph_destroy_session, "graph_destroy_session", "Destroy Graph Session", _DESTRUCTIVE),
+        (graph_statistics, "graph_statistics", "Graph Overview and Statistics", _READONLY),
+        (graph_neighbors, "graph_neighbors", "Explore Node Neighborhood", _READONLY),
+        (
+            graph_focus_summary,
+            "graph_focus_summary",
+            "Summarize Multiple Graph Neighborhoods",
+            _READONLY,
+        ),
+        (graph_find_connections, "graph_find_connections", "Find Paths Between Nodes", _READONLY),
+        (graph_analyze, "graph_analyze", "Run Graph Analytics", _READONLY),
+        (graph_compare, "graph_compare", "Compare Two Graphs", _READONLY),
+        (graph_cross_reference, "graph_cross_reference", "Cross-Reference Graph Nodes", _READONLY),
+        (graph_knowledge_add, "graph_knowledge_add", "Add Knowledge Entity", _DEFAULT),
+        (graph_knowledge_relate, "graph_knowledge_relate", "Add Knowledge Relationship", _DEFAULT),
+        (knowledge_batch, "knowledge_batch", "Bulk Add Knowledge Nodes and Relations", _DEFAULT),
+        (graph_knowledge_infer, "graph_knowledge_infer", "Run Knowledge Inference", _READONLY),
+        (graph_knowledge_summary, "graph_knowledge_summary", "Knowledge Graph Summary", _READONLY),
+        (suggest_database, "suggest_database", "Suggest SQL or Graph Database", _READONLY),
+        (session_create, "session_create", "Create Unified Multi-Backend Session", _DEFAULT),
+        (session_destroy, "session_destroy", "Destroy Unified Session", _DESTRUCTIVE),
+        (
+            get_youtube_information,
+            "get_youtube_information",
+            "Get YouTube Video Information",
+            _READONLY_OPEN,
+        ),
+        (think_create_session, "think_create_session", "Create Thinking Session", _DEFAULT),
+        (think_destroy_session, "think_destroy_session", "Destroy Thinking Session", _DESTRUCTIVE),
+        (think_graph, "think_graph", "Thought Graph", _DEFAULT),
+        (think_graph_delegate, "think_graph_delegate", "Thought Graph Delegation", _DEFAULT),
+        (think_decide, "think_decide", "Decision Framework", _DEFAULT),
+        (think_model, "think_model", "Mental Model Analysis", _DEFAULT),
+        (think_rules, "think_rules", "Manage Weighted Rule Profiles", _DEFAULT),
+        (think_validate, "think_validate", "Validate Against Rule Profiles", _DEFAULT),
+        (think_debug, "think_debug", "Systematic Debugging", _DEFAULT),
+        (think_argue, "think_argue", "Structured Argumentation", _DEFAULT),
+        (think_science, "think_science", "Scientific Method Inquiry", _DEFAULT),
+        (think_monitor, "think_monitor", "Knowledge Boundary Assessment", _DEFAULT),
+        (think_summarize, "think_summarize", "Summarize Thinking Session", _READONLY),
+        (think_interfere, "think_interfere", "Interference Protocol", _DEFAULT),
+        (think_interfere_state, "think_interfere_state", "Interference Protocol State", _READONLY),
+        (think_refs_query, "think_refs_query", "Find Cross-References by Entity ID", _READONLY),
+        (brainstorm, "brainstorm", "Brainstorm (DIVERGE)", _DEFAULT),
+        (iterate, "iterate", "Iterate (ITERATE)", _DEFAULT),
+        (
+            extract_findings_from_sql,
+            "extract_findings_from_sql",
+            "Extract Findings From SQL",
+            _DEFAULT,
+        ),
+        (
+            extract_findings_from_graph,
+            "extract_findings_from_graph",
+            "Extract Findings From Graph",
+            _DEFAULT,
+        ),
+        (holon_create, "holon_create", "Create Holon", _DEFAULT),
+        (holon_update, "holon_update", "Update Holon", _DEFAULT),
+        (holon_view, "holon_view", "Navigate Holarchy", _READONLY),
+        (holon_analyze, "holon_analyze", "Analyze Holarchy", _DEFAULT),
+        (holon_query, "holon_query", "Query Holarchy", _READONLY),
+        (score_rubric, "score_rubric", "Scoring Rubric", _DEFAULT),
+        (score_evaluate, "score_evaluate", "Evaluate with Score", _DEFAULT),
+        (score_gate, "score_gate", "Scoring Gate Check", _READONLY),
+        (rubric_templates, "rubric_templates", "List/Load Pre-built Rubrics", _DEFAULT),
+    ]
+    if expose_legacy:
+        tools.extend(
+            [
+                (scaffold, "scaffold", "Scaffold Structured Analysis", _DEFAULT),
+                (hypothesize, "hypothesize", "Generate Structured Hypotheses", _DEFAULT),
+                (argue, "argue", "Structured Argument Chain", _DEFAULT),
+                (self_assess, "self_assess", "Knowledge Boundary Assessment", _DEFAULT),
+                (reason_graph, "reason_graph", "Reason Graph", _DEFAULT),
+                (model_system, "model_system", "Model Multi-Scale System", _DEFAULT),
+                (mine_patterns, "mine_patterns", "Mine Structured Patterns", _DEFAULT),
+                (test_interventions, "test_interventions", "Test Interventions", _DEFAULT),
+                (compare_models, "compare_models", "Compare Models", _DEFAULT),
+                (reason_trace, "reason_trace", "Grounded Reason Trace", _DEFAULT),
+                (
+                    synthesize_conclusion,
+                    "synthesize_conclusion",
+                    "Synthesize Grounded Conclusion",
+                    _DEFAULT,
+                ),
+                (reason_index, "reason_index", "Reason Artifact Index", _READONLY),
+                (reason_get, "reason_get", "Get Reason Artifact", _READONLY),
+                (reason_refs, "reason_refs", "Find Reason References", _READONLY),
+                (
+                    session_resume,
+                    "session_resume",
+                    "Resume Structured Reasoning Session",
+                    _READONLY,
+                ),
+                (
+                    session_export,
+                    "session_export",
+                    "Export Structured Reasoning Session",
+                    _READONLY,
+                ),
+                (workflow_validate, "workflow_validate", "Validate Workflow Coverage", _READONLY),
+            ]
+        )
+    return tools
+
+
+_TOOLS = _build_tool_specs()
 
 for func, name, title, annot in _TOOLS:
     mcp.tool(name=name, annotations={"title": title, **annot})(func)
@@ -393,6 +438,7 @@ connected data, pattern matching.
 ### Analytics Tools
 - graph_statistics(session_id) → full graph overview in one call
 - graph_neighbors(session_id, name, type, depth) → N-hop neighborhood
+- graph_focus_summary(session_id, [name1, name2], type, depth) → batch neighborhood summary
 - graph_find_connections(session_id, from, type, to, type) → all paths
 - graph_analyze(session_id, "hubs"|"orphans"|"categories"|"cross_connections")
 
@@ -430,20 +476,32 @@ Primary surface for analysis:
 - think_create_session(project_id="analysis") → standalone think session
 - session_create(backends=["think","graph","sql"], mode="analyze") → parent session
 - think_model(items=[...]) → structured scaffold with a named mental model
+- think_rules(...) → create weighted hard/soft rule profiles and bind them to plans
+- think_validate(...) → validate a thought/model/decision/holon/evaluation against bound rules
 - think_science(items=[...]) → observation/question/hypothesis/experiment chain
 - think_decide(items=[...]) → explicit options/criteria/recommendation
 - think_graph(...) → concise thought graph nodes; branch instead of writing essays
 - think_argue(chain=[...]) → thesis/antithesis/synthesis chains
 - think_monitor(items=[...]) → last-step calibration of claims and limitations
+- score_evaluate(..., use_bound_profiles=true) → carry rule validation into scoring finalization
 - think_interfere(...) → structured novelty generation via interference protocol
 - think_refs_query(entity_id, session_id) → find records that cite an entity id
 - think_summarize(session_id) → token-optimized summary of the session
 
-Legacy V2 reasoning tools are still available for compatibility:
-- scaffold / hypothesize / self_assess / reason_graph / model_system
-- mine_patterns / test_interventions / compare_models / reason_trace
-- synthesize_conclusion / reason_index / reason_get / reason_refs
-- session_resume / workflow_validate
+Migration map for older reasoning concepts:
+- scaffold → think_model
+- hypothesize → think_science
+- self_assess → think_monitor
+- reason_graph → think_graph
+- extract_findings_from_sql / extract_findings_from_graph stay public as bridge tools
+
+Recommended analysis flow for assay-heavy domains:
+- sql_import / sql_import_batch using one of the supported table formats
+- data_profile / data_anomalies before narrative reasoning
+- extract_findings_from_sql for reusable, addressable findings
+- think_model(items=[...]) to separate measured signal from inferred mechanism
+- think_science(items=[...]) to force competing explanations and falsification tests
+- think_monitor(items=[...]) to record tissue/assay/confounder limits before conclusions
 
 ### Explore / Diverge / Iterate
 - data_profile(session_id, table) → profile tabular data first
@@ -479,11 +537,20 @@ Holons can participate in multiple holarchies simultaneously.
 Separate AI judgment from scoring. AI submits findings; server computes scores.
 - score_rubric(action="create", rubric_id, dimensions, ...) → define scoring framework
 - score_rubric(action="list") → show rubrics
-- score_evaluate(action="start", rubric_id, context) → begin evaluation
-- score_evaluate(action="finding", evaluation_id, dimension, severity, ...) → submit finding
+- score_evaluate(action="start", session_id, rubric_id, context) → begin evaluation
+- score_evaluate(action="start_with_rubric", session_id, rubric_id, dimensions, context)
+  → create rubric + start in one call
+- score_evaluate(action="finding", evaluation_id, dimension, severity, ...)
+  → submit one scored finding
+- score_evaluate(action="batch_findings", evaluation_id, findings=[...])
+  → sequential batch scoring in one call
+- score_evaluate(action="review", evaluation_id)
+  → current score, coverage, recent findings, open dimensions
+- score_evaluate(action="note", evaluation_id, dimension, severity, description)
+  → lightweight finding stub
 - score_evaluate(action="finalize", evaluation_id, summary) → close + verdict
 - score_gate(action="gate", evaluation_id) → pass/fail check (for hooks)
-- score_gate(action="list", rubric_id) → evaluation history
+- score_gate(action="list", session_id, rubric_id) → evaluation history
 
 ## When to Use Each Tool (Methodology)
 
@@ -511,7 +578,9 @@ Separate AI judgment from scoring. AI submits findings; server computes scores.
 
 ### Cross-referencing:
 All reasoning tools accept refs/connects_to so artifacts stay linked.
-Example: a thought can reference a scaffold item id, then think_refs_query can retrieve the backlinks.
+Example: a thought can reference a scaffold item id,
+then think_refs_query can retrieve the backlinks.
+Scoring actions also accept analysis_refs so findings can cite think_* or extracted-finding ids.
 
 ## Token Efficiency
 SQL results default to CSV format (2-3x fewer tokens than JSON).
@@ -552,6 +621,11 @@ sql_import supports: csv, tsv, txt, json, jsonl, parquet
 - JSON: array of objects [{"col": "val"}, ...]
 - JSONL: one JSON object per line
 - Parquet: base64-encoded binary data
+- Reusable input shapes:
+  - entity-score table: entity,score,direction,panel,source
+  - differential table: feature,log2fc,pvalue,padj
+  - ranked list: entity,rank,metric,source
+  - wide matrix: feature,sample_a,sample_b,...
 
 ### Multi-chunk import
 sql_import_batch(session_id, "table", [chunk1, chunk2, ...])
@@ -610,6 +684,7 @@ MATCH (g:Gene) RETURN g.system,
 ### Quick Analytics (use these tools instead of raw Cypher)
 - graph_statistics(session_id) → full overview in 1 call
 - graph_neighbors(session_id, "IL6", "Gene", depth=2) → neighborhood
+- graph_focus_summary(session_id, ["IL6", "TNF"], "Gene", depth=2) → batch focus summary
 - graph_find_connections(session_id, "AVP", "Gene", "IL6", "Gene")
 - graph_analyze(session_id, "hubs") → most connected nodes
 - graph_analyze(session_id, "orphans") → disconnected nodes
@@ -722,7 +797,10 @@ graph_import(session_id, "Follows",
 - CSV is the most token-efficient format for bulk tabular data
 - Use sql_import_batch when data is split across sources
 - For large datasets, import CSV instead of many INSERT statements
-- Parquet is best for preserving exact types (numeric precision, dates)"""
+- Parquet is best for preserving exact types (numeric precision, dates)
+- Preferred workflow:
+  import → data_profile → data_anomalies → extract_findings_from_sql
+  → think_model / think_science"""
 
 
 # ──────────────────────────────────────────────

@@ -25,7 +25,9 @@ from aismartbuddy.tools import size_guarded
 from aismartbuddy.tools.think import (
     _engine,
     _get_or_create_think_session,
+    _materialize_subject_rule_bindings,
     _require_think_session,
+    _rule_bindings_from_profile_ids,
     _validate_enum,
 )
 
@@ -46,61 +48,71 @@ def _trunc_long(s: str) -> str:
 
 # ── Validation constants ─────────────────────────────────────
 
-_HOLON_UPDATE_ACTIONS = frozenset({
-    "context",
-    "rules",
-    "description",
-    "properties",
-    "projection",
-    "join_holarchy",
-    "add_lens",
-})
+_HOLON_UPDATE_ACTIONS = frozenset(
+    {
+        "context",
+        "rules",
+        "description",
+        "properties",
+        "projection",
+        "join_holarchy",
+        "add_lens",
+    }
+)
 
-_HOLON_VIEW_ACTIONS = frozenset({
-    "zoom_in",
-    "zoom_out",
-    "sideways",
-    "cross_level",
-    "memberships",
-})
+_HOLON_VIEW_ACTIONS = frozenset(
+    {
+        "zoom_in",
+        "zoom_out",
+        "sideways",
+        "cross_level",
+        "memberships",
+    }
+)
 
-_HOLON_ANALYZE_ACTIONS = frozenset({
-    "tensions",
-    "emergence",
-    "propagate_up",
-    "propagate_down",
-    "coherence",
-    "bridge",
-    "lens",
-    "feedback_loops",
-    "leverage_points",
-})
+_HOLON_ANALYZE_ACTIONS = frozenset(
+    {
+        "tensions",
+        "emergence",
+        "propagate_up",
+        "propagate_down",
+        "coherence",
+        "bridge",
+        "lens",
+        "feedback_loops",
+        "leverage_points",
+    }
+)
 
-_PROPAGATION_UP_TYPES = frozenset({
-    "inform",
-    "constrain",
-    "transform",
-})
+_PROPAGATION_UP_TYPES = frozenset(
+    {
+        "inform",
+        "constrain",
+        "transform",
+    }
+)
 
-_PROPAGATION_DOWN_TYPES = frozenset({
-    "constrain",
-    "enable",
-    "restructure",
-})
+_PROPAGATION_DOWN_TYPES = frozenset(
+    {
+        "constrain",
+        "enable",
+        "restructure",
+    }
+)
 
-_HOLON_QUERY_RESOLUTIONS = frozenset({
-    "local",
-    "subtree",
-    "holarchy",
-})
+_HOLON_QUERY_RESOLUTIONS = frozenset(
+    {
+        "local",
+        "subtree",
+        "holarchy",
+    }
+)
 
 
 # ── Helpers ──────────────────────────────────────────────────
 
 
-def _get_membership(
-    node: HolonNode, holarchy_id: str
-) -> dict | None:
+def _get_membership(node: HolonNode, holarchy_id: str) -> dict | None:
     """Find a specific membership entry on a holon."""
     for m in node.memberships:
         if m["holarchy_id"] == holarchy_id:
@@ -108,16 +120,11 @@ def _get_membership(
     return None
 
 
-def _resolve_holarchy(
-    node: HolonNode, holarchy_id: str | None
-) -> str | None:
+def _resolve_holarchy(node: HolonNode, holarchy_id: str | None) -> str | None:
     """Resolve which holarchy to use. If None and only one membership, use it."""
     if holarchy_id:
         if _get_membership(node, holarchy_id) is None:
-            raise ValueError(
-                f"Holon '{node.id}' has no membership "
-                f"in holarchy '{holarchy_id}'"
-            )
+            raise ValueError(f"Holon '{node.id}' has no membership in holarchy '{holarchy_id}'")
         return holarchy_id
     if len(node.memberships) == 1:
         return node.memberships[0]["holarchy_id"]
@@ -155,6 +162,7 @@ async def holon_create(
     properties: list[str] | None = None,
     projection: str = "",
     holons: list[dict] | None = None,
+    rule_profile_ids: list[str] | None = None,
     ctx: _MCPContext | None = None,
 ) -> str:
     """Create a holon — an entity that is both a whole and a part.
@@ -191,9 +199,7 @@ async def holon_create(
         Single mode: compact status with holon position.
         Batch mode: ref→id mapping for all created holons.
     """
-    _, info = await anyio.to_thread.run_sync(
-        lambda: _get_or_create_think_session(session_id, ctx)
-    )
+    _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
     engine = _engine(info)
     sid = info.session_id
 
@@ -203,11 +209,25 @@ async def holon_create(
             raise ValueError("holons batch must be non-empty")
         default_hid = holarchy_id or uuid.uuid4().hex[:10]
         ref_to_id = engine.add_holons_batch(holons, default_hid)
+        if rule_profile_ids:
+            bindings = _rule_bindings_from_profile_ids(engine, rule_profile_ids)
+            for holon_ref, holon_id in ref_to_id.items():
+                engine.bind_rule_profiles(holon_id, "holon", bindings)
+                await _materialize_subject_rule_bindings(
+                    engine,
+                    session_id,
+                    subject_kind="holon",
+                    subject_id=holon_id,
+                    subject_label=next(
+                        (item["name"] for item in holons if item["ref"] == holon_ref),
+                        holon_id,
+                    ),
+                    bindings=bindings,
+                    source="holon_create",
+                )
         # Discover holarchies actually created
         hids_used: set[str] = set()
-        for hid_val in [
-            item.get("holarchy_id") or default_hid for item in holons
-        ]:
+        for hid_val in [item.get("holarchy_id") or default_hid for item in holons]:
             hids_used.add(hid_val)
         ref_lines = ", ".join(f"{r}={i}" for r, i in ref_to_id.items())
         return (
@@ -235,9 +255,7 @@ async def holon_create(
             if parent.memberships:
                 hid = parent.memberships[0]["holarchy_id"]
             else:
-                raise ValueError(
-                    "Parent has no memberships — specify holarchy_id"
-                )
+                raise ValueError("Parent has no memberships — specify holarchy_id")
         # Derive level from parent's level in this holarchy
         pm = _get_membership(parent, hid)
         if pm:
@@ -250,15 +268,27 @@ async def holon_create(
         context=context,
         rules=rules or [],
         properties=properties or [],
-        memberships=[{
-            "holarchy_id": hid,
-            "parent_id": parent_id,
-            "role_in_parent": role_in_parent,
-            "level": level,
-        }],
+        rule_bindings=_rule_bindings_from_profile_ids(engine, rule_profile_ids),
+        memberships=[
+            {
+                "holarchy_id": hid,
+                "parent_id": parent_id,
+                "role_in_parent": role_in_parent,
+                "level": level,
+            }
+        ],
         projections={hid: projection} if projection else {},
     )
     engine.add_holon(node)
+    await _materialize_subject_rule_bindings(
+        engine,
+        session_id,
+        subject_kind="holon",
+        subject_id=nid,
+        subject_label=name,
+        bindings=node.rule_bindings,
+        source="holon_create",
+    )
 
     parent_name = ""
     if parent_id:
@@ -291,6 +321,7 @@ async def holon_update(
     projection: str | None = None,
     lens_name: str | None = None,
     lens_findings: str | None = None,
+    rule_profile_ids: list[str] | None = None,
 ) -> str:
     """Update a holon's state, join a holarchy, or add an analytical lens.
 
@@ -337,11 +368,35 @@ async def holon_update(
         if node is None:
             raise ValueError(f"Holon '{holon_id}' not found")
 
-        return _holon_update_locked(
-            engine, info, node, holon_id, action, content, rules, properties,
-            holarchy_id, parent_id, role_in_parent, projection,
-            lens_name, lens_findings,
+        result = _holon_update_locked(
+            engine,
+            info,
+            node,
+            holon_id,
+            action,
+            content,
+            rules,
+            properties,
+            holarchy_id,
+            parent_id,
+            role_in_parent,
+            projection,
+            lens_name,
+            lens_findings,
+            rule_profile_ids,
         )
+        bindings = list(node.rule_bindings)
+        subject_label = node.name
+    await _materialize_subject_rule_bindings(
+        engine,
+        session_id,
+        subject_kind="holon",
+        subject_id=holon_id,
+        subject_label=subject_label,
+        bindings=bindings,
+        source="holon_update",
+    )
+    return result
 
 
 def _holon_update_locked(
@@ -359,6 +414,7 @@ def _holon_update_locked(
     projection: str | None,
     lens_name: str | None,
     lens_findings: str | None,
+    rule_profile_ids: list[str] | None,
 ) -> str:
     """Body of holon_update executed under engine.state_lock.
 
@@ -367,23 +423,27 @@ def _holon_update_locked(
     engine.state_lock (enforced by holon_update's with-block).
     """
     session_id = info.session_id
+    if rule_profile_ids:
+        bindings = _rule_bindings_from_profile_ids(engine, rule_profile_ids)
+        existing = list(node.rule_bindings)
+        seen = {(b.get("profile_id"), b.get("snapshot_id")) for b in existing}
+        for binding in bindings:
+            key = (binding.get("profile_id"), binding.get("snapshot_id"))
+            if key not in seen:
+                seen.add(key)
+                existing.append(binding)
+        node.rule_bindings = existing
     if action == "context":
         if not content:
             raise ValueError("content is required for context action")
         node.context = content
-        return (
-            f"Session: {session_id} | Holon: {holon_id}\n"
-            f"Context updated: {_trunc_long(content)}"
-        )
+        return f"Session: {session_id} | Holon: {holon_id}\nContext updated: {_trunc_long(content)}"
 
     if action == "rules":
         if rules is None:
             raise ValueError("rules is required for rules action")
         node.rules = rules
-        return (
-            f"Session: {session_id} | Holon: {holon_id}\n"
-            f"Rules updated: {len(rules)} rules"
-        )
+        return f"Session: {session_id} | Holon: {holon_id}\nRules updated: {len(rules)} rules"
 
     if action == "description":
         if not content:
@@ -396,9 +456,7 @@ def _holon_update_locked(
 
     if action == "properties":
         if properties is None:
-            raise ValueError(
-                "properties is required for properties action"
-            )
+            raise ValueError("properties is required for properties action")
         node.properties = properties
         return (
             f"Session: {session_id} | Holon: {holon_id}\n"
@@ -407,9 +465,7 @@ def _holon_update_locked(
 
     if action == "projection":
         if not holarchy_id or not content:
-            raise ValueError(
-                "holarchy_id and content required for projection action"
-            )
+            raise ValueError("holarchy_id and content required for projection action")
         node.projections[holarchy_id] = content
         # Clear stale flag
         node.stale_projections.discard(holarchy_id)
@@ -420,17 +476,18 @@ def _holon_update_locked(
 
     if action == "join_holarchy":
         if not holarchy_id or not parent_id:
-            raise ValueError(
-                "holarchy_id and parent_id required for join_holarchy"
-            )
+            raise ValueError("holarchy_id and parent_id required for join_holarchy")
         parent = engine.get_holon(parent_id)
         if parent is None:
             raise ValueError(f"Parent '{parent_id}' not found")
         pm = _get_membership(parent, holarchy_id)
         level = (pm["level"] + 1) if pm else 0
         engine.join_holarchy(
-            holon_id, holarchy_id, parent_id,
-            role_in_parent or "", level,
+            holon_id,
+            holarchy_id,
+            parent_id,
+            role_in_parent or "",
+            level,
         )
         if projection:
             node.projections[holarchy_id] = projection
@@ -442,13 +499,13 @@ def _holon_update_locked(
 
     # action == "add_lens"
     if not lens_name or not lens_findings:
-        raise ValueError(
-            "lens_name and lens_findings required for add_lens"
-        )
-    node.analytical_lenses.append({
-        "name": lens_name,
-        "findings": lens_findings,
-    })
+        raise ValueError("lens_name and lens_findings required for add_lens")
+    node.analytical_lenses.append(
+        {
+            "name": lens_name,
+            "findings": lens_findings,
+        }
+    )
     return (
         f"Session: {session_id} | Holon: {holon_id}\n"
         f"Lens '{lens_name}' added"
@@ -558,14 +615,11 @@ async def holon_view(
         omitted_children = len(children) - len(shown_children)
         lines.append(f"\n### Children ({len(children)}):")
         for i, child in enumerate(shown_children):
-            lines.append(f"  {i+1}. {_holon_summary_line(child, hid)}")
+            lines.append(f"  {i + 1}. {_holon_summary_line(child, hid)}")
             if child.context:
                 lines.append(f"     Context: {_trunc_long(child.context)}")
         if omitted_children:
-            lines.append(
-                f"  ... {omitted_children} more"
-                " (use holon_query resolution=subtree)"
-            )
+            lines.append(f"  ... {omitted_children} more (use holon_query resolution=subtree)")
         if not children:
             lines.append("  (leaf holon — no children)")
         return "\n".join(lines)
@@ -624,10 +678,7 @@ async def holon_view(
             if sib.context:
                 lines.append(f"    Context: {_trunc(sib.context)}")
         if omitted_siblings:
-            lines.append(
-                f"  ... {omitted_siblings} more"
-                " (use holon_query resolution=local)"
-            )
+            lines.append(f"  ... {omitted_siblings} more (use holon_query resolution=local)")
         if not siblings:
             lines.append("  (no peers — only child)")
         return "\n".join(lines)
@@ -635,15 +686,12 @@ async def holon_view(
     # ── cross_level ──────────────────────────────────────
     ancestry = engine.get_holon_ancestry(holon_id, hid)
     ancestry.reverse()  # root first
-    ancestry = ancestry[-levels_up - 1:]  # trim to levels_up + self
-    descendants = engine.get_holon_subtree(
-        holon_id, hid, max_depth=levels_down
-    )
+    ancestry = ancestry[-levels_up - 1 :]  # trim to levels_up + self
+    descendants = engine.get_holon_subtree(holon_id, hid, max_depth=levels_down)
 
     lines = [
         f"Session: {session_id} | Holarchy: {hid}",
-        f"## Cross-Level View: {node.name}"
-        f" ({levels_up} up, {levels_down} down)",
+        f"## Cross-Level View: {node.name} ({levels_up} up, {levels_down} down)",
     ]
     lines.append("\n### Ancestry:")
     for anc in ancestry:
@@ -651,9 +699,7 @@ async def holon_view(
         lvl = m["level"] if m else "?"
         marker = " [THIS]" if anc.id == holon_id else ""
         indent = "  " * (int(lvl) if isinstance(lvl, int) else 0)
-        lines.append(
-            f"{indent}{anc.name} (L{lvl}){marker}"
-        )
+        lines.append(f"{indent}{anc.name} (L{lvl}){marker}")
         if anc.context and anc.id != holon_id:
             lines.append(f"{indent}  Context: {_trunc(anc.context)}")
 
@@ -680,9 +726,7 @@ async def holon_view(
         if omitted:
             lines.append(f"  ... {omitted} more (use holon_query resolution=subtree)")
 
-    stale_count = sum(
-        1 for d in descendants if hid in d.stale_projections
-    )
+    stale_count = sum(1 for d in descendants if hid in d.stale_projections)
     if stale_count:
         lines.append(f"\nStale projections in scope: {stale_count}")
 
@@ -769,15 +813,10 @@ async def holon_analyze(
                 continue
             # Stale projections
             if h.stale_projections:
-                issues.append(
-                    f"{h.name}: stale projections in "
-                    f"{', '.join(h.stale_projections)}"
-                )
+                issues.append(f"{h.name}: stale projections in {', '.join(h.stale_projections)}")
             # Description stale
             if h.description_stale:
-                issues.append(
-                    f"{h.name}: description may be invalid"
-                )
+                issues.append(f"{h.name}: description may be invalid")
             # Check for holons with no children but marked as
             # having sub-structure implied by properties
             for m in h.memberships:
@@ -787,21 +826,11 @@ async def holon_analyze(
                 # Orphan check: parent doesn't exist
                 pid = m.get("parent_id")
                 if pid and not engine.get_holon(pid):
-                    issues.append(
-                        f"{h.name}: orphaned in {hid}"
-                        f" (parent {pid} missing)"
-                    )
+                    issues.append(f"{h.name}: orphaned in {hid} (parent {pid} missing)")
                 # No children at non-leaf level
-                if (
-                    not children
-                    and parent
-                    and engine.get_holon_children(parent.id, hid)
-                ):
+                if not children and parent and engine.get_holon_children(parent.id, hid):
                     sibs = engine.get_holon_siblings(h.id, hid)
-                    sibs_with_children = [
-                        s for s in sibs
-                        if engine.get_holon_children(s.id, hid)
-                    ]
+                    sibs_with_children = [s for s in sibs if engine.get_holon_children(s.id, hid)]
                     if sibs_with_children:
                         issues.append(
                             f"{h.name}: leaf in {hid} but "
@@ -828,10 +857,7 @@ async def holon_analyze(
             raise ValueError(f"Holon '{holon_id}' not found")
 
         hid = _resolve_holarchy(node, holarchy_id)
-        children = (
-            engine.get_holon_children(holon_id, hid)
-            if hid else []
-        )
+        children = engine.get_holon_children(holon_id, hid) if hid else []
         child_props: set[str] = set()
         for child in children:
             child_props.update(child.properties)
@@ -846,15 +872,11 @@ async def holon_analyze(
         ]
         for p in sorted(child_props):
             lines.append(f"  - {p}")
-        lines.append(
-            f"\nThis holon's properties ({len(parent_props)}):"
-        )
+        lines.append(f"\nThis holon's properties ({len(parent_props)}):")
         for p in sorted(parent_props):
             marker = " [EMERGENT]" if p in emergent else ""
             lines.append(f"  - {p}{marker}")
-        lines.append(
-            f"\nEmergent properties ({len(emergent)}):"
-        )
+        lines.append(f"\nEmergent properties ({len(emergent)}):")
         for p in sorted(emergent):
             lines.append(f"  - {p}")
         if not emergent:
@@ -868,12 +890,10 @@ async def holon_analyze(
     # ── propagate_up ─────────────────────────────────────
     if action == "propagate_up":
         if not holon_id or not insight or not propagation_type:
-            raise ValueError(
-                "holon_id, insight, and propagation_type "
-                "required for propagate_up"
-            )
+            raise ValueError("holon_id, insight, and propagation_type required for propagate_up")
         _validate_enum(
-            propagation_type, _PROPAGATION_UP_TYPES,
+            propagation_type,
+            _PROPAGATION_UP_TYPES,
             "propagation_type (up)",
         )
         node = engine.get_holon(holon_id)
@@ -904,19 +924,16 @@ async def holon_analyze(
             f"Session: {session_id} | Propagated UP in {hid}\n"
             f"Type: {propagation_type}\n"
             f"Insight: {_trunc_long(insight)}\n"
-            f"Affected ({len(affected)}): "
-            + " → ".join(affected)
+            f"Affected ({len(affected)}): " + " → ".join(affected)
         )
 
     # ── propagate_down ───────────────────────────────────
     if action == "propagate_down":
         if not holon_id or not insight or not propagation_type:
-            raise ValueError(
-                "holon_id, insight, and propagation_type "
-                "required for propagate_down"
-            )
+            raise ValueError("holon_id, insight, and propagation_type required for propagate_down")
         _validate_enum(
-            propagation_type, _PROPAGATION_DOWN_TYPES,
+            propagation_type,
+            _PROPAGATION_DOWN_TYPES,
             "propagation_type (down)",
         )
         node = engine.get_holon(holon_id)
@@ -952,9 +969,7 @@ async def holon_analyze(
     # ── coherence ────────────────────────────────────────
     if action == "coherence":
         if not holon_a_id or not holon_b_id:
-            raise ValueError(
-                "holon_a_id and holon_b_id required for coherence"
-            )
+            raise ValueError("holon_a_id and holon_b_id required for coherence")
         a = engine.get_holon(holon_a_id)
         b = engine.get_holon(holon_b_id)
         if a is None:
@@ -994,8 +1009,7 @@ async def holon_analyze(
         bridge = engine.find_bridge(holon_a_id, holon_b_id)
         if bridge and len(bridge) > 2:
             lines.append(
-                f"\n### Bridge ({len(bridge)} hops): "
-                + " → ".join(n.name for n in bridge)
+                f"\n### Bridge ({len(bridge)} hops): " + " → ".join(n.name for n in bridge)
             )
 
         lines.append(
@@ -1009,9 +1023,7 @@ async def holon_analyze(
     # ── bridge ───────────────────────────────────────────
     if action == "bridge":
         if not from_id or not to_id:
-            raise ValueError(
-                "from_id and to_id required for bridge"
-            )
+            raise ValueError("from_id and to_id required for bridge")
         from_node = engine.get_holon(from_id)
         to_node = engine.get_holon(to_id)
         if from_node is None:
@@ -1022,9 +1034,7 @@ async def holon_analyze(
         path = engine.find_bridge(from_id, to_id)
         if not path:
             return (
-                f"Session: {session_id}\n"
-                f"No path found between {from_node.name} "
-                f"and {to_node.name}"
+                f"Session: {session_id}\nNo path found between {from_node.name} and {to_node.name}"
             )
 
         lines = [
@@ -1039,10 +1049,7 @@ async def holon_analyze(
                 marker = " [START]"
             elif i == len(path) - 1:
                 marker = " [END]"
-            lines.append(
-                f"  {i+1}. {node.name}{marker}"
-                f" — {_trunc(node.description)}"
-            )
+            lines.append(f"  {i + 1}. {node.name}{marker} — {_trunc(node.description)}")
             if node.context:
                 lines.append(f"     Context: {_trunc(node.context)}")
         return "\n".join(lines)
@@ -1050,7 +1057,10 @@ async def holon_analyze(
     # ── feedback_loops ───────────────────────────────────
     if action == "feedback_loops":
         return _analyze_feedback_loops(
-            engine, session_id, holarchy_id, holon_id,
+            engine,
+            session_id,
+            holarchy_id,
+            holon_id,
         )
 
     # ── leverage_points ──────────────────────────────────
@@ -1096,9 +1106,7 @@ async def holon_analyze(
         lines.append(f"Rules: {'; '.join(node.rules)}")
     if node.properties:
         lines.append(f"Properties: {', '.join(node.properties)}")
-    lines.append(
-        "Use holon_update(action='add_lens') to store findings."
-    )
+    lines.append("Use holon_update(action='add_lens') to store findings.")
     return "\n".join(lines)
 
 
@@ -1119,16 +1127,11 @@ def _analyze_feedback_loops(
             raise ValueError(f"Holon '{holon_id}' not found")
         hid = _resolve_holarchy(node, holarchy_id)
         if hid is None:
-            raise ValueError(
-                "Specify holarchy_id (holon has multiple memberships)"
-            )
+            raise ValueError("Specify holarchy_id (holon has multiple memberships)")
         subtree_ids = {n.id for n in engine.get_holon_subtree(holon_id, hid)}
         holons = [h for h in holons if h.id in subtree_ids]
     elif holarchy_id:
-        holons = [
-            h for h in holons
-            if any(m["holarchy_id"] == holarchy_id for m in h.memberships)
-        ]
+        holons = [h for h in holons if any(m["holarchy_id"] == holarchy_id for m in h.memberships)]
 
     # Find bidirectional references in context/rules
     _MAX_FEEDBACK_PAIRS = 50
@@ -1153,21 +1156,21 @@ def _analyze_feedback_loops(
                 continue
             checked.add(pair)
             if names[b.id] in texts[a.id] and names[a.id] in texts[b.id]:
-                loops.append({
-                    "holon_a": a.name,
-                    "holon_b": b.name,
-                    "a_context": _trunc(a.context),
-                    "b_context": _trunc(b.context),
-                })
+                loops.append(
+                    {
+                        "holon_a": a.name,
+                        "holon_b": b.name,
+                        "a_context": _trunc(a.context),
+                        "b_context": _trunc(b.context),
+                    }
+                )
 
     lines = [
         f"Session: {session_id}",
         f"## Feedback Loops: {len(loops)} detected",
     ]
     for loop in loops:
-        lines.append(
-            f"  {loop['holon_a']} <-> {loop['holon_b']}"
-        )
+        lines.append(f"  {loop['holon_a']} <-> {loop['holon_b']}")
         lines.append(f"    A: {loop['a_context']}")
         lines.append(f"    B: {loop['b_context']}")
     if not loops:
@@ -1192,10 +1195,7 @@ def _analyze_leverage_points(
     scores: list[tuple[str, str, float]] = []
     for hid, node in engine.holon_nodes.items():
         membership_count = len(node.memberships)
-        total_children = sum(
-            len(kids)
-            for kids in node.children_by_holarchy.values()
-        )
+        total_children = sum(len(kids) for kids in node.children_by_holarchy.values())
         # Score: memberships weight 3x, children weight 1x
         score = (membership_count * 3.0) + total_children
         if score > 0:
@@ -1211,12 +1211,9 @@ def _analyze_leverage_points(
     for i, (hid, name, score) in enumerate(top):
         node = engine.holon_nodes[hid]
         memberships = len(node.memberships)
-        children = sum(
-            len(kids)
-            for kids in node.children_by_holarchy.values()
-        )
+        children = sum(len(kids) for kids in node.children_by_holarchy.values())
         lines.append(
-            f"  {i+1}. {name} (score={score:.0f})"
+            f"  {i + 1}. {name} (score={score:.0f})"
             f" | memberships={memberships}"
             f" | children={children}"
         )
@@ -1270,14 +1267,10 @@ async def holon_query(
 
     hid = _resolve_holarchy(vantage, holarchy_id)
     if hid is None:
-        raise ValueError(
-            "Specify holarchy_id (vantage has multiple memberships)"
-        )
+        raise ValueError("Specify holarchy_id (vantage has multiple memberships)")
 
     lines = [
-        f"Session: {session_id}"
-        f" | Query from: {vantage.name}"
-        f" | Resolution: {resolution}",
+        f"Session: {session_id} | Query from: {vantage.name} | Resolution: {resolution}",
         f"Question: {question}",
         f"\n## Vantage Point: {vantage.name}",
         f"Description: {vantage.description}",
@@ -1292,9 +1285,7 @@ async def holon_query(
     if vantage.analytical_lenses:
         lines.append(f"Lenses: {len(vantage.analytical_lenses)}")
         for lens in vantage.analytical_lenses:
-            lines.append(
-                f"  {lens['name']}: {_trunc(lens['findings'])}"
-            )
+            lines.append(f"  {lens['name']}: {_trunc(lens['findings'])}")
 
     # Gather scope — collect visible nodes for stale scan
     scope_nodes: list[HolonNode] = [vantage]
@@ -1315,9 +1306,7 @@ async def holon_query(
     elif resolution == "subtree":
         subtree = engine.get_holon_subtree(vantage_id, hid)
         scope_nodes = subtree
-        lines.append(
-            f"\n## Visible Context (subtree, {len(subtree)} holons):"
-        )
+        lines.append(f"\n## Visible Context (subtree, {len(subtree)} holons):")
         for node in subtree:
             m = _get_membership(node, hid)
             lvl = m["level"] if m else "?"
@@ -1331,10 +1320,7 @@ async def holon_query(
         if root_id:
             all_nodes = engine.get_holon_subtree(root_id, hid)
             scope_nodes = all_nodes
-            lines.append(
-                f"\n## Visible Context"
-                f" (holarchy, {len(all_nodes)} holons):"
-            )
+            lines.append(f"\n## Visible Context (holarchy, {len(all_nodes)} holons):")
             for node in all_nodes:
                 m = _get_membership(node, hid)
                 lvl = m["level"] if m else "?"
@@ -1342,19 +1328,12 @@ async def holon_query(
                 marker = " [VANTAGE]" if node.id == vantage_id else ""
                 lines.append(f"{indent}{node.name} (L{lvl}){marker}")
                 if node.context:
-                    lines.append(
-                        f"{indent}  Context: {_trunc(node.context)}"
-                    )
+                    lines.append(f"{indent}  Context: {_trunc(node.context)}")
 
     # Stale projections — scoped to visible nodes only
-    stale_nodes = [
-        n for n in scope_nodes
-        if hid in n.stale_projections
-    ]
+    stale_nodes = [n for n in scope_nodes if hid in n.stale_projections]
     if stale_nodes:
-        lines.append(
-            f"\n## Stale Projections ({len(stale_nodes)}):"
-        )
+        lines.append(f"\n## Stale Projections ({len(stale_nodes)}):")
         for n in stale_nodes:
             lines.append(f"  - {n.name}")
 

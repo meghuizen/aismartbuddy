@@ -27,11 +27,14 @@ def _synchronized(method):
     Uses RLock so nested engine calls (e.g. add_node → _cleanup_graph_memory)
     don't deadlock.
     """
+
     @wraps(method)
     def wrapper(self, *args, **kwargs):
         with self._state_lock:
             return method(self, *args, **kwargs)
+
     return wrapper
+
 
 # Memory limits
 MAX_NODES = 2000
@@ -70,6 +73,7 @@ class ThoughtNode:
     delegation_result: str = ""
     depends_on: list[str] = field(default_factory=list)
     refs: list[str] = field(default_factory=list)
+    rule_bindings: list[dict] = field(default_factory=list)
     validation_results: list[dict] = field(default_factory=list)
     depth: int = 0
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -96,6 +100,7 @@ class ModelRecord:
     conclusion: str = ""
     record_id: str = ""
     refs: list[str] = field(default_factory=list)
+    rule_bindings: list[dict] = field(default_factory=list)
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -116,6 +121,7 @@ class DecisionRecord:
     evaluations: list[dict] = field(default_factory=list)
     recommendation: str = ""
     refs: list[str] = field(default_factory=list)
+    rule_bindings: list[dict] = field(default_factory=list)
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -173,6 +179,7 @@ class InquiryRecord:
     analysis: str = ""
     conclusion: str = ""
     refs: list[str] = field(default_factory=list)
+    rule_bindings: list[dict] = field(default_factory=list)
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -195,6 +202,7 @@ class MonitorRecord:
     recommended_approach: str = ""
     suggested_assessments: list[str] = field(default_factory=list)
     refs: list[str] = field(default_factory=list)
+    rule_bindings: list[dict] = field(default_factory=list)
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -244,6 +252,7 @@ class HolonNode:
     description_stale: bool = False
     analytical_lenses: list[dict] = field(default_factory=list)
     refs: list[str] = field(default_factory=list)
+    rule_bindings: list[dict] = field(default_factory=list)
     children_by_holarchy: dict[str, list[str]] = field(default_factory=dict)
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -272,9 +281,7 @@ class IterationRecord:
     metric_history: list[float] = field(default_factory=list)
     # When higher metric is better. Set when first metric is recorded.
     higher_is_better: bool = True
-    created_at: datetime = field(
-        default_factory=lambda: datetime.now(timezone.utc)
-    )
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 @dataclass
@@ -284,10 +291,12 @@ class FindingRecord:
     id: str
     dimension: str
     severity: str
+    kind: str = "finding"  # finding | note
     blocking: bool = False
     description: str = ""
     evidence: list[str] = field(default_factory=list)
     recommendation: str = ""
+    refs: list[str] = field(default_factory=list)
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -313,6 +322,8 @@ class EvaluationRecord:
 
     id: str
     rubric_id: str
+    session_id: str = ""
+    parent_session_id: str | None = None
     context: str = ""
     status: str = "active"  # active | finalized
     findings: list[FindingRecord] = field(default_factory=list)
@@ -325,8 +336,91 @@ class EvaluationRecord:
     auto_fail: bool = False
     summary: str = ""
     refs: list[str] = field(default_factory=list)
+    rule_bindings: list[dict] = field(default_factory=list)
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     finalized_at: datetime | None = None
+
+
+@dataclass
+class RuleItem:
+    """A single weighted rule/requirement inside a reusable profile."""
+
+    id: str
+    text: str
+    weight: float
+    kind: str = "soft"  # soft | hard
+    status: str = "active"  # active | superseded
+    rationale: str = ""
+    tags: list[str] = field(default_factory=list)
+    refs: list[str] = field(default_factory=list)
+    conflicts_with: list[str] = field(default_factory=list)
+
+
+@dataclass
+class RuleSnapshot:
+    """Pinned copy of a profile's rules for auditability."""
+
+    id: str
+    profile_id: str
+    label: str = ""
+    rules: list[RuleItem] = field(default_factory=list)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+@dataclass
+class RuleProfile:
+    """Reusable weighted rule profile."""
+
+    id: str
+    name: str
+    description: str = ""
+    rules: list[RuleItem] = field(default_factory=list)
+    snapshots: list[RuleSnapshot] = field(default_factory=list)
+    refs: list[str] = field(default_factory=list)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+@dataclass
+class RuleConflictRecord:
+    """Unresolved conflict between active rules."""
+
+    id: str
+    rule_ids: list[str] = field(default_factory=list)
+    profile_ids: list[str] = field(default_factory=list)
+    status: str = "open"  # open | resolved
+    resolution_note: str = ""
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    resolved_at: datetime | None = None
+
+
+@dataclass
+class ValidationAssessment:
+    """Caller-supplied validation judgment for one rule."""
+
+    rule_id: str
+    status: str  # satisfies | violates | uncertain | not_applicable
+    note: str = ""
+    refs: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ValidationRecord:
+    """Persisted validation result against one subject and rule binding set."""
+
+    id: str
+    subject_id: str
+    subject_kind: str
+    rule_bindings: list[dict] = field(default_factory=list)
+    passed_hard_gates: bool = True
+    weighted_score: float = 100.0
+    weighted_gaps: list[dict] = field(default_factory=list)
+    uncovered_rules: list[str] = field(default_factory=list)
+    conflicting_rules: list[str] = field(default_factory=list)
+    nuance_notes: list[str] = field(default_factory=list)
+    hard_failures: list[str] = field(default_factory=list)
+    assessments: list[ValidationAssessment] = field(default_factory=list)
+    refs: list[str] = field(default_factory=list)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 @dataclass
@@ -352,6 +446,39 @@ class ArtifactRecord:
 
 MAX_RUBRICS = 100
 MAX_EVALUATIONS = 100
+MAX_RULE_PROFILES = 100
+MAX_RULE_VALIDATIONS = 500
+
+
+def _clone_rule_item(item: RuleItem) -> RuleItem:
+    """Return a deep-ish copy of a RuleItem."""
+    return RuleItem(
+        id=item.id,
+        text=item.text,
+        weight=float(item.weight),
+        kind=item.kind,
+        status=item.status,
+        rationale=item.rationale,
+        tags=list(item.tags),
+        refs=list(item.refs),
+        conflicts_with=list(item.conflicts_with),
+    )
+
+
+def _clone_rule_snapshot(snapshot: RuleSnapshot) -> RuleSnapshot:
+    """Return a copy of a RuleSnapshot."""
+    return RuleSnapshot(
+        id=snapshot.id,
+        profile_id=snapshot.profile_id,
+        label=snapshot.label,
+        rules=[_clone_rule_item(r) for r in snapshot.rules],
+        created_at=snapshot.created_at,
+    )
+
+
+def _binding_key(binding: dict) -> tuple[str, str | None]:
+    """Stable dedupe key for a rule binding dict."""
+    return (str(binding.get("profile_id", "")), binding.get("snapshot_id"))
 
 
 # ── ThinkingEngine ───────────────────────────────────────────
@@ -371,6 +498,7 @@ class ThinkingEngine:
 
     def __init__(self) -> None:
         import threading
+
         # RLock so internal methods (e.g. add_node → _cleanup_graph_memory)
         # can re-acquire without deadlocking.
         self._state_lock = threading.RLock()
@@ -387,6 +515,9 @@ class ThinkingEngine:
         self.holon_holarchies: dict[str, str] = {}  # holarchy_id → root_id
         self.rubrics: dict[str, RubricRecord] = {}
         self.evaluations: dict[str, EvaluationRecord] = {}
+        self.rule_profiles: dict[str, RuleProfile] = {}
+        self.rule_conflicts: dict[str, RuleConflictRecord] = {}
+        self.validations: dict[str, ValidationRecord] = {}
         self.iterations: dict[str, IterationRecord] = {}
         self.artifacts: dict[str, ArtifactRecord] = {}
         self._artifact_ids_by_kind: dict[str, set[str]] = {}
@@ -428,6 +559,9 @@ class ThinkingEngine:
         self.holon_holarchies.clear()
         self.rubrics.clear()
         self.evaluations.clear()
+        self.rule_profiles.clear()
+        self.rule_conflicts.clear()
+        self.validations.clear()
         self.iterations.clear()
         self.artifacts.clear()
         self._artifact_ids_by_kind.clear()
@@ -481,9 +615,7 @@ class ThinkingEngine:
         for spec in child_specs:
             content = spec.get("thought", "")
             if not content:
-                raise ValueError(
-                    "Each child must include a non-empty 'thought' field"
-                )
+                raise ValueError("Each child must include a non-empty 'thought' field")
             cid = _uuid.uuid4().hex[:10]
             child = ThoughtNode(
                 id=cid,
@@ -677,6 +809,12 @@ class ThinkingEngine:
     def add_model(self, record: ModelRecord) -> None:
         self.models.append(record)
 
+    def get_model(self, record_id: str) -> ModelRecord | None:
+        for record in self.models:
+            if record.record_id == record_id:
+                return record
+        return None
+
     # ── Decisions ────────────────────────────────────────
 
     @_synchronized
@@ -812,9 +950,7 @@ class ThinkingEngine:
             if r in visited:
                 return
             if r in temp_mark:
-                raise ValueError(
-                    f"Cycle detected in parent_ref graph at '{r}'"
-                )
+                raise ValueError(f"Cycle detected in parent_ref graph at '{r}'")
             temp_mark.add(r)
             dep = depends_on.get(r)
             if dep is not None:
@@ -866,12 +1002,14 @@ class ThinkingEngine:
                 context=item.get("context", ""),
                 rules=item.get("rules") or [],
                 properties=item.get("properties") or [],
-                memberships=[{
-                    "holarchy_id": hid,
-                    "parent_id": parent_id,
-                    "role_in_parent": item.get("role_in_parent", ""),
-                    "level": level,
-                }],
+                memberships=[
+                    {
+                        "holarchy_id": hid,
+                        "parent_id": parent_id,
+                        "role_in_parent": item.get("role_in_parent", ""),
+                        "level": level,
+                    }
+                ],
                 projections={hid: projection} if projection else {},
             )
             self.holon_nodes[nid] = node
@@ -902,12 +1040,14 @@ class ThinkingEngine:
         for m in node.memberships:
             if m["holarchy_id"] == holarchy_id:
                 return node  # already a member
-        node.memberships.append({
-            "holarchy_id": holarchy_id,
-            "parent_id": parent_id,
-            "role_in_parent": role,
-            "level": level,
-        })
+        node.memberships.append(
+            {
+                "holarchy_id": holarchy_id,
+                "parent_id": parent_id,
+                "role_in_parent": role,
+                "level": level,
+            }
+        )
         if parent_id in self.holon_nodes:
             parent = self.holon_nodes[parent_id]
             children = parent.children_by_holarchy.setdefault(holarchy_id, [])
@@ -918,22 +1058,14 @@ class ThinkingEngine:
     def get_holon(self, holon_id: str) -> HolonNode | None:
         return self.holon_nodes.get(holon_id)
 
-    def get_holon_children(
-        self, holon_id: str, holarchy_id: str
-    ) -> list[HolonNode]:
+    def get_holon_children(self, holon_id: str, holarchy_id: str) -> list[HolonNode]:
         node = self.holon_nodes.get(holon_id)
         if node is None:
             return []
         child_ids = node.children_by_holarchy.get(holarchy_id, [])
-        return [
-            self.holon_nodes[cid]
-            for cid in child_ids
-            if cid in self.holon_nodes
-        ]
+        return [self.holon_nodes[cid] for cid in child_ids if cid in self.holon_nodes]
 
-    def get_holon_parent(
-        self, holon_id: str, holarchy_id: str
-    ) -> HolonNode | None:
+    def get_holon_parent(self, holon_id: str, holarchy_id: str) -> HolonNode | None:
         node = self.holon_nodes.get(holon_id)
         if node is None:
             return None
@@ -944,20 +1076,13 @@ class ThinkingEngine:
                     return self.holon_nodes.get(pid)
         return None
 
-    def get_holon_siblings(
-        self, holon_id: str, holarchy_id: str
-    ) -> list[HolonNode]:
+    def get_holon_siblings(self, holon_id: str, holarchy_id: str) -> list[HolonNode]:
         parent = self.get_holon_parent(holon_id, holarchy_id)
         if parent is None:
             return []
-        return [
-            c for c in self.get_holon_children(parent.id, holarchy_id)
-            if c.id != holon_id
-        ]
+        return [c for c in self.get_holon_children(parent.id, holarchy_id) if c.id != holon_id]
 
-    def get_holon_ancestry(
-        self, holon_id: str, holarchy_id: str
-    ) -> list[HolonNode]:
+    def get_holon_ancestry(self, holon_id: str, holarchy_id: str) -> list[HolonNode]:
         """Trace ancestry in a specific holarchy. Returns [node, parent, ..., root]."""
         path: list[HolonNode] = []
         seen: set[str] = set()
@@ -997,9 +1122,7 @@ class ThinkingEngine:
                     queue.append((child, depth + 1))
         return result
 
-    def find_bridge(
-        self, from_id: str, to_id: str
-    ) -> list[HolonNode]:
+    def find_bridge(self, from_id: str, to_id: str) -> list[HolonNode]:
         """BFS across ALL holarchies to find shortest path between holons."""
         if from_id not in self.holon_nodes or to_id not in self.holon_nodes:
             return []
@@ -1021,11 +1144,7 @@ class ThinkingEngine:
                     nid = parent_map[nid]
                     path.append(nid)
                 path.reverse()
-                return [
-                    self.holon_nodes[pid]
-                    for pid in path
-                    if pid in self.holon_nodes
-                ]
+                return [self.holon_nodes[pid] for pid in path if pid in self.holon_nodes]
 
             node = self.holon_nodes.get(current_id)
             if node is None:
@@ -1073,10 +1192,7 @@ class ThinkingEngine:
         to_delete: list[str] = []
         for hid, node in self.holon_nodes.items():
             # Remove membership for this holarchy
-            node.memberships = [
-                m for m in node.memberships
-                if m["holarchy_id"] != holarchy_id
-            ]
+            node.memberships = [m for m in node.memberships if m["holarchy_id"] != holarchy_id]
             # Remove children tracking for this holarchy
             node.children_by_holarchy.pop(holarchy_id, None)
             # Remove projections/stale for this holarchy
@@ -1088,6 +1204,472 @@ class ThinkingEngine:
         for hid in to_delete:
             self.holon_nodes.pop(hid, None)
 
+    # ── Rule registry + plan-aware validation ───────────
+
+    def _cleanup_rule_memory(self) -> None:
+        """Evict oldest closed validations and unbound profiles if needed."""
+        if len(self.validations) >= MAX_RULE_VALIDATIONS:
+            ordered = sorted(
+                self.validations.values(),
+                key=lambda v: v.created_at,
+            )
+            n_remove = max(1, len(self.validations) - MAX_RULE_VALIDATIONS + 1)
+            for record in ordered[:n_remove]:
+                self.validations.pop(record.id, None)
+
+        if len(self.rule_profiles) >= MAX_RULE_PROFILES:
+            bound_profile_ids = {
+                binding.get("profile_id")
+                for subject in self._iter_rule_bound_subjects()
+                for binding in getattr(subject, "rule_bindings", [])
+            }
+            removable = [
+                p
+                for p in sorted(self.rule_profiles.values(), key=lambda p: p.created_at)
+                if p.id not in bound_profile_ids
+            ]
+            n_remove = max(1, len(self.rule_profiles) - MAX_RULE_PROFILES + 1)
+            for profile in removable[:n_remove]:
+                self.rule_profiles.pop(profile.id, None)
+
+    def _iter_rule_bound_subjects(self) -> list[object]:
+        """Return every subject type that can carry rule bindings."""
+        subjects: list[object] = []
+        subjects.extend(self.thought_nodes.values())
+        subjects.extend(self.models)
+        subjects.extend(self.decisions.values())
+        subjects.extend(self.inquiries.values())
+        subjects.extend(self.monitors.values())
+        subjects.extend(self.holon_nodes.values())
+        subjects.extend(self.evaluations.values())
+        return subjects
+
+    def _normalize_rule_bindings(self, bindings: list[dict] | None) -> list[dict]:
+        """Validate and dedupe rule bindings while preserving order."""
+        out: list[dict] = []
+        seen: set[tuple[str, str | None]] = set()
+        for binding in bindings or []:
+            profile_id = str(binding.get("profile_id") or "").strip()
+            snapshot_id = binding.get("snapshot_id")
+            if not profile_id:
+                raise ValueError("Rule binding missing profile_id")
+            profile = self.rule_profiles.get(profile_id)
+            if profile is None:
+                raise ValueError(f"Rule profile '{profile_id}' not found")
+            if snapshot_id:
+                if all(s.id != snapshot_id for s in profile.snapshots):
+                    raise ValueError(
+                        f"Snapshot '{snapshot_id}' not found on profile '{profile_id}'"
+                    )
+            key = (profile_id, snapshot_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({"profile_id": profile_id, "snapshot_id": snapshot_id})
+        return out
+
+    def _get_subject(self, subject_id: str, subject_kind: str | None = None) -> tuple[str, object]:
+        """Resolve a subject id across supported record types."""
+        normalized = (subject_kind or "").strip().lower()
+        if normalized in {"thought", "thought_node", "node"}:
+            node = self.thought_nodes.get(subject_id)
+            if node is None:
+                raise ValueError(f"Thought node '{subject_id}' not found")
+            return "thought", node
+        if normalized in {"model", "mental_model"}:
+            rec = self.get_model(subject_id)
+            if rec is None:
+                raise ValueError(f"Model record '{subject_id}' not found")
+            return "model", rec
+        if normalized in {"decision"}:
+            rec = self.decisions.get(subject_id)
+            if rec is None:
+                raise ValueError(f"Decision '{subject_id}' not found")
+            return "decision", rec
+        if normalized in {"inquiry", "science"}:
+            rec = self.inquiries.get(subject_id)
+            if rec is None:
+                raise ValueError(f"Inquiry '{subject_id}' not found")
+            return "inquiry", rec
+        if normalized in {"monitor", "assessment"}:
+            rec = self.monitors.get(subject_id)
+            if rec is None:
+                raise ValueError(f"Monitor '{subject_id}' not found")
+            return "monitor", rec
+        if normalized in {"holon"}:
+            rec = self.holon_nodes.get(subject_id)
+            if rec is None:
+                raise ValueError(f"Holon '{subject_id}' not found")
+            return "holon", rec
+        if normalized in {"evaluation", "score"}:
+            rec = self.evaluations.get(subject_id)
+            if rec is None:
+                raise ValueError(f"Evaluation '{subject_id}' not found")
+            return "evaluation", rec
+
+        candidates: list[tuple[str, object]] = []
+        if subject_id in self.thought_nodes:
+            candidates.append(("thought", self.thought_nodes[subject_id]))
+        model = self.get_model(subject_id)
+        if model is not None:
+            candidates.append(("model", model))
+        if subject_id in self.decisions:
+            candidates.append(("decision", self.decisions[subject_id]))
+        if subject_id in self.inquiries:
+            candidates.append(("inquiry", self.inquiries[subject_id]))
+        if subject_id in self.monitors:
+            candidates.append(("monitor", self.monitors[subject_id]))
+        if subject_id in self.holon_nodes:
+            candidates.append(("holon", self.holon_nodes[subject_id]))
+        if subject_id in self.evaluations:
+            candidates.append(("evaluation", self.evaluations[subject_id]))
+        if not candidates:
+            raise ValueError(f"Subject '{subject_id}' not found")
+        if len(candidates) > 1:
+            kinds = ", ".join(k for k, _ in candidates)
+            raise ValueError(
+                f"Subject '{subject_id}' is ambiguous across kinds: {kinds}. "
+                "Pass subject_kind to disambiguate."
+            )
+        return candidates[0]
+
+    def _subject_rule_refs(self, bindings: list[dict], entity_id: str) -> bool:
+        """Return whether a binding set references a profile, snapshot, or rule."""
+        for binding in bindings:
+            profile_id = binding.get("profile_id")
+            snapshot_id = binding.get("snapshot_id")
+            if entity_id == profile_id or entity_id == snapshot_id:
+                return True
+            for profile_ref, _, rule in self.get_effective_rules([binding]):
+                if entity_id in {rule.id, profile_ref}:
+                    return True
+        return False
+
+    def get_effective_rules(self, bindings: list[dict]) -> list[tuple[str, str | None, RuleItem]]:
+        """Expand live/snapshot bindings into active rule items."""
+        effective: list[tuple[str, str | None, RuleItem]] = []
+        for binding in self._normalize_rule_bindings(bindings):
+            profile_id = binding["profile_id"]
+            snapshot_id = binding.get("snapshot_id")
+            profile = self.rule_profiles[profile_id]
+            if snapshot_id:
+                snapshot = next(
+                    (s for s in profile.snapshots if s.id == snapshot_id),
+                    None,
+                )
+                if snapshot is None:
+                    continue
+                source_rules = snapshot.rules
+            else:
+                source_rules = profile.rules
+            for rule in source_rules:
+                if rule.status == "active":
+                    effective.append((profile_id, snapshot_id, _clone_rule_item(rule)))
+        return effective
+
+    @_synchronized
+    def upsert_rule_profile(self, record: RuleProfile) -> None:
+        if record.id not in self.rule_profiles:
+            self._cleanup_rule_memory()
+        self.rule_profiles[record.id] = record
+
+    def get_rule_profile(self, profile_id: str) -> RuleProfile | None:
+        return self.rule_profiles.get(profile_id)
+
+    def get_rule_profiles(self) -> list[RuleProfile]:
+        return list(self.rule_profiles.values())
+
+    @_synchronized
+    def add_rules_batch(self, profile_id: str, rules: list[RuleItem]) -> RuleProfile:
+        profile = self.rule_profiles.get(profile_id)
+        if profile is None:
+            raise ValueError(f"Rule profile '{profile_id}' not found")
+        existing_ids = {r.id for r in profile.rules}
+        for rule in rules:
+            if rule.id in existing_ids:
+                raise ValueError(f"Rule '{rule.id}' already exists in profile '{profile_id}'")
+            existing_ids.add(rule.id)
+            profile.rules.append(rule)
+        return profile
+
+    @_synchronized
+    def update_rule_weights(self, profile_id: str, updates: list[dict]) -> RuleProfile:
+        profile = self.rule_profiles.get(profile_id)
+        if profile is None:
+            raise ValueError(f"Rule profile '{profile_id}' not found")
+        by_id = {r.id: r for r in profile.rules}
+        for update in updates:
+            rule_id = update["rule_id"]
+            if rule_id not in by_id:
+                raise ValueError(f"Rule '{rule_id}' not found in profile '{profile_id}'")
+            by_id[rule_id].weight = float(update["weight"])
+        return profile
+
+    @_synchronized
+    def deprecate_rules(self, profile_id: str, rule_ids: list[str]) -> RuleProfile:
+        profile = self.rule_profiles.get(profile_id)
+        if profile is None:
+            raise ValueError(f"Rule profile '{profile_id}' not found")
+        by_id = {r.id: r for r in profile.rules}
+        for rule_id in rule_ids:
+            if rule_id not in by_id:
+                raise ValueError(f"Rule '{rule_id}' not found in profile '{profile_id}'")
+            by_id[rule_id].status = "superseded"
+        return profile
+
+    @_synchronized
+    def create_rule_snapshot(
+        self, profile_id: str, snapshot_id: str, label: str = ""
+    ) -> RuleSnapshot:
+        profile = self.rule_profiles.get(profile_id)
+        if profile is None:
+            raise ValueError(f"Rule profile '{profile_id}' not found")
+        if any(s.id == snapshot_id for s in profile.snapshots):
+            raise ValueError(f"Snapshot '{snapshot_id}' already exists on profile '{profile_id}'")
+        snapshot = RuleSnapshot(
+            id=snapshot_id,
+            profile_id=profile_id,
+            label=label,
+            rules=[_clone_rule_item(rule) for rule in profile.rules],
+        )
+        profile.snapshots.append(snapshot)
+        return snapshot
+
+    @_synchronized
+    def bind_rule_profiles(
+        self,
+        subject_id: str,
+        subject_kind: str | None,
+        bindings: list[dict],
+    ) -> tuple[str, list[dict]]:
+        resolved_kind, subject = self._get_subject(subject_id, subject_kind)
+        normalized = self._normalize_rule_bindings(bindings)
+        merged: list[dict] = []
+        seen: set[tuple[str, str | None]] = set()
+        for binding in list(getattr(subject, "rule_bindings", [])) + normalized:
+            key = _binding_key(binding)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append({"profile_id": key[0], "snapshot_id": key[1]})
+        subject.rule_bindings = merged
+        return resolved_kind, merged
+
+    def get_subject_rule_bindings(
+        self, subject_id: str, subject_kind: str | None = None
+    ) -> tuple[str, list[dict]]:
+        resolved_kind, subject = self._get_subject(subject_id, subject_kind)
+        return resolved_kind, list(getattr(subject, "rule_bindings", []))
+
+    @_synchronized
+    def resolve_rule_conflicts(
+        self,
+        conflict_ids: list[str],
+        resolution_note: str,
+    ) -> list[RuleConflictRecord]:
+        resolved: list[RuleConflictRecord] = []
+        for conflict_id in conflict_ids:
+            record = self.rule_conflicts.get(conflict_id)
+            if record is None:
+                raise ValueError(f"Rule conflict '{conflict_id}' not found")
+            record.status = "resolved"
+            record.resolution_note = resolution_note
+            record.resolved_at = datetime.now(timezone.utc)
+            resolved.append(record)
+        return resolved
+
+    def _ensure_rule_conflicts(self, bindings: list[dict]) -> list[RuleConflictRecord]:
+        """Detect active conflicts, creating records when needed."""
+        open_conflicts: list[RuleConflictRecord] = []
+        effective = self.get_effective_rules(bindings)
+        seen_pairs: set[tuple[str, str]] = set()
+        for idx, (profile_a, _, rule_a) in enumerate(effective):
+            for profile_b, _, rule_b in effective[idx + 1 :]:
+                if rule_a.id == rule_b.id:
+                    continue
+                if (
+                    rule_b.id not in rule_a.conflicts_with
+                    and rule_a.id not in rule_b.conflicts_with
+                ):
+                    continue
+                pair = tuple(sorted((rule_a.id, rule_b.id)))
+                if pair in seen_pairs:
+                    continue
+                seen_pairs.add(pair)
+                existing = next(
+                    (
+                        c
+                        for c in self.rule_conflicts.values()
+                        if tuple(sorted(c.rule_ids)) == pair and c.status == "open"
+                    ),
+                    None,
+                )
+                if existing is None:
+                    conflict_id = f"conflict-{len(self.rule_conflicts) + 1:03d}"
+                    existing = RuleConflictRecord(
+                        id=conflict_id,
+                        rule_ids=list(pair),
+                        profile_ids=sorted({profile_a, profile_b}),
+                    )
+                    self.rule_conflicts[conflict_id] = existing
+                open_conflicts.append(existing)
+        return open_conflicts
+
+    @_synchronized
+    def validate_subject(
+        self,
+        subject_id: str,
+        subject_kind: str | None,
+        assessments: list[ValidationAssessment] | None = None,
+        *,
+        rule_profile_ids: list[str] | None = None,
+        use_bound_profiles: bool = True,
+        validation_id: str,
+        refs: list[str] | None = None,
+        nuance_notes: list[str] | None = None,
+    ) -> ValidationRecord:
+        resolved_kind, subject = self._get_subject(subject_id, subject_kind)
+        bindings: list[dict] = []
+        if use_bound_profiles:
+            bindings.extend(getattr(subject, "rule_bindings", []))
+        for profile_id in rule_profile_ids or []:
+            bindings.append({"profile_id": profile_id, "snapshot_id": None})
+        bindings = self._normalize_rule_bindings(bindings)
+        conflicts = self._ensure_rule_conflicts(bindings)
+        effective = self.get_effective_rules(bindings)
+        assessment_map = {a.rule_id: a for a in assessments or []}
+
+        hard_failures: list[str] = []
+        uncovered_rules: list[str] = []
+        weighted_gaps: list[dict] = []
+        effective_notes: list[str] = list(nuance_notes or [])
+        weighted_denominator = 0.0
+        weighted_numerator = 0.0
+
+        for profile_id, snapshot_id, rule in effective:
+            assessment = assessment_map.get(rule.id)
+            if assessment is None:
+                uncovered_rules.append(rule.id)
+                if rule.kind == "soft":
+                    weighted_denominator += max(0.0, float(rule.weight))
+                    weighted_gaps.append(
+                        {
+                            "rule_id": rule.id,
+                            "profile_id": profile_id,
+                            "snapshot_id": snapshot_id,
+                            "status": "uncovered",
+                            "weight": float(rule.weight),
+                        }
+                    )
+                continue
+            if rule.kind == "hard" and assessment.status == "violates":
+                hard_failures.append(rule.id)
+            if assessment.status == "uncertain":
+                effective_notes.append(
+                    f"Uncertain judgment on rule '{rule.id}': {assessment.note or rule.text[:80]}"
+                )
+            if rule.kind != "soft":
+                continue
+            if assessment.status == "not_applicable":
+                continue
+            weight = max(0.0, float(rule.weight))
+            weighted_denominator += weight
+            credit = 0.0
+            if assessment.status == "satisfies":
+                credit = weight
+            elif assessment.status == "uncertain":
+                credit = weight * 0.5
+            else:
+                weighted_gaps.append(
+                    {
+                        "rule_id": rule.id,
+                        "profile_id": profile_id,
+                        "snapshot_id": snapshot_id,
+                        "status": assessment.status,
+                        "weight": weight,
+                        "note": assessment.note,
+                    }
+                )
+            weighted_numerator += credit
+
+        for conflict in conflicts:
+            effective_notes.append(
+                f"Unresolved conflict {conflict.id}: {' vs '.join(conflict.rule_ids)}"
+            )
+
+        weighted_score = 100.0
+        if weighted_denominator > 0:
+            weighted_score = round((weighted_numerator / weighted_denominator) * 100.0, 1)
+
+        weighted_gaps.sort(key=lambda g: (-float(g.get("weight", 0.0)), g["rule_id"]))
+        record = ValidationRecord(
+            id=validation_id,
+            subject_id=subject_id,
+            subject_kind=resolved_kind,
+            rule_bindings=bindings,
+            passed_hard_gates=not hard_failures,
+            weighted_score=weighted_score,
+            weighted_gaps=weighted_gaps,
+            uncovered_rules=sorted(dict.fromkeys(uncovered_rules)),
+            conflicting_rules=[c.id for c in conflicts if c.status == "open"],
+            nuance_notes=list(dict.fromkeys(effective_notes)),
+            hard_failures=sorted(dict.fromkeys(hard_failures)),
+            assessments=list(assessments or []),
+            refs=list(dict.fromkeys(list(refs or []))),
+        )
+        self.validations[record.id] = record
+        if hasattr(subject, "validation_results"):
+            subject.validation_results.append(
+                {
+                    "validation_id": record.id,
+                    "weighted_score": record.weighted_score,
+                    "passed_hard_gates": record.passed_hard_gates,
+                }
+            )
+        return record
+
+    def get_validation(self, validation_id: str) -> ValidationRecord | None:
+        return self.validations.get(validation_id)
+
+    def get_latest_validation(
+        self,
+        subject_id: str,
+        subject_kind: str | None = None,
+    ) -> ValidationRecord | None:
+        normalized = (subject_kind or "").strip().lower()
+        candidates = [
+            record
+            for record in self.validations.values()
+            if record.subject_id == subject_id
+            and (not normalized or record.subject_kind == normalized)
+        ]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda record: record.created_at, reverse=True)
+        return candidates[0]
+
+    @_synchronized
+    def subject_rule_validation_summary(
+        self,
+        subject_id: str,
+        subject_kind: str | None = None,
+    ) -> dict:
+        resolved_kind, subject = self._get_subject(subject_id, subject_kind)
+        bindings = list(getattr(subject, "rule_bindings", []))
+        latest = self.get_latest_validation(subject_id, resolved_kind)
+        conflicts = self._ensure_rule_conflicts(bindings) if bindings else []
+        return {
+            "subject_kind": resolved_kind,
+            "bindings": bindings,
+            "latest_validation_id": latest.id if latest else None,
+            "passed_hard_gates": latest.passed_hard_gates if latest else True,
+            "weighted_score": latest.weighted_score if latest else None,
+            "hard_failures": list(latest.hard_failures) if latest else [],
+            "uncovered_rules": list(latest.uncovered_rules) if latest else [],
+            "conflicts": [c.id for c in conflicts if c.status == "open"],
+            "nuance_notes": list(latest.nuance_notes) if latest else [],
+        }
+
     # ── Scoring ──────────────────────────────────────────
 
     def _cleanup_scoring_memory(self) -> None:
@@ -1098,10 +1680,7 @@ class ThinkingEngine:
         """
         # Evict oldest finalized evaluations if over limit
         if len(self.evaluations) >= MAX_EVALUATIONS:
-            finalized = [
-                eid for eid, e in self.evaluations.items()
-                if e.status != "active"
-            ]
+            finalized = [eid for eid, e in self.evaluations.items() if e.status != "active"]
             n_to_remove = max(1, len(self.evaluations) - MAX_EVALUATIONS + 1)
             for eid in finalized[:n_to_remove]:
                 self.evaluations.pop(eid, None)
@@ -1117,7 +1696,8 @@ class ThinkingEngine:
     @_synchronized
     def upsert_rubric(self, record: RubricRecord) -> None:
         active = [
-            e for e in self.evaluations.values()
+            e
+            for e in self.evaluations.values()
             if e.rubric_id == record.id and e.status == "active"
         ]
         if active:
@@ -1146,18 +1726,21 @@ class ThinkingEngine:
     def get_evaluation(self, eval_id: str) -> EvaluationRecord | None:
         return self.evaluations.get(eval_id)
 
-    def get_evaluations(
-        self, rubric_id: str | None = None
-    ) -> list[EvaluationRecord]:
+    def get_evaluations(self, rubric_id: str | None = None) -> list[EvaluationRecord]:
         evals = list(self.evaluations.values())
         if rubric_id:
             evals = [e for e in evals if e.rubric_id == rubric_id]
         return evals
 
+    def get_latest_active_evaluation(self) -> EvaluationRecord | None:
+        active = [e for e in self.evaluations.values() if e.status == "active"]
+        if not active:
+            return None
+        active.sort(key=lambda e: e.created_at, reverse=True)
+        return active[0]
+
     @_synchronized
-    def apply_finding(
-        self, eval_id: str, finding: FindingRecord
-    ) -> float:
+    def apply_finding(self, eval_id: str, finding: FindingRecord) -> float:
         """Apply a finding to an evaluation, return running score.
 
         If finding.id is empty, assigns a unique id based on current finding
@@ -1178,6 +1761,8 @@ class ThinkingEngine:
         # Record finding
         ev.findings.append(finding)
         ev.dimensions_reviewed.add(finding.dimension)
+        if finding.refs:
+            ev.refs = list(dict.fromkeys([*ev.refs, *finding.refs]))
 
         # Apply deduction
         deduction = rubric.severity_deductions.get(finding.severity, 0.0)
@@ -1194,23 +1779,15 @@ class ThinkingEngine:
             (d for d in rubric.dimensions if d["id"] == finding.dimension),
             None,
         )
-        highest_severity = (
-            rubric.severity_levels[0] if rubric.severity_levels else "critical"
-        )
-        if (
-            finding.severity == highest_severity
-            and dim_info
-            and dim_info.get("required", False)
-        ):
+        highest_severity = rubric.severity_levels[0] if rubric.severity_levels else "critical"
+        if finding.severity == highest_severity and dim_info and dim_info.get("required", False):
             ev.auto_fail = True
 
         # Compute running score
         ev.running_score = self._compute_score(ev, rubric)
         return ev.running_score
 
-    def _compute_score(
-        self, ev: EvaluationRecord, rubric: RubricRecord
-    ) -> float:
+    def _compute_score(self, ev: EvaluationRecord, rubric: RubricRecord) -> float:
         """Compute score based on rubric strategy."""
         dims = rubric.dimensions
         if not dims:
@@ -1221,8 +1798,7 @@ class ThinkingEngine:
             return float(rubric.scale_max)
 
         weighted_sum = sum(
-            ev.dimension_scores.get(d["id"], rubric.scale_max) * d["weight"]
-            for d in dims
+            ev.dimension_scores.get(d["id"], rubric.scale_max) * d["weight"] for d in dims
         )
         avg = weighted_sum / total_weight
 
@@ -1254,9 +1830,7 @@ class ThinkingEngine:
         if extra_reviewed:
             reviewed.update(extra_reviewed)
 
-        required = {
-            d["id"] for d in rubric.dimensions if d.get("required", False)
-        }
+        required = {d["id"] for d in rubric.dimensions if d.get("required", False)}
         return sorted(required - reviewed)
 
     @_synchronized
@@ -1280,9 +1854,7 @@ class ThinkingEngine:
         if ev is None:
             raise ValueError(f"Evaluation '{eval_id}' not found")
         if ev.status != "active":
-            raise ValueError(
-                f"Evaluation '{eval_id}' is already {ev.status}"
-            )
+            raise ValueError(f"Evaluation '{eval_id}' is already {ev.status}")
         rubric = self.rubrics.get(ev.rubric_id)
         if rubric is None:
             raise ValueError(f"Rubric '{ev.rubric_id}' not found")
@@ -1344,14 +1916,9 @@ class ThinkingEngine:
                 if root:
                     subtree = self.get_subtree_nodes(root_id)
                     max_depth = max((n.depth for n in subtree), default=0)
-                    delegated = sum(
-                        1 for n in subtree if n.delegation_state
-                    )
+                    delegated = sum(1 for n in subtree if n.delegation_state)
                     root_preview = root.content[:40]
-                    line = (
-                        f"- {tid}: \"{root_preview}\" — "
-                        f"{len(subtree)} nodes, depth {max_depth}"
-                    )
+                    line = f'- {tid}: "{root_preview}" — {len(subtree)} nodes, depth {max_depth}'
                     if delegated:
                         line += f", {delegated} delegated"
                     lines.append(line)
@@ -1362,10 +1929,10 @@ class ThinkingEngine:
         if self.models:
             lines.append(f"\n### Mental Models: {len(self.models)} applied")
             _append_items(
-                lines, self.models,
+                lines,
+                self.models,
                 lambda m: (
-                    f"- {m.model_name}: "
-                    f"{m.conclusion[:100] if m.conclusion else '(no conclusion)'}"
+                    f"- {m.model_name}: {m.conclusion[:100] if m.conclusion else '(no conclusion)'}"
                 ),
             )
 
@@ -1373,7 +1940,8 @@ class ThinkingEngine:
         if self.decisions:
             lines.append(f"\n### Decisions: {len(self.decisions)}")
             _append_items(
-                lines, self.decisions.values(),
+                lines,
+                self.decisions.values(),
                 lambda d: (
                     f"- {d.decision_id}: "
                     f"{d.recommendation[:100] if d.recommendation else f'stage={d.stage}'}"
@@ -1384,7 +1952,8 @@ class ThinkingEngine:
         if self.debugs:
             lines.append(f"\n### Debugging: {len(self.debugs)} approaches")
             _append_items(
-                lines, self.debugs,
+                lines,
+                self.debugs,
                 lambda d: (
                     f"- {d.approach_name} on "
                     f"'{d.issue[:60]}': "
@@ -1401,10 +1970,9 @@ class ThinkingEngine:
         if self.inquiries:
             lines.append(f"\n### Scientific Inquiries: {len(self.inquiries)}")
             _append_items(
-                lines, self.inquiries.values(),
-                lambda inq: (
-                    f"- {inq.inquiry_id}: stage={inq.stage}, iter={inq.iteration}"
-                ),
+                lines,
+                self.inquiries.values(),
+                lambda inq: f"- {inq.inquiry_id}: stage={inq.stage}, iter={inq.iteration}",
             )
 
         # Monitors
@@ -1413,8 +1981,7 @@ class ThinkingEngine:
 
             def _mon(mon):  # type: ignore[no-untyped-def]
                 mon_line = (
-                    f"- {mon.task[:60]}: confidence={mon.overall_confidence:.2f}, "
-                    f"stage={mon.stage}"
+                    f"- {mon.task[:60]}: confidence={mon.overall_confidence:.2f}, stage={mon.stage}"
                 )
                 if mon.knowledge_assessment:
                     domain = mon.knowledge_assessment.get("domain", "?")
@@ -1426,9 +1993,7 @@ class ThinkingEngine:
 
         # Interference Protocols
         if self.interferences:
-            lines.append(
-                f"\n### Interference Protocols: {len(self.interferences)}"
-            )
+            lines.append(f"\n### Interference Protocols: {len(self.interferences)}")
 
             def _ip(ip):  # type: ignore[no-untyped-def]
                 ip_line = (
@@ -1437,10 +2002,7 @@ class ThinkingEngine:
                 )
                 if ip.emergent_name:
                     ip_line += f", concept={ip.emergent_name}"
-                ip_line += (
-                    f", sources={len(ip.source_laws)}, "
-                    f"fragments={len(ip.fragments)}"
-                )
+                ip_line += f", sources={len(ip.source_laws)}, fragments={len(ip.fragments)}"
                 return ip_line
 
             _append_items(lines, self.interferences.values(), _ip)
@@ -1449,17 +2011,9 @@ class ThinkingEngine:
         if self.holon_nodes:
             n_holarchies = len(self.holon_holarchies)
             n_holons = len(self.holon_nodes)
-            multi = sum(
-                1 for h in self.holon_nodes.values()
-                if len(h.memberships) > 1
-            )
-            stale = sum(
-                len(h.stale_projections) for h in self.holon_nodes.values()
-            )
-            lines.append(
-                f"\n### Holonic Workspaces: {n_holarchies} holarchies, "
-                f"{n_holons} holons"
-            )
+            multi = sum(1 for h in self.holon_nodes.values() if len(h.memberships) > 1)
+            stale = sum(len(h.stale_projections) for h in self.holon_nodes.values())
+            lines.append(f"\n### Holonic Workspaces: {n_holarchies} holarchies, {n_holons} holons")
             if multi:
                 lines.append(f"Multi-membership holons: {multi}")
             if stale:
@@ -1467,23 +2021,43 @@ class ThinkingEngine:
             for hid, root_id in self.holon_holarchies.items():
                 root = self.holon_nodes.get(root_id)
                 if root:
-                    lines.append(f"- {hid}: \"{root.name}\" (root)")
+                    lines.append(f'- {hid}: "{root.name}" (root)')
 
         # Scoring
         if self.rubrics or self.evaluations:
-            active = sum(
-                1 for e in self.evaluations.values()
-                if e.status == "active"
-            )
-            finalized = sum(
-                1 for e in self.evaluations.values()
-                if e.status == "finalized"
-            )
+            active = sum(1 for e in self.evaluations.values() if e.status == "active")
+            finalized = sum(1 for e in self.evaluations.values() if e.status == "finalized")
             lines.append(
                 f"\n### Scoring: {len(self.rubrics)} rubrics, "
                 f"{len(self.evaluations)} evaluations "
                 f"({active} active, {finalized} finalized)"
             )
+
+        # Rule validation
+        if self.rule_profiles or self.validations:
+            bound_subjects = sum(
+                1
+                for subject in self._iter_rule_bound_subjects()
+                if getattr(subject, "rule_bindings", [])
+            )
+            unresolved = sum(
+                1 for conflict in self.rule_conflicts.values() if conflict.status == "open"
+            )
+            lines.append(
+                f"\n### Rule Validation: {len(self.rule_profiles)} profiles, "
+                f"{len(self.validations)} validations, "
+                f"{unresolved} unresolved conflicts"
+            )
+            if bound_subjects:
+                lines.append(f"Bound subjects: {bound_subjects}")
+            for profile in sorted(self.rule_profiles.values(), key=lambda p: p.created_at)[:cap]:
+                active_rules = sum(1 for rule in profile.rules if rule.status == "active")
+                lines.append(
+                    f"- {profile.id}: {profile.name[:50]} "
+                    f"({active_rules} active rules, {len(profile.snapshots)} snapshots)"
+                )
+            if len(self.rule_profiles) > cap:
+                lines.append(f"- ... ({len(self.rule_profiles) - cap} more)")
 
         if len(lines) == 1:
             return "Empty thinking session — no activity recorded."
@@ -1500,17 +2074,13 @@ class ThinkingEngine:
             n_to_remove = max(1, len(tree_ids) - MAX_TREES + 1)
             for tid in tree_ids[:n_to_remove]:
                 self._evict_tree(tid)
-            logger.debug(
-                "Evicted %d trees (limit: %d)", n_to_remove, MAX_TREES
-            )
+            logger.debug("Evicted %d trees (limit: %d)", n_to_remove, MAX_TREES)
 
         # Evict oldest trees if too many nodes total (>= to make room)
         while len(self.thought_nodes) >= MAX_NODES and self.thought_trees:
             oldest_tid = next(iter(self.thought_trees))
             self._evict_tree(oldest_tid)
-            logger.debug(
-                "Evicted tree %s (node limit: %d)", oldest_tid, MAX_NODES
-            )
+            logger.debug("Evicted tree %s (node limit: %d)", oldest_tid, MAX_NODES)
 
     def _evict_tree(self, tree_id: str) -> None:
         """Remove an entire tree and all its nodes."""

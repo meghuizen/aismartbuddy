@@ -55,6 +55,11 @@ class RuntimeConfig:
     holon_truncate_chars: int = DEFAULT_HOLON_TRUNCATE_CHARS
     holon_truncate_long: int = DEFAULT_HOLON_TRUNCATE_LONG
 
+    # Reasoning-surface exposure. Default is the collapsed public registry:
+    # modern think_* tools plus non-overlapping bridge tools. Legacy V2
+    # reasoning tools can be re-exposed for compatibility/debugging.
+    expose_legacy_reasoning_tools: bool = False
+
     # Microsoft Entra ID OAuth (optional). When BOTH tenant_id and audience
     # are set, the server validates incoming Bearer tokens against the
     # configured tenant. Requires the [entra] optional dep group installed.
