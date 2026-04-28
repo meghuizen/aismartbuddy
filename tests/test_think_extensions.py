@@ -512,3 +512,679 @@ class TestPlanSparklingGrowingOrbit:
                 action="revise",
                 node_id=node_id,
             )
+
+
+def _new_session() -> str:
+    """Helper: create a fresh think session and return its id."""
+    import asyncio  # noqa: F401  # imported for parity with anyio tests
+    # Sessions are auto-created by the first call; tests pass session_id
+    # explicitly to avoid creating new sessions on every list-form call.
+    return ""
+
+
+@pytest.mark.usefixtures("_init_session_manager")
+class TestThinkHypothesisListForm:
+    """Section 2 of tool-call-efficiency-improvements.md — list-form on
+    register/invalidate actions of think_hypothesis.
+    """
+
+    @pytest.mark.anyio
+    async def test_register_empty_list_rejected(self):
+        with pytest.raises(ValueError, match="non-empty list"):
+            await think_hypothesis(action="register", items=[])
+
+    @pytest.mark.anyio
+    async def test_register_missing_required_field(self):
+        with pytest.raises(ValueError, match=r"items\[0\] \(h1\) missing required 'statement'"):
+            await think_hypothesis(
+                action="register",
+                items=[{"id": "h1"}],
+            )
+
+    @pytest.mark.anyio
+    async def test_register_duplicate_id_rejected(self):
+        with pytest.raises(ValueError, match="duplicate id 'h1'"):
+            await think_hypothesis(
+                action="register",
+                items=[
+                    {"id": "h1", "statement": "First"},
+                    {"id": "h1", "statement": "Second"},
+                ],
+            )
+
+    @pytest.mark.anyio
+    async def test_register_n1_succeeds(self):
+        result = await think_hypothesis(
+            action="register",
+            items=[{"id": "h1_solo", "statement": "Solo hypothesis"}],
+        )
+        assert "Hypotheses registered: 1" in result
+        assert "h1_solo" in result
+        assert "Status: registered" in result
+
+    @pytest.mark.anyio
+    async def test_register_nk_creates_all(self):
+        result = await think_hypothesis(
+            action="register",
+            items=[
+                {"id": "h_a", "statement": "Hypo A"},
+                {"id": "h_b", "statement": "Hypo B", "domain": "engineering"},
+                {"id": "h_c", "statement": "Hypo C", "prior_weight": 0.7},
+            ],
+        )
+        assert "Hypotheses registered: 3" in result
+        assert "h_a" in result and "h_b" in result and "h_c" in result
+        sid = None
+        # Confirm follow-up compare sees all 3 (validates that they were
+        # actually persisted under one lock acquire).
+        # Auto-session created in the previous call; now we list.
+        # We can't easily get sid without `Session:` echo, so use compare to
+        # auto-create a new session — which would fail. Instead, use the
+        # first call's auto-session via the next call's explicit session_id.
+        # Workaround: register with explicit sid, then compare.
+        from aismartbuddy.tools.infra import session_create
+        sess = await session_create(backends=["think"], mode="analyze")
+        sid = _extract_value(sess, "session_id:")
+        result2 = await think_hypothesis(
+            action="register",
+            session_id=sid,
+            items=[
+                {"id": "h_a2", "statement": "Hypo A"},
+                {"id": "h_b2", "statement": "Hypo B"},
+                {"id": "h_c2", "statement": "Hypo C"},
+            ],
+        )
+        assert "Hypotheses registered: 3" in result2
+        listed = await think_hypothesis(action="compare", session_id=sid)
+        assert "Hypotheses: 3" in listed
+        assert "h_a2" in listed and "h_b2" in listed and "h_c2" in listed
+
+    @pytest.mark.anyio
+    async def test_register_mutual_exclusion(self):
+        with pytest.raises(ValueError, match="pass either items"):
+            await think_hypothesis(
+                action="register",
+                statement="conflicting",
+                items=[{"id": "h1", "statement": "Hypo"}],
+            )
+
+    @pytest.mark.anyio
+    async def test_register_single_form_unchanged(self):
+        # Capture baseline by calling single-form; verify exact format.
+        result = await think_hypothesis(
+            action="register",
+            hypothesis_id="hyp_baseline",
+            statement="Baseline single-form statement",
+        )
+        sid = _extract_value(result, "Session:")
+        # Single-form must be unchanged byte-for-byte.
+        assert result == (
+            f"Session: {sid} | Hypothesis: hyp_baseline\nStatus: registered"
+        )
+
+    @pytest.mark.anyio
+    async def test_invalidate_empty_list_falls_through_to_single_form_error(self):
+        # An empty hypothesis_ids list should not be treated as list-form
+        # (since `if hypothesis_ids:` is false for empty list); falls
+        # through to the single-form error path which requires hypothesis_id.
+        with pytest.raises(ValueError, match="hypothesis_id is required"):
+            await think_hypothesis(action="invalidate", hypothesis_ids=[])
+
+    @pytest.mark.anyio
+    async def test_invalidate_non_string_id_rejected(self):
+        with pytest.raises(ValueError, match=r"hypothesis_ids\[0\] must be a non-empty string"):
+            await think_hypothesis(
+                action="invalidate",
+                hypothesis_ids=[123],  # type: ignore[list-item]
+            )
+
+    @pytest.mark.anyio
+    async def test_invalidate_duplicate_id_rejected(self):
+        from aismartbuddy.tools.infra import session_create
+        sess = await session_create(backends=["think"], mode="analyze")
+        sid = _extract_value(sess, "session_id:")
+        await think_hypothesis(
+            action="register",
+            session_id=sid,
+            items=[{"id": "h_dup", "statement": "S"}],
+        )
+        with pytest.raises(ValueError, match="duplicate id 'h_dup'"):
+            await think_hypothesis(
+                action="invalidate",
+                session_id=sid,
+                hypothesis_ids=["h_dup", "h_dup"],
+            )
+
+    @pytest.mark.anyio
+    async def test_invalidate_n1_list_succeeds(self):
+        from aismartbuddy.tools.infra import session_create
+        sess = await session_create(backends=["think"], mode="analyze")
+        sid = _extract_value(sess, "session_id:")
+        await think_hypothesis(
+            action="register",
+            session_id=sid,
+            items=[{"id": "h_inv1", "statement": "S"}],
+        )
+        result = await think_hypothesis(
+            action="invalidate",
+            session_id=sid,
+            hypothesis_ids=["h_inv1"],
+        )
+        assert "Hypotheses invalidated: 1" in result
+        assert "h_inv1" in result
+        assert "Reason: invalidated" in result
+
+    @pytest.mark.anyio
+    async def test_invalidate_nk_list_succeeds(self):
+        from aismartbuddy.tools.infra import session_create
+        sess = await session_create(backends=["think"], mode="analyze")
+        sid = _extract_value(sess, "session_id:")
+        await think_hypothesis(
+            action="register",
+            session_id=sid,
+            items=[
+                {"id": "h_x1", "statement": "X1"},
+                {"id": "h_x2", "statement": "X2"},
+                {"id": "h_x3", "statement": "X3"},
+            ],
+        )
+        result = await think_hypothesis(
+            action="invalidate",
+            session_id=sid,
+            hypothesis_ids=["h_x1", "h_x2", "h_x3"],
+            reason="batch test",
+        )
+        assert "Hypotheses invalidated: 3" in result
+        assert "h_x1" in result and "h_x2" in result and "h_x3" in result
+        assert "Reason: batch test" in result
+
+    @pytest.mark.anyio
+    async def test_invalidate_mutual_exclusion(self):
+        with pytest.raises(ValueError, match="pass either hypothesis_ids"):
+            await think_hypothesis(
+                action="invalidate",
+                hypothesis_id="some_id",
+                hypothesis_ids=["another_id"],
+            )
+
+    @pytest.mark.anyio
+    async def test_invalidate_single_form_unchanged(self):
+        # Ensure the single-form invalidate response format is unchanged.
+        # Don't pass session_id — let the tool auto-create one and report it.
+        registered = await think_hypothesis(
+            action="register",
+            hypothesis_id="hyp_inv_single",
+            statement="To invalidate",
+        )
+        emitted_sid = _extract_value(registered, "Session:")
+        result = await think_hypothesis(
+            action="invalidate",
+            session_id=emitted_sid,
+            hypothesis_id="hyp_inv_single",
+            reason="why",
+        )
+        assert result == (
+            f"Session: {emitted_sid} | Hypothesis: hyp_inv_single\n"
+            "Status: invalidated | Reason: why"
+        )
+
+
+@pytest.mark.usefixtures("_init_session_manager")
+class TestThinkConstraintListForm:
+    """Section 2 — list-form on register/remove actions of think_constraint."""
+
+    @pytest.mark.anyio
+    async def test_register_empty_list_rejected(self):
+        with pytest.raises(ValueError, match="non-empty list"):
+            await think_constraint(action="register", items=[])
+
+    @pytest.mark.anyio
+    async def test_register_missing_required_field(self):
+        with pytest.raises(ValueError, match=r"items\[0\] \(c1\) missing required 'statement'"):
+            await think_constraint(
+                action="register",
+                items=[{"id": "c1", "domain": "d", "type": "hard"}],
+            )
+
+    @pytest.mark.anyio
+    async def test_register_invalid_type_rejected(self):
+        with pytest.raises(ValueError, match=r"field 'type'"):
+            await think_constraint(
+                action="register",
+                items=[{
+                    "id": "c1",
+                    "domain": "d",
+                    "type": "neither-hard-nor-soft",
+                    "statement": "s",
+                }],
+            )
+
+    @pytest.mark.anyio
+    async def test_register_duplicate_id_rejected(self):
+        with pytest.raises(ValueError, match="duplicate id 'cd'"):
+            await think_constraint(
+                action="register",
+                items=[
+                    {"id": "cd", "domain": "d", "type": "hard", "statement": "s"},
+                    {"id": "cd", "domain": "d", "type": "soft", "statement": "s"},
+                ],
+            )
+
+    @pytest.mark.anyio
+    async def test_register_n1_succeeds(self):
+        result = await think_constraint(
+            action="register",
+            items=[{
+                "id": "c_solo",
+                "domain": "data",
+                "type": "hard",
+                "statement": "Single-item constraint",
+            }],
+        )
+        assert "Constraints registered: 1" in result
+        assert "c_solo" in result
+        assert "Status: registered" in result
+
+    @pytest.mark.anyio
+    async def test_register_nk_creates_all(self):
+        from aismartbuddy.tools.infra import session_create
+        sess = await session_create(backends=["think"], mode="analyze")
+        sid = _extract_value(sess, "session_id:")
+        result = await think_constraint(
+            action="register",
+            session_id=sid,
+            items=[
+                {"id": "ck_a", "domain": "d", "type": "hard", "statement": "A"},
+                {"id": "ck_b", "domain": "d", "type": "soft", "statement": "B"},
+                {"id": "ck_c", "domain": "d", "type": "hard", "statement": "C"},
+            ],
+        )
+        assert "Constraints registered: 3" in result
+        listed = await think_constraint(action="list", session_id=sid)
+        assert "Constraints: 3" in listed
+
+    @pytest.mark.anyio
+    async def test_register_mutual_exclusion(self):
+        with pytest.raises(ValueError, match="pass either items"):
+            await think_constraint(
+                action="register",
+                statement="conflicting",
+                items=[{"id": "c", "domain": "d", "type": "hard", "statement": "s"}],
+            )
+
+    @pytest.mark.anyio
+    async def test_register_single_form_unchanged(self):
+        result = await think_constraint(
+            action="register",
+            constraint_id="c_baseline",
+            domain="d",
+            type="hard",
+            statement="single-form",
+        )
+        sid = _extract_value(result, "Session:")
+        assert result == (
+            f"Session: {sid} | Constraint: c_baseline\nStatus: registered"
+        )
+
+    @pytest.mark.anyio
+    async def test_remove_non_string_rejected(self):
+        with pytest.raises(ValueError, match=r"constraint_ids\[0\] must be a non-empty string"):
+            await think_constraint(
+                action="remove",
+                constraint_ids=[123],  # type: ignore[list-item]
+            )
+
+    @pytest.mark.anyio
+    async def test_remove_duplicate_id_rejected(self):
+        with pytest.raises(ValueError, match="duplicate id 'cr'"):
+            await think_constraint(
+                action="remove",
+                constraint_ids=["cr", "cr"],
+            )
+
+    @pytest.mark.anyio
+    async def test_remove_n1_succeeds(self):
+        from aismartbuddy.tools.infra import session_create
+        sess = await session_create(backends=["think"], mode="analyze")
+        sid = _extract_value(sess, "session_id:")
+        await think_constraint(
+            action="register",
+            session_id=sid,
+            constraint_id="c_rm1",
+            domain="d",
+            type="hard",
+            statement="x",
+        )
+        result = await think_constraint(
+            action="remove",
+            session_id=sid,
+            constraint_ids=["c_rm1"],
+        )
+        assert "Constraints removed: 1" in result
+        assert "c_rm1" in result
+
+    @pytest.mark.anyio
+    async def test_remove_nk_succeeds(self):
+        from aismartbuddy.tools.infra import session_create
+        sess = await session_create(backends=["think"], mode="analyze")
+        sid = _extract_value(sess, "session_id:")
+        await think_constraint(
+            action="register",
+            session_id=sid,
+            items=[
+                {"id": f"crm_{n}", "domain": "d", "type": "hard", "statement": "x"}
+                for n in range(3)
+            ],
+        )
+        result = await think_constraint(
+            action="remove",
+            session_id=sid,
+            constraint_ids=["crm_0", "crm_1", "crm_2"],
+        )
+        assert "Constraints removed: 3" in result
+
+    @pytest.mark.anyio
+    async def test_remove_mutual_exclusion(self):
+        with pytest.raises(ValueError, match="pass either constraint_ids"):
+            await think_constraint(
+                action="remove",
+                constraint_id="x",
+                constraint_ids=["y"],
+            )
+
+    @pytest.mark.anyio
+    async def test_remove_single_form_unchanged(self):
+        # Auto-create session via the first call; reuse the emitted Session
+        # id so the byte-for-byte comparison below uses the THINK backend's
+        # actual session id (not a parent id).
+        registered = await think_constraint(
+            action="register",
+            constraint_id="c_rm_single",
+            domain="d",
+            type="hard",
+            statement="x",
+        )
+        emitted_sid = _extract_value(registered, "Session:")
+        result = await think_constraint(
+            action="remove",
+            session_id=emitted_sid,
+            constraint_id="c_rm_single",
+        )
+        assert result == (
+            f"Session: {emitted_sid} | Constraint: c_rm_single\nStatus: removed"
+        )
+
+
+@pytest.mark.usefixtures("_init_session_manager")
+class TestThinkEvidenceListForm:
+    """Section 2 — list-form on register/chain actions of think_evidence."""
+
+    @pytest.mark.anyio
+    async def test_register_empty_list_rejected(self):
+        with pytest.raises(ValueError, match="non-empty list"):
+            await think_evidence(action="register", items=[])
+
+    @pytest.mark.anyio
+    async def test_register_missing_required_field(self):
+        with pytest.raises(ValueError, match=r"items\[0\] \(e1\) missing required 'source_type'"):
+            await think_evidence(
+                action="register",
+                items=[{"id": "e1", "content": "x"}],
+            )
+
+    @pytest.mark.anyio
+    async def test_register_invalid_source_type(self):
+        with pytest.raises(ValueError, match=r"field 'source_type'"):
+            await think_evidence(
+                action="register",
+                items=[{"id": "e1", "content": "x", "source_type": "fake-type"}],
+            )
+
+    @pytest.mark.anyio
+    async def test_register_duplicate_id_rejected(self):
+        with pytest.raises(ValueError, match="duplicate id 'ed'"):
+            await think_evidence(
+                action="register",
+                items=[
+                    {"id": "ed", "content": "1", "source_type": "measurement"},
+                    {"id": "ed", "content": "2", "source_type": "measurement"},
+                ],
+            )
+
+    @pytest.mark.anyio
+    async def test_register_n1_succeeds(self):
+        result = await think_evidence(
+            action="register",
+            items=[{"id": "e_solo", "content": "obs", "source_type": "observation"}],
+        )
+        assert "Evidence registered: 1" in result
+        assert "e_solo" in result
+
+    @pytest.mark.anyio
+    async def test_register_nk_creates_all(self):
+        from aismartbuddy.tools.infra import session_create
+        sess = await session_create(backends=["think"], mode="analyze")
+        sid = _extract_value(sess, "session_id:")
+        result = await think_evidence(
+            action="register",
+            session_id=sid,
+            items=[
+                {"id": f"e_{n}", "content": f"c{n}", "source_type": "measurement"}
+                for n in range(4)
+            ],
+        )
+        assert "Evidence registered: 4" in result
+        listed = await think_evidence(action="list", session_id=sid)
+        assert "Evidence items: 4" in listed
+
+    @pytest.mark.anyio
+    async def test_register_mutual_exclusion(self):
+        with pytest.raises(ValueError, match="pass either items"):
+            await think_evidence(
+                action="register",
+                content="conflicting",
+                items=[{"id": "e", "content": "x", "source_type": "measurement"}],
+            )
+
+    @pytest.mark.anyio
+    async def test_register_single_form_unchanged(self):
+        result = await think_evidence(
+            action="register",
+            evidence_id="e_baseline",
+            content="c",
+            source_type="measurement",
+        )
+        sid = _extract_value(result, "Session:")
+        assert result == (
+            f"Session: {sid} | Evidence: e_baseline\nStatus: registered"
+        )
+
+    @pytest.mark.anyio
+    async def test_chain_missing_required_field(self):
+        with pytest.raises(ValueError, match=r"items\[0\] \(ch1\) missing required 'to_id'"):
+            await think_evidence(
+                action="chain",
+                items=[{"id": "ch1", "from_id": "e1", "inference_type": "deductive"}],
+            )
+
+    @pytest.mark.anyio
+    async def test_chain_duplicate_id_rejected(self):
+        with pytest.raises(ValueError, match="duplicate id 'ch_dup'"):
+            await think_evidence(
+                action="chain",
+                items=[
+                    {"id": "ch_dup", "from_id": "e1", "to_id": "h1", "inference_type": "deductive"},
+                    {"id": "ch_dup", "from_id": "e1", "to_id": "h2", "inference_type": "inductive"},
+                ],
+            )
+
+    @pytest.mark.anyio
+    async def test_chain_n1_succeeds(self):
+        result = await think_evidence(
+            action="chain",
+            items=[
+                {"id": "ch_solo", "from_id": "e1", "to_id": "h1", "inference_type": "deductive"},
+            ],
+        )
+        assert "Evidence chains added: 1" in result
+        assert "ch_solo" in result
+
+    @pytest.mark.anyio
+    async def test_chain_nk_succeeds(self):
+        from aismartbuddy.tools.infra import session_create
+        sess = await session_create(backends=["think"], mode="analyze")
+        sid = _extract_value(sess, "session_id:")
+        result = await think_evidence(
+            action="chain",
+            session_id=sid,
+            items=[
+                {"id": f"ch_{n}", "from_id": "e1", "to_id": f"h{n}", "inference_type": "deductive"}
+                for n in range(3)
+            ],
+        )
+        assert "Evidence chains added: 3" in result
+
+    @pytest.mark.anyio
+    async def test_chain_mutual_exclusion(self):
+        with pytest.raises(ValueError, match="pass either items"):
+            await think_evidence(
+                action="chain",
+                from_id="x",
+                items=[
+                    {"id": "ch", "from_id": "e", "to_id": "h", "inference_type": "deductive"},
+                ],
+            )
+
+    @pytest.mark.anyio
+    async def test_chain_single_form_unchanged(self):
+        # Single-form generates an internal id; we verify the structural
+        # format of the response (everything except the generated chain id).
+        result = await think_evidence(
+            action="chain",
+            from_id="ee1",
+            to_id="hh1",
+            inference_type="deductive",
+        )
+        emitted_sid = _extract_value(result, "Session:")
+        # Expected: "Session: {sid} | Evidence chain: chain_<hex>\n
+        # ee1 --[deductive]--> hh1"
+        lines = result.split("\n")
+        assert len(lines) == 2
+        assert lines[0].startswith(f"Session: {emitted_sid} | Evidence chain: chain_")
+        assert lines[1] == "ee1 --[deductive]--> hh1"
+
+
+@pytest.mark.usefixtures("_init_session_manager")
+class TestThinkTopologyListForm:
+    """Section 2 — list-form on define action of think_topology."""
+
+    @pytest.mark.anyio
+    async def test_define_empty_list_rejected(self):
+        with pytest.raises(ValueError, match="non-empty list"):
+            await think_topology(action="define", items=[])
+
+    @pytest.mark.anyio
+    async def test_define_missing_required_field(self):
+        with pytest.raises(ValueError, match=r"items\[0\] \(t1\) missing required 'nodes'"):
+            await think_topology(
+                action="define",
+                items=[{
+                    "id": "t1",
+                    "domain": "d",
+                }],
+            )
+
+    @pytest.mark.anyio
+    async def test_define_invalid_node_role(self):
+        with pytest.raises(ValueError, match=r"field 'nodes'"):
+            await think_topology(
+                action="define",
+                items=[{
+                    "id": "t1",
+                    "domain": "d",
+                    "nodes": [{"id": "n", "role": "WRONG"}],
+                    "edges": [],
+                }],
+            )
+
+    @pytest.mark.anyio
+    async def test_define_duplicate_id_rejected(self):
+        with pytest.raises(ValueError, match="duplicate id 'td'"):
+            await think_topology(
+                action="define",
+                items=[
+                    {
+                        "id": "td", "domain": "d",
+                        "nodes": [{"id": "n", "role": "SOURCE"}],
+                        "edges": [{"from": "n", "to": "n", "type": "COUPLES"}],
+                    },
+                    {
+                        "id": "td", "domain": "d",
+                        "nodes": [{"id": "n", "role": "SINK"}],
+                        "edges": [{"from": "n", "to": "n", "type": "DELAYS"}],
+                    },
+                ],
+            )
+
+    @pytest.mark.anyio
+    async def test_define_n1_succeeds(self):
+        result = await think_topology(
+            action="define",
+            items=[{
+                "id": "t_solo",
+                "name": "Solo",
+                "domain": "engineering",
+                "nodes": [{"id": "n", "role": "SOURCE"}],
+                "edges": [{"from": "n", "to": "n", "type": "COUPLES"}],
+            }],
+        )
+        assert "Topologies defined: 1" in result
+        assert "t_solo" in result
+
+    @pytest.mark.anyio
+    async def test_define_nk_creates_all(self):
+        from aismartbuddy.tools.infra import session_create
+        sess = await session_create(backends=["think"], mode="analyze")
+        sid = _extract_value(sess, "session_id:")
+        result = await think_topology(
+            action="define",
+            session_id=sid,
+            items=[
+                {
+                    "id": f"tk_{n}", "domain": "d",
+                    "nodes": [{"id": "x", "role": "SOURCE"}],
+                    "edges": [{"from": "x", "to": "x", "type": "COUPLES"}],
+                }
+                for n in range(3)
+            ],
+        )
+        assert "Topologies defined: 3" in result
+        listed = await think_topology(action="search", session_id=sid)
+        assert "Topologies: 3" in listed
+
+    @pytest.mark.anyio
+    async def test_define_mutual_exclusion(self):
+        with pytest.raises(ValueError, match="pass either items"):
+            await think_topology(
+                action="define",
+                topology_id="conflict",
+                items=[{
+                    "id": "t", "domain": "d",
+                    "nodes": [{"id": "n", "role": "SOURCE"}],
+                    "edges": [],
+                }],
+            )
+
+    @pytest.mark.anyio
+    async def test_define_single_form_unchanged(self):
+        result = await think_topology(
+            action="define",
+            topology_id="t_baseline",
+            name="Single-form name",
+            nodes=[{"id": "n", "role": "SOURCE"}],
+            edges=[{"from": "n", "to": "n", "type": "COUPLES"}],
+        )
+        sid = _extract_value(result, "Session:")
+        assert result == (
+            f"Session: {sid} | Topology: t_baseline\nStatus: defined"
+        )

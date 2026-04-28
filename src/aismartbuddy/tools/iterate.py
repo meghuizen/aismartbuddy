@@ -36,7 +36,7 @@ async def iterate(
     higher_is_better: bool = True,
     ctx: _MCPContext | None = None,
 ) -> str:
-    """Track a build-test-learn cycle. Lightweight by design.
+    """[ELABORATE] Track a build-test-learn cycle. Lightweight by design.
 
     Actions:
         start: Begin a new iteration. Requires goal. Returns iteration_id.

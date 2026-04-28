@@ -176,7 +176,10 @@ class TestScoreEvaluateFindingBatch:
             ],
         )
         assert "Batch: 3 findings applied" in result
-        assert "Running scores:" in result
+        # Section 7 trim: arrow-chain Running scores line is gone; the
+        # per-finding running_score lives in the Results: [...] JSON.
+        assert "Running scores:" not in result
+        assert "running_score" in result
         assert "loses the incremental" in result.lower()
 
     @pytest.mark.anyio

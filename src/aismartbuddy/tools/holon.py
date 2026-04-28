@@ -162,10 +162,11 @@ async def holon_create(
     properties: list[str] | None = None,
     projection: str = "",
     holons: list[dict] | None = None,
+    auto_graph: bool = False,
     rule_profile_ids: list[str] | None = None,
     ctx: _MCPContext | None = None,
 ) -> str:
-    """Create a holon — an entity that is both a whole and a part.
+    """[ELABORATE] Create a holon — an entity that is both a whole and a part.
 
     Single mode: omit `holons`. Provide name + description (+ optional
     parent_id, holarchy_id, role_in_parent, context, rules, properties,
@@ -176,6 +177,10 @@ async def holon_create(
     to create N holons atomically in one call. parent_ref may reference
     another holon in the batch (by its temp ref) or an existing holon_id.
     All-or-nothing: validation failures abort the whole batch.
+
+    Pass auto_graph=True (requires session_create(backends=['think','graph']))
+    to materialise each holon as a KnowledgeNode with PartOf edges in one
+    round-trip. Batch-mode only — auto_graph requires holons=[...].
 
     To add an existing holon to a second holarchy, use holon_update
     with action="join_holarchy".
@@ -194,10 +199,16 @@ async def holon_create(
         holons: Batch mode — list of dicts. Each: {ref, name, description,
             parent_ref?, holarchy_id?, role_in_parent?, context?, rules?,
             properties?, projection?}. Topologically resolved server-side.
+        auto_graph: Batch-only (holons=[...]). When True + parent session has
+            graph backend, materialise each holon as a KnowledgeNode +
+            parent_ref edges (PartOf) in one round trip. Requires an
+            explicit unified session_id from
+            session_create(backends=['think','graph']).
 
     Returns:
         Single mode: compact status with holon position.
-        Batch mode: ref→id mapping for all created holons.
+        Batch mode: ref→id mapping for all created holons (+ graph node
+        count if auto_graph).
     """
     _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
     engine = _engine(info)
@@ -230,14 +241,58 @@ async def holon_create(
         for hid_val in [item.get("holarchy_id") or default_hid for item in holons]:
             hids_used.add(hid_val)
         ref_lines = ", ".join(f"{r}={i}" for r, i in ref_to_id.items())
-        return (
-            f"Session: {sid} | Batch: {len(ref_to_id)} holons created\n"
-            f"Holarchies: {', '.join(sorted(hids_used))}\n"
-            f"Refs: {ref_lines}\n"
-            "Status: created"
-        )
+
+        graph_count = 0
+        if auto_graph:
+            from aismartbuddy.tools import materialize_auto_graph
+
+            if not session_id:
+                raise ValueError(
+                    "auto_graph requires an explicit unified session_id from "
+                    "session_create(backends=['think','graph'])."
+                )
+            # Build a synthetic items list keyed on the FINAL assigned holon-id
+            # so KnowledgeNode rows match how downstream tools reference holons.
+            # parent_ref values are mapped through ref_to_id when they refer to
+            # a batch ref; existing holon-ids pass through via dict.get fallback.
+            synthetic = [
+                {
+                    "id": ref_to_id[h["ref"]],
+                    "description": h.get("description", ""),
+                    "parent_ref": (
+                        [ref_to_id.get(h["parent_ref"], h["parent_ref"])]
+                        if h.get("parent_ref")
+                        else []
+                    ),
+                }
+                for h in holons
+            ]
+            graph_count = await materialize_auto_graph(
+                session_id,
+                synthetic,
+                source_tag="holon_create",
+                entity_type="holon",
+                description_field="description",
+                edge_label="PartOf",
+                ref_field="parent_ref",
+            )
+
+        out_lines = [
+            f"Session: {sid} | Batch: {len(ref_to_id)} holons created",
+            f"Holarchies: {', '.join(sorted(hids_used))}",
+            f"Refs: {ref_lines}",
+        ]
+        if auto_graph:
+            out_lines.append(f"Graph nodes created: {graph_count}")
+        out_lines.append("Status: created")
+        return "\n".join(out_lines)
 
     # ── Single mode (existing behavior) ────────────────
+    if auto_graph:
+        raise ValueError(
+            "auto_graph is only supported in batch mode. "
+            "Pass holons=[...] to use auto_graph."
+        )
     if not name:
         raise ValueError("Single-mode holon_create requires 'name'")
     if not description:
@@ -323,7 +378,7 @@ async def holon_update(
     lens_findings: str | None = None,
     rule_profile_ids: list[str] | None = None,
 ) -> str:
-    """Update a holon's state, join a holarchy, or add an analytical lens.
+    """[ELABORATE] Update a holon's state, join a holarchy, or add an analytical lens.
 
     Actions:
         context: Update working state (requires content).
@@ -525,7 +580,7 @@ async def holon_view(
     levels_up: int = 1,
     levels_down: int = 1,
 ) -> str:
-    """Navigate the holarchy while preserving context at each level.
+    """[ELABORATE] Navigate the holarchy while preserving context at each level.
 
     Actions:
         zoom_in: Descend one level. Shows children with parent
@@ -751,7 +806,7 @@ async def holon_analyze(
     from_id: str | None = None,
     to_id: str | None = None,
 ) -> str:
-    """Analyze holarchy patterns, propagate insights, find bridges.
+    """[ELABORATE] Analyze holarchy patterns, propagate insights, find bridges.
 
     Actions:
         tensions: Scan for structural problems — missing levels,
@@ -1233,7 +1288,7 @@ async def holon_query(
     holarchy_id: str | None = None,
     resolution: str = "local",
 ) -> str:
-    """Query the holarchy from a specific vantage point and resolution.
+    """[ELABORATE] Query the holarchy from a specific vantage point and resolution.
 
     Assembles context visible from the vantage holon at the
     specified resolution and presents it as a structured briefing.

@@ -521,13 +521,15 @@ Every option also reads from an `AISMARTBUDDY_*` environment variable (e.g. `AIS
 |---|---|
 | **SQL (DuckDB)** | `sql_create_session`, `sql_query`, `sql_query_next`, `sql_import`, `sql_import_batch`, `sql_schema`, `sql_destroy_session` |
 | **Graph (LadybugDB)** | `graph_create_session`, `graph_query`, `graph_query_next`, `graph_import`, `graph_schema`, `graph_destroy_session`, `graph_statistics`, `graph_neighbors`, `graph_find_connections`, `graph_analyze`, `graph_compare`, `graph_cross_reference`, `graph_knowledge_add`, `graph_knowledge_relate`, `graph_knowledge_infer`, `graph_knowledge_summary` |
-| **Thinking** | `think_create_session`, `think_graph`, `think_graph_validate`, `think_graph_delegate`, `think_decide`, `think_model`, `think_debug`, `think_argue`, `think_collaborate`, `think_science`, `think_monitor`, `think_visualize`, `think_summarize`, `think_destroy_session`, `think_interfere`, `think_interfere_state` |
+| **Thinking** | `think_create_session`, `think_graph`, `think_graph_validate`, `think_graph_delegate`, `think_decide`, `think_model`, `think_debug`, `think_argue`, `think_science`, `think_monitor`, `think_summarize`, `think_destroy_session`, `think_interfere`, `think_interfere_state` |
 | **Holonic** | `holon_create`, `holon_update`, `holon_view`, `holon_analyze`, `holon_query` |
 | **Scoring** | `score_rubric`, `score_evaluate`, `score_gate` |
 | **YouTube** | `get_youtube_information` |
 | **Meta** | `suggest_database` |
 
 See `CLAUDE.md` for tool descriptions and usage patterns. The server also exposes 5 prompts (guides) and 2 resources (sessions listing).
+
+**The `items=[...]` forcing-function pattern**: SCAFFOLD/ASSESS thinking tools (`think_model`, `think_science`, `think_decide`, `think_monitor`, etc.) accept `items=[{id, ...required_fields}, ...]` for one round-trip → N validated outputs. Each item is checked against the same per-tool schema; the server fail-fast rejects the whole batch on the first violation with the failing index + missing field. Pair it with `auto_graph=True` (when the session was created via `session_create(backends=["think","graph"])`) to materialise each item as a `KnowledgeNode` in the graph backend with `connects_to`/`parent_ref`/`responds_to_index`/`subject_id` edges in the same call — eliminating the manual KG construction phase.
 
 ---
 

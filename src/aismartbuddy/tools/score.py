@@ -78,7 +78,7 @@ async def score_rubric(
     scoring_strategy: str = "weighted_deduction",
     ctx: Context | None = None,
 ) -> str:
-    """Create or list scoring rubrics.
+    """[ASSESS] Create or list scoring rubrics.
 
     A rubric defines the scoring framework: dimensions with weights,
     severity levels, deduction amounts, pass threshold, and strategy.
@@ -373,7 +373,7 @@ async def rubric_templates(
     session_id: str | None = None,
     ctx: Context | None = None,
 ) -> str:
-    """List or load pre-built scoring rubrics.
+    """[ASSESS] List or load pre-built scoring rubrics.
 
     Templates ship with the server: security_review, architecture_review,
     code_review, code_quality, research_quality, hypothesis_strength,
@@ -433,6 +433,64 @@ async def rubric_templates(
     )
 
 
+def _build_finalize_block(
+    info,
+    engine,
+    ev: EvaluationRecord,
+    rubric: RubricRecord,
+    *,
+    use_bound_profiles: bool,
+    analysis_refs: list[str] | None,
+) -> str:
+    """Render the finalize body (final score + dimension table + rules).
+
+    Used by action="finalize" and by action="batch_findings" with
+    auto_finalize=True to produce the same shape after the
+    EvaluationRecord has already been finalized in the engine.
+    """
+    sev_counts: dict[str, int] = {}
+    for f in ev.findings:
+        sev_counts[f.severity] = sev_counts.get(f.severity, 0) + 1
+
+    dim_lines = []
+    for d in rubric.dimensions:
+        did = d["id"]
+        score = ev.dimension_scores.get(did, rubric.scale_max)
+        n_findings = sum(1 for f in ev.findings if f.dimension == did)
+        dim_lines.append(f"  {did}: {score:.1f}/{rubric.scale_max} ({n_findings} findings)")
+
+    sev_str = ", ".join(f"{s}={sev_counts.get(s, 0)}" for s in rubric.severity_levels)
+    pass_str = "PASS" if ev.passed else "FAIL"
+
+    rule_summary = None
+    if use_bound_profiles or ev.rule_bindings:
+        latest_rule_validation = engine.get_latest_validation(ev.id, "evaluation")
+        if latest_rule_validation is None:
+            latest_rule_validation = engine.validate_subject(
+                ev.id,
+                "evaluation",
+                [],
+                use_bound_profiles=True,
+                validation_id=uuid.uuid4().hex[:10],
+                refs=analysis_refs,
+            )
+        rule_summary = engine.subject_rule_validation_summary(ev.id, "evaluation")
+        if latest_rule_validation and not latest_rule_validation.passed_hard_gates:
+            ev.passed = False
+            pass_str = "FAIL"
+
+    lines = [
+        f"Final score: {ev.final_score}/{rubric.scale_max} | Pass: {pass_str}",
+        f"Threshold: {rubric.pass_threshold} | Strategy: {rubric.scoring_strategy}",
+        f"Findings: {len(ev.findings)} ({sev_str})",
+        "Dimension scores:",
+    ]
+    lines.extend(dim_lines)
+    if rule_summary is not None:
+        lines.append(_format_rule_validation_summary(rule_summary))
+    return "\n".join(lines)
+
+
 async def score_evaluate(
     action: str,
     session_id: str | None = None,
@@ -447,6 +505,7 @@ async def score_evaluate(
     recommendation: str | None = None,
     summary: str | None = None,
     dimensions_reviewed: list[str] | None = None,
+    auto_finalize: bool = False,
     findings: list[dict] | None = None,
     use_latest: bool = False,
     analysis_refs: list[str] | None = None,
@@ -462,7 +521,7 @@ async def score_evaluate(
     scoring_strategy: str = "weighted_deduction",
     ctx: Context | None = None,
 ) -> str:
-    """Start an evaluation, submit findings, or finalize.
+    """[ASSESS] Start an evaluation, submit findings, or finalize.
 
     The key design: findings are submitted individually. The server
     computes the running score after each, preventing the AI from
@@ -499,9 +558,13 @@ async def score_evaluate(
         description: What was found (for finding).
         evidence: Where the finding was observed (for finding).
         recommendation: How to fix it (for finding).
-        summary: Overall evaluation summary (for finalize).
+        summary: Overall evaluation summary (for finalize, also required
+            when auto_finalize=True on batch_findings).
         dimensions_reviewed: Extra dimensions reviewed with no
-            findings (for finalize).
+            findings (for finalize, also used when auto_finalize=True).
+        auto_finalize: When True on action="batch_findings", finalize the
+            evaluation in the same call after applying findings. Requires
+            a non-empty `summary`. Default False (backward-compat).
         use_latest: Resolve the latest active evaluation in scope when
             evaluation_id is omitted.
         analysis_refs: IDs from think_* or extracted findings to keep an audit trail.
@@ -654,6 +717,12 @@ async def score_evaluate(
     if action in {"batch_findings", "finding_batch"}:
         if not findings:
             raise ValueError("findings list must be non-empty")
+        if auto_finalize and not (summary and summary.strip()):
+            raise ValueError(
+                "auto_finalize=True requires a 'summary' parameter — "
+                "finalize records the evaluation conclusion. Without a "
+                "summary, use action='finalize' separately."
+            )
         info, engine, ev = _find_evaluation_session(
             evaluation_id, session_id=session_id, use_latest=use_latest
         )
@@ -687,6 +756,8 @@ async def score_evaluate(
         running_scores: list[float] = []
         finding_ids: list[str] = []
         result_rows: list[str] = []
+        finalize_missing: list[str] = []
+        finalized_ev: EvaluationRecord | None = None
         with engine.state_lock:
             for f in findings:
                 fr = FindingRecord(
@@ -720,12 +791,17 @@ async def score_evaluate(
                         separators=(",", ":"),
                     )
                 )
+            if auto_finalize:
+                # finalize_evaluation is @_synchronized over the same RLock;
+                # reentrant acquisition is safe.
+                finalize_missing, finalized_ev = engine.finalize_evaluation(
+                    ev.id, dimensions_reviewed, summary or ""
+                )
         for finding_id in finding_ids:
             finding = next((f for f in ev.findings if f.id == finding_id), None)
             if finding is not None:
                 await _materialize_evaluation_graph(ev, finding)
 
-        running_str = " -> ".join(f"{s}" for s in running_scores)
         final_running = running_scores[-1]
         threshold_status = (
             "above_threshold" if final_running >= rubric.pass_threshold else "below_threshold"
@@ -733,13 +809,27 @@ async def score_evaluate(
         response = (
             f"Session: {info.session_id} | Eval: {ev.id}"
             f" | Batch: {len(findings)} findings applied\n"
-            f"evaluation_id: {ev.id}\n"
             f"Results: [{', '.join(result_rows)}]\n"
-            f"Running scores: {running_str}\n"
             f"Final: {final_running}/{rubric.scale_max}"
             f" (threshold {rubric.pass_threshold}) | {threshold_status}\n"
             f"Finding IDs: {', '.join(finding_ids)}"
         )
+        if auto_finalize:
+            if finalize_missing:
+                response += (
+                    f"\nCANNOT FINALIZE: required dimensions not reviewed: "
+                    f"{', '.join(finalize_missing)}\n"
+                    "Submit findings or include in dimensions_reviewed."
+                )
+            elif finalized_ev is not None:
+                response += "\n" + _build_finalize_block(
+                    info,
+                    engine,
+                    finalized_ev,
+                    rubric,
+                    use_bound_profiles=use_bound_profiles,
+                    analysis_refs=analysis_refs,
+                )
         if action == "finding_batch":
             response += (
                 "\n⚠ finding_batch loses the incremental self-assessment "
@@ -860,7 +950,7 @@ async def score_gate(
     limit: int = 10,
     use_latest: bool = False,
 ) -> str:
-    """Check scoring gates or list evaluation history.
+    """[ASSESS] Check scoring gates or list evaluation history.
 
     Actions:
         gate: Lightweight pass/fail check for hooks. Returns

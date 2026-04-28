@@ -686,23 +686,33 @@ def _compose_next_hint(tool: str, key_arg: str, ids: list[str]) -> str:
 
 
 def _long_thought_warnings(entries: list[tuple[str, str]]) -> str:
-    """Return a multi-line advisory string for any entries whose content
-    exceeds the soft length threshold, or "" if none.
+    """Return a compact advisory string for entries whose content exceeds the
+    soft length threshold, or "" if none.
 
     entries: list of (label, content) pairs, where label identifies the
     offending thought (e.g. "thought", "thoughts[3]", "children[1]").
+
+    Single offender: full per-entry note. Multiple offenders: single-line
+    summary count to keep the response compact (the agent has already
+    submitted; itemising every long entry just inflates the response).
     """
-    notes: list[str] = []
+    offenders: list[tuple[str, int]] = []
     for label, content in entries:
         length = len(content or "")
         if length > _LONG_THOUGHT_THRESHOLD:
-            notes.append(
-                f"Note: {label} is {length} chars — consider action='branch' "
-                f"with children=[...] to keep nodes queryable."
-            )
-    if not notes:
+            offenders.append((label, length))
+    if not offenders:
         return ""
-    return "\n".join(notes) + "\n"
+    if len(offenders) == 1:
+        label, length = offenders[0]
+        return (
+            f"Note: {label} is {length} chars — consider action='branch' "
+            f"with children=[...] to keep nodes queryable.\n"
+        )
+    return (
+        f"Note: {len(offenders)} thoughts exceed {_LONG_THOUGHT_THRESHOLD} chars "
+        f"(use action='branch' to split).\n"
+    )
 
 
 # ── Tool: Thought Graph ─────────────────────────────────────
@@ -741,6 +751,7 @@ async def think_graph(
     min_children: int | None = None,
     rule_profile_ids: list[str] | None = None,
     idempotency_key: str | None = None,
+    auto_graph: bool = False,
     ctx: _MCPContext | None = None,
 ) -> str:
     """Thought graph — structured thinking with progressive complexity.
@@ -842,6 +853,17 @@ async def think_graph(
         idempotency_key: Optional retry token for safe write retries. If the
             same session_id + key combination already completed, the server
             returns the original result without creating duplicate nodes.
+        auto_graph: Batch-only (thoughts=[...]). When True + parent session
+            has graph backend, materialise each thought as a KnowledgeNode and
+            each parent_ref as a BranchOf edge in one round trip.
+
+    Pass auto_graph=True (requires session_create(backends=['think','graph']))
+    to materialise each item as a KnowledgeNode with BranchOf edges in one
+    round-trip.
+
+    Returns a 'Suggested next:' line at end of response with canonical
+    follow-up call pre-filled (after action='synthesize'). Read it before
+    deciding the next step.
 
     Returns:
         Compact status with node position and tree structure.
@@ -942,22 +964,72 @@ async def think_graph(
                 bindings=node.rule_bindings,
                 source="think_graph",
             )
+
+        graph_count = 0
+        if auto_graph:
+            from aismartbuddy.tools import materialize_auto_graph
+
+            if not session_id:
+                raise ValueError(
+                    "auto_graph requires an explicit unified session_id from "
+                    "session_create(backends=['think','graph'])."
+                )
+            # Build assigned-id list in batch order so int parent_ref values
+            # resolve to the engine-assigned node ids.
+            thought_ids = [node.id for node in created]
+            synthetic = [
+                {
+                    "id": thought_ids[i],
+                    "thought": specs[i]["content"],
+                    "parent_ref": (
+                        [thoughts[i]["parent_ref"]]
+                        if thoughts[i].get("parent_ref") is not None
+                        else []
+                    ),
+                }
+                for i in range(len(thought_ids))
+            ]
+
+            def _resolve_thought_ref(r: object) -> str | None:
+                if isinstance(r, int):
+                    if 0 <= r < len(thought_ids):
+                        return thought_ids[r]
+                    return None
+                # str → pass through (existing node id); None handled by
+                # the empty list short-circuit above.
+                return None
+
+            graph_count = await materialize_auto_graph(
+                session_id,
+                synthetic,
+                source_tag="think_graph",
+                entity_type="thought",
+                description_field="thought",
+                edge_label="BranchOf",
+                ref_field="parent_ref",
+                ref_resolver=_resolve_thought_ref,
+            )
+
         warning = _long_thought_warnings(
             [(f"thoughts[{i}]", spec["content"]) for i, spec in enumerate(specs)]
         )
-        result = warning + "\n".join(
-            [
-                f"Session: {sid} | Batch nodes created: {len(created)}",
-                "Node IDs: " + ", ".join(created_refs),
-                "Trees: " + ", ".join(dict.fromkeys(node.tree_id for node in created)),
-                "Status: batch added",
-            ]
-        )
+        out_lines = [
+            f"Session: {sid} | Batch nodes created: {len(created)}",
+            "Node IDs: " + ", ".join(created_refs),
+            "Trees: " + ", ".join(dict.fromkeys(node.tree_id for node in created)),
+        ]
+        if auto_graph:
+            out_lines.append(f"Graph nodes created: {graph_count}")
+        out_lines.append("Status: batch added")
+        result = warning + "\n".join(out_lines)
         return _store_idempotent_result(sid, idempotency_key, result)
 
     # ── Think / Branch / Synthesize: add new node ────────
     if not thought:
-        raise ValueError("thought is required in single-node mode")
+        raise ValueError(
+            "thought is required in single-node mode. PREFER thoughts=[{thought, "
+            "parent_ref, ...}, ...] for batch creation — same lock, fewer round-trips."
+        )
     nid = uuid.uuid4().hex[:10]
     depth = 0
 
@@ -1167,6 +1239,7 @@ async def think_decide(
     evaluations: list[dict] | None = None,
     recommendation: str | None = None,
     items: list[dict] | None = None,
+    auto_graph: bool = False,
     rule_profile_ids: list[str] | None = None,
     ctx: _MCPContext | None = None,
 ) -> str:
@@ -1184,14 +1257,24 @@ async def think_decide(
     Single-form: backward-compat staged form (problem-definition → options
       → criteria → evaluation → analysis → recommendation).
 
+    Pass auto_graph=True (requires session_create(backends=['think','graph']))
+    to materialise each item as a KnowledgeNode with DerivedFrom edges in one
+    round-trip.
+
     Args:
       items: STRICT — list of decision items as above.
       decision_statement, options, analysis_type, stage, decision_id,
         iteration, next_stage_needed, criteria, evaluations, recommendation:
         single-form fields.
+      auto_graph: items[]-only. When True + parent session has graph backend,
+        materialise each item as a KnowledgeNode + connects_to edges
+        (DerivedFrom) in one round trip.
       session_id: omit to auto-create.
 
     Returns: decision ids[] in items[] mode, or single-form status.
+
+    Returns a 'Suggested next:' line at end of response (items[] path) with
+    canonical follow-up call pre-filled. Read it before deciding the next step.
     """
     _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
     engine = _engine(info)
@@ -1254,11 +1337,32 @@ async def think_decide(
                 source="think_decide",
             )
 
-        base = (
-            f"Session: {info.session_id} | Decisions: {len(ids)}\n"
-            f"IDs: {', '.join(ids)}\n"
-            "Status: decided"
-        )
+        graph_count = 0
+        if auto_graph:
+            from aismartbuddy.tools import materialize_auto_graph
+
+            if not session_id:
+                raise ValueError(
+                    "auto_graph requires an explicit unified session_id from "
+                    "session_create(backends=['think','graph'])."
+                )
+            graph_count = await materialize_auto_graph(
+                session_id,
+                items,
+                source_tag="think_decide",
+                entity_type="decision",
+                description_field="recommendation",
+                edge_label="DerivedFrom",
+            )
+
+        out_lines = [
+            f"Session: {info.session_id} | Decisions: {len(ids)}",
+            f"IDs: {', '.join(ids)}",
+        ]
+        if auto_graph:
+            out_lines.append(f"Graph nodes created: {graph_count}")
+        out_lines.append("Status: decided")
+        base = "\n".join(out_lines)
         hint = _compose_next_hint("score_evaluate", "analysis_refs", ids)
         return base + (f"\n{hint}" if hint else "")
 
@@ -1266,7 +1370,11 @@ async def think_decide(
     _validate_enum(analysis_type, _DECISION_TYPES, "analysis_type")
     _validate_enum(stage, _DECISION_STAGES, "stage")
     if not decision_statement or not options or not decision_id:
-        raise ValueError("single-form requires decision_statement, options, decision_id")
+        raise ValueError(
+            "single-form requires decision_statement, options, decision_id. "
+            "PREFER items=[{id, decision_statement, options, criteria, recommendation}, ...] "
+            "for batch decisions."
+        )
 
     record = DecisionRecord(
         decision_id=decision_id,
@@ -1489,6 +1597,9 @@ async def think_model(
       session_id: omit to auto-create think session.
 
     Returns: item_ids[] (+ graph node count if auto_graph) or single-item status.
+
+    Returns a 'Suggested next:' line at end of response (items[] path) with
+    canonical follow-up call pre-filled. Read it before deciding the next step.
     """
     _validate_enum(model_name, _MODEL_NAMES, "model_name")
 
@@ -1583,9 +1694,18 @@ async def think_model(
     if record.record_id:
         lines.append(f"Record ID: {record.record_id}")
     if not steps and not conclusion:
-        # No steps yet — return framework guidance to help the AI
-        lines.append(_MODEL_GUIDANCE[model_name])
-        lines.append("Status: framework loaded — apply the steps above")
+        # No steps yet — return framework guidance to help the AI.
+        # Only emit the full framework block on the FIRST model call in this
+        # session (engine.models has just been appended above, so count==1
+        # means this is the first). Subsequent guidance-only calls get a
+        # short pointer back to prior guidance.
+        if len(engine.models) <= 1:
+            lines.append(_MODEL_GUIDANCE[model_name])
+            lines.append("Status: framework loaded — apply the steps above")
+        else:
+            lines.append(
+                f"Status: framework {model_name} loaded — see prior guidance for steps"
+            )
     elif conclusion:
         lines.append(f"Conclusion: {conclusion[:200]}")
     else:
@@ -1717,6 +1837,7 @@ async def think_argue(
     strengths: list[str] | None = None,
     weaknesses: list[str] | None = None,
     chain: list[dict] | None = None,
+    auto_graph: bool = False,
     ctx: _MCPContext | None = None,
 ) -> str:
     """Dialectical reasoning through thesis, antithesis, synthesis.
@@ -1734,6 +1855,10 @@ async def think_argue(
     Each chain entry is one argument move. Do not collapse thesis,
     counterargument, rebuttal, and synthesis into one oversized entry.
 
+    Pass auto_graph=True (requires session_create(backends=['think','graph']))
+    to materialise each item as a KnowledgeNode with RespondsTo edges in one
+    round-trip.
+
     Args:
         claim: The central claim of this argument.
         premises: Supporting premises for the claim.
@@ -1750,10 +1875,16 @@ async def think_argue(
         weaknesses: Notable weak points.
         chain: Batch mode — list of argument dicts. Returns chain_id +
             argument_ids[]. KEEPS structural validation per-entry.
+        auto_graph: chain[]-only. When True + parent session has graph backend,
+            materialise each argument as a KnowledgeNode and each
+            responds_to_index as a RespondsTo edge in one round trip.
 
     Returns:
         Single mode: compact status with argumentation chain progress.
         Batch mode: chain_id + ordered list of argument_ids.
+
+    Returns a 'Suggested next:' line at end of response (chain[] path) with
+    canonical follow-up call pre-filled. Read it before deciding the next step.
     """
     _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
     engine = _engine(info)
@@ -1761,7 +1892,10 @@ async def think_argue(
     # ── Batch chain mode ─────────────────────────────────
     if chain is not None:
         if len(chain) < 1:
-            raise ValueError("chain must be non-empty")
+            raise ValueError(
+                "chain must be non-empty. Use chain=[{type, claim, premises, "
+                "conclusion, ...}, ...] (PREFERRED) or single-mode with claim+premises+conclusion."
+            )
         # Validate every entry up front
         for i, entry in enumerate(chain):
             etype = entry.get("type") or entry.get("argument_type")
@@ -1808,12 +1942,55 @@ async def think_argue(
                 )
                 engine.add_argument(chain_id, rec)
                 ids.append(aid)
-        base = (
+
+        graph_count = 0
+        if auto_graph:
+            from aismartbuddy.tools import materialize_auto_graph
+
+            if not session_id:
+                raise ValueError(
+                    "auto_graph requires an explicit unified session_id from "
+                    "session_create(backends=['think','graph'])."
+                )
+            argument_ids = list(ids)
+            synthetic = [
+                {
+                    "id": argument_ids[i],
+                    "claim": entry.get("claim", ""),
+                    "responds_to_index": (
+                        [entry["responds_to_index"]]
+                        if entry.get("responds_to_index") is not None
+                        else []
+                    ),
+                }
+                for i, entry in enumerate(chain)
+            ]
+
+            def _resolve_arg_ref(r: object) -> str | None:
+                if isinstance(r, int) and 0 <= r < len(argument_ids):
+                    return argument_ids[r]
+                return None
+
+            graph_count = await materialize_auto_graph(
+                session_id,
+                synthetic,
+                source_tag="think_argue",
+                entity_type="argument",
+                description_field="claim",
+                edge_label="RespondsTo",
+                ref_field="responds_to_index",
+                ref_resolver=_resolve_arg_ref,
+            )
+
+        out_lines = [
             f"Session: {info.session_id} | Chain: {chain_id}"
-            f" | Batch: {len(ids)} arguments\n"
-            f"Arg IDs: {', '.join(ids)}\n"
-            "Status: dialectic batch applied"
-        )
+            f" | Batch: {len(ids)} arguments",
+            f"Arg IDs: {', '.join(ids)}",
+        ]
+        if auto_graph:
+            out_lines.append(f"Graph nodes created: {graph_count}")
+        out_lines.append("Status: dialectic batch applied")
+        base = "\n".join(out_lines)
         hint = _compose_next_hint("think_monitor", "refs", ids)
         return base + (f"\n{hint}" if hint else "")
 
@@ -1944,6 +2121,9 @@ async def think_science(
       session_id: omit to auto-create.
 
     Returns: hypothesis_ids[] in items[] mode, or single-stage status.
+
+    Returns a 'Suggested next:' line at end of response (items[] path) with
+    canonical follow-up call pre-filled. Read it before deciding the next step.
     """
     _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
     engine = _engine(info)
@@ -2005,7 +2185,11 @@ async def think_science(
     # ── Single-stage backward-compat path ─────────────────────
     _validate_enum(stage, _SCIENCE_STAGES, "stage")
     if not inquiry_id:
-        raise ValueError("inquiry_id required for single-stage form")
+        raise ValueError(
+            "inquiry_id required for single-stage form. "
+            "PREFER items=[{id, observation, question, hypothesis:{...}}, ...] "
+            "for batch hypotheses."
+        )
 
     record = InquiryRecord(
         inquiry_id=inquiry_id,
@@ -2134,6 +2318,9 @@ async def think_monitor(
     `knowledgeLevel` / `confidenceScore` / `knownLimitations` inside
     knowledge_assessment. The items[] form uses the short names
     `level` / `confidence` / `limitations` — stick to ONE form per call.
+
+    Returns a 'Suggested next:' line at end of response (items[] path) with
+    canonical follow-up call pre-filled. Read it before deciding the next step.
     """
     _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
     engine = _engine(info)
@@ -2208,7 +2395,11 @@ async def think_monitor(
     # ── Single-form backward-compat path ────────────────────
     _validate_enum(stage, _MONITOR_STAGES, "stage")
     if not monitoring_id:
-        raise ValueError("monitoring_id required for single-form")
+        raise ValueError(
+            "monitoring_id required for single-form. "
+            "PREFER items=[{id, task, knowledge:{...}, claims:[...]}, ...] "
+            "for batch self-assessment."
+        )
     overall_confidence = max(0.0, min(1.0, overall_confidence))
 
     if knowledge_assessment:
@@ -2495,6 +2686,7 @@ async def think_validate(
     nuance_notes: list[str] | None = None,
     refs: list[str] | None = None,
     items: list[dict] | None = None,
+    auto_graph: bool = False,
     ctx: _MCPContext | None = None,
 ) -> str:
     """[ASSESS] Validate a plan/artifact against weighted hard+soft rule profiles.
@@ -2502,6 +2694,12 @@ async def think_validate(
     Returns a validation record with hard-gate status, weighted score, gaps,
     uncovered rules, conflicts, and nuance notes. Use this when rules must
     persist across long chats and related subplans.
+
+    Pass auto_graph=True (requires session_create(backends=['think','graph']))
+    to materialise each item as a KnowledgeNode with Validates edges in one
+    round-trip. Validates edges require the subject_id to already be a
+    KnowledgeNode (e.g., chain auto_graph from your scaffold/decision tools
+    earlier in the session). Otherwise the edge is silently skipped.
     """
     _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
     engine = _engine(info)
@@ -2544,11 +2742,52 @@ async def think_validate(
             )
             ids.append(record.id)
             await _materialize_rule_graph(session_id, validation=record)
-        return (
-            f"Session: {info.session_id} | Validations: {len(ids)}\n"
-            f"IDs: {', '.join(ids)}\n"
-            "Status: validated"
-        )
+
+        graph_count = 0
+        if auto_graph:
+            from aismartbuddy.tools import materialize_auto_graph
+
+            if not session_id:
+                raise ValueError(
+                    "auto_graph requires an explicit unified session_id from "
+                    "session_create(backends=['think','graph'])."
+                )
+            # subject_id is a single string per item — wrap as a 1-element list
+            # so materialize_auto_graph iterates a single Validates edge per
+            # validation. The Validates edge is silently skipped if the
+            # subject_id is not already a KnowledgeNode.
+            synthetic = [
+                {
+                    "id": ids[i],
+                    "rationale": (
+                        item.get("rationale")
+                        or item.get("note")
+                        or item.get("subject_id", "")
+                    ),
+                    "subject_id": (
+                        [item["subject_id"]] if item.get("subject_id") else []
+                    ),
+                }
+                for i, item in enumerate(items)
+            ]
+            graph_count = await materialize_auto_graph(
+                session_id,
+                synthetic,
+                source_tag="think_validate",
+                entity_type="validation",
+                description_field="rationale",
+                edge_label="Validates",
+                ref_field="subject_id",
+            )
+
+        out_lines = [
+            f"Session: {info.session_id} | Validations: {len(ids)}",
+            f"IDs: {', '.join(ids)}",
+        ]
+        if auto_graph:
+            out_lines.append(f"Graph nodes created: {graph_count}")
+        out_lines.append("Status: validated")
+        return "\n".join(out_lines)
 
     if not subject_id:
         raise ValueError("subject_id is required")
@@ -2606,7 +2845,7 @@ async def think_validate(
 
 
 async def think_set_active_session(session_id: str) -> str:
-    """Set the implicit active session for subsequent tools."""
+    """[ELABORATE] Set the implicit active session for subsequent tools."""
     mgr = get_session_manager()
     actual = await anyio.to_thread.run_sync(lambda: mgr.set_active_session(session_id))
     return f"Active session set.\nsession_id: {actual}"
@@ -2618,7 +2857,7 @@ async def think_get_subtree(
     session_id: str | None = None,
     depth: int | None = None,
 ) -> str:
-    """Return a node and its descendants as an outline."""
+    """[ELABORATE] Return a node and its descendants as an outline."""
     _, info = _require_think_session(session_id)
     engine = _engine(info)
     node = engine.get_node(node_id)
@@ -2636,7 +2875,7 @@ async def think_get_subtree(
 
 
 async def think_get_path(node_id: str, session_id: str | None = None) -> str:
-    """Return the ancestry path from root to a node."""
+    """[ELABORATE] Return the ancestry path from root to a node."""
     _, info = _require_think_session(session_id)
     engine = _engine(info)
     path = engine.get_path_to_root(node_id)
@@ -2654,7 +2893,7 @@ async def think_export_session(
     session_id: str | None = None,
     format: str = "outline",
 ) -> str:
-    """Export full thought-tree state for session handoff/resume."""
+    """[ELABORATE] Export full thought-tree state for session handoff/resume."""
     if format not in {"outline", "flat", "json"}:
         raise ValueError("format must be outline|flat|json")
     _, info = _require_think_session(session_id)
@@ -2705,7 +2944,7 @@ async def think_link_sessions(
     node_b_id: str,
     relationship: str,
 ) -> str:
-    """Create a cross-session relationship between two nodes/artifacts."""
+    """[ELABORATE] Create a cross-session relationship between two nodes/artifacts."""
     mgr = get_session_manager()
     link = await anyio.to_thread.run_sync(
         lambda: mgr.add_session_link(session_a, node_a_id, session_b, node_b_id, relationship)
@@ -2718,7 +2957,7 @@ async def think_link_sessions(
 
 
 async def think_get_session_links(session_id: str | None = None) -> str:
-    """Return all cross-session links touching a session."""
+    """[ELABORATE] Return all cross-session links touching a session."""
     actual_session_id = resolve_active_or_provided_session_id(session_id)
     if not actual_session_id:
         raise ValueError("session_id is required unless an active session is set")
@@ -2740,7 +2979,7 @@ async def think_graph_validate(
     session_id: str | None = None,
     auto_branch_on_warning: bool = False,
 ) -> str:
-    """Validate a thought node for granularity and structural completeness."""
+    """[ELABORATE] Validate a thought node for granularity and structural completeness."""
     _, info = _require_think_session(session_id)
     engine = _engine(info)
     node = engine.get_node(node_id)
@@ -2825,14 +3064,64 @@ async def think_hypothesis(
     revised_statement: str | None = None,
     reason: str | None = None,
     invalidated_by: str | None = None,
+    items: list[dict] | None = None,
     ctx: _MCPContext | None = None,
 ) -> str:
-    """Register, compare, update, and invalidate competing hypotheses."""
+    """[SCAFFOLD] Register, compare, update, and invalidate competing hypotheses.
+
+    PREFER items=[...] (or *_ids=[...] for invalidate/remove) on every action
+    when handling one-or-more records — list-form scales without added
+    round-trips. Single-record args remain supported for backward-compat.
+    """
     _validate_enum(action, _HYPOTHESIS_ACTIONS, "action")
     _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
     engine = _engine(info)
 
     if action == "register":
+        # ── List-form path ──────────────────────────────────
+        if items is not None:
+            from aismartbuddy.tools import validate_items
+
+            single_form_args = bool(
+                statement
+                or hypothesis_id
+                or domain
+                or predictions
+            )
+            if single_form_args:
+                raise ValueError(
+                    "think_hypothesis.register: pass either items=[...] "
+                    "(preferred) or single-record args, not both."
+                )
+            validate_items(
+                items,
+                required=["statement"],
+                tool="think_hypothesis",
+            )
+            from aismartbuddy.tools import collect_item_refs as _collect_refs
+
+            ids: list[str] = []
+            with engine.state_lock:
+                for it in items:
+                    pw = float(it.get("prior_weight", 0.5))
+                    confidence = float(it.get("confidence", pw))
+                    record = HypothesisRecord(
+                        id=it["id"],
+                        statement=it["statement"],
+                        domain=str(it.get("domain", "") or it.get("kind", "") or ""),
+                        prior_weight=max(0.0, min(1.0, pw)),
+                        posterior_weight=max(0.0, min(1.0, confidence)),
+                        predictions=list(it.get("predictions") or []),
+                        refs=_collect_refs(it),
+                    )
+                    engine.upsert_hypothesis(record)
+                    ids.append(it["id"])
+            return (
+                f"Hypotheses registered: {len(ids)}\n"
+                f"IDs: {', '.join(ids)}\n"
+                "Status: registered"
+            )
+
         if not statement:
             raise ValueError("statement is required for register")
         hid = hypothesis_id or f"hyp_{uuid.uuid4().hex[:8]}"
@@ -2924,6 +3213,42 @@ async def think_hypothesis(
         )
         return f"Session: {info.session_id} | Hypothesis: {record.id}\nStatus: updated"
 
+    # action == "invalidate"
+    # ── List-form path ──────────────────────────────────
+    if hypothesis_ids:
+        if hypothesis_id:
+            raise ValueError(
+                "think_hypothesis.invalidate: pass either hypothesis_ids=[...] "
+                "(preferred) or single-record args, not both."
+            )
+        validated_ids: list[str] = []
+        for i, hid in enumerate(hypothesis_ids):
+            if not (isinstance(hid, str) and hid):
+                raise ValueError(
+                    f"think_hypothesis.invalidate: hypothesis_ids[{i}] must be "
+                    "a non-empty string"
+                )
+            validated_ids.append(hid)
+        seen: set[str] = set()
+        for i, hid in enumerate(validated_ids):
+            if hid in seen:
+                raise ValueError(
+                    f"think_hypothesis.invalidate: hypothesis_ids[{i}] "
+                    f"duplicate id '{hid}'"
+                )
+            seen.add(hid)
+        invalidated_records: list[str] = []
+        invalidation_reason = reason or invalidated_by or "invalidated"
+        with engine.state_lock:
+            for hid in validated_ids:
+                rec = engine.invalidate_hypothesis(hid, invalidation_reason)
+                invalidated_records.append(rec.id)
+        return (
+            f"Hypotheses invalidated: {len(invalidated_records)}\n"
+            f"IDs: {', '.join(invalidated_records)}\n"
+            f"Status: invalidated | Reason: {invalidation_reason}"
+        )
+
     if not hypothesis_id:
         raise ValueError("hypothesis_id is required for invalidate")
     record = engine.invalidate_hypothesis(
@@ -2950,9 +3275,15 @@ async def think_constraint(
     target_text: str | None = None,
     status: str | None = None,
     note: str | None = None,
+    items: list[dict] | None = None,
+    constraint_ids: list[str] | None = None,
     ctx: _MCPContext | None = None,
 ) -> str:
-    """Register constraints and validate targets against them.
+    """[ELABORATE] Register constraints and validate targets against them.
+
+    PREFER items=[...] (or *_ids=[...] for invalidate/remove) on every action
+    when handling one-or-more records — list-form scales without added
+    round-trips. Single-record args remain supported for backward-compat.
 
     `check_all` performs a real sweep: for each applicable constraint and each
     matching target, it returns a matrix row. Existing validations are reused;
@@ -3006,6 +3337,53 @@ async def think_constraint(
         return rows
 
     if action == "register":
+        # ── List-form path ──────────────────────────────────
+        if items is not None:
+            from aismartbuddy.tools import validate_items
+
+            single_form_args = bool(
+                constraint_id or statement or domain or type or applies_to
+            )
+            if single_form_args:
+                raise ValueError(
+                    "think_constraint.register: pass either items=[...] "
+                    "(preferred) or single-record args, not both."
+                )
+
+            def _check_type(t: object) -> str | None:
+                if t not in _CONSTRAINT_TYPES:
+                    return f"must be one of {sorted(_CONSTRAINT_TYPES)}"
+                return None
+
+            validate_items(
+                items,
+                required=["domain", "type", "statement"],
+                tool="think_constraint",
+                item_validators={"type": _check_type},
+            )
+            from aismartbuddy.tools import collect_item_refs as _collect_refs
+
+            registered_ids: list[str] = []
+            with engine.state_lock:
+                for it in items:
+                    engine.upsert_constraint(
+                        ConstraintRecord(
+                            id=it["id"],
+                            domain=str(it["domain"]),
+                            constraint_type=str(it["type"]),
+                            statement=str(it["statement"]),
+                            check_description=str(it.get("check_description", "") or ""),
+                            applies_to=list(it.get("applies_to") or []),
+                            refs=_collect_refs(it),
+                        )
+                    )
+                    registered_ids.append(it["id"])
+            return (
+                f"Constraints registered: {len(registered_ids)}\n"
+                f"IDs: {', '.join(registered_ids)}\n"
+                "Status: registered"
+            )
+
         if not constraint_id or not statement or not domain or not type:
             raise ValueError("constraint_id, domain, type, and statement are required for register")
         _validate_enum(type, _CONSTRAINT_TYPES, "type")
@@ -3033,6 +3411,38 @@ async def think_constraint(
         return "\n".join(lines)
 
     if action == "remove":
+        # ── List-form path ──────────────────────────────────
+        if constraint_ids:
+            if constraint_id:
+                raise ValueError(
+                    "think_constraint.remove: pass either constraint_ids=[...] "
+                    "(preferred) or single-record args, not both."
+                )
+            validated_ids: list[str] = []
+            for i, cid in enumerate(constraint_ids):
+                if not (isinstance(cid, str) and cid):
+                    raise ValueError(
+                        f"think_constraint.remove: constraint_ids[{i}] must be "
+                        "a non-empty string"
+                    )
+                validated_ids.append(cid)
+            seen: set[str] = set()
+            for i, cid in enumerate(validated_ids):
+                if cid in seen:
+                    raise ValueError(
+                        f"think_constraint.remove: constraint_ids[{i}] "
+                        f"duplicate id '{cid}'"
+                    )
+                seen.add(cid)
+            with engine.state_lock:
+                for cid in validated_ids:
+                    engine.remove_constraint(cid)
+            return (
+                f"Constraints removed: {len(validated_ids)}\n"
+                f"IDs: {', '.join(validated_ids)}\n"
+                "Status: removed"
+            )
+
         if not constraint_id:
             raise ValueError("constraint_id is required for remove")
         engine.remove_constraint(constraint_id)
@@ -3149,14 +3559,88 @@ async def think_topology(
     topology_b_id: str | None = None,
     target_domain: str | None = None,
     pattern: str | None = None,
+    items: list[dict] | None = None,
     ctx: _MCPContext | None = None,
 ) -> str:
-    """Define, compare, and translate domain-neutral structural topologies."""
+    """[ELABORATE] Define, compare, and translate domain-neutral structural topologies.
+
+    PREFER items=[...] (or *_ids=[...] for invalidate/remove) on every action
+    when handling one-or-more records — list-form scales without added
+    round-trips. Single-record args remain supported for backward-compat.
+    """
     _validate_enum(action, _TOPOLOGY_ACTIONS, "action")
     _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
     engine = _engine(info)
 
     if action == "define":
+        # ── List-form path ──────────────────────────────────
+        if items is not None:
+            from aismartbuddy.tools import validate_items
+
+            single_form_args = bool(
+                topology_id or name or nodes or edges
+                or source_description or source_domain
+            )
+            if single_form_args:
+                raise ValueError(
+                    "think_topology.define: pass either items=[...] "
+                    "(preferred) or single-record args, not both."
+                )
+
+            def _check_nodes(ns: object) -> str | None:
+                if not isinstance(ns, list) or not ns:
+                    return "must be a non-empty list of {id, role}"
+                for j, n in enumerate(ns):
+                    if not isinstance(n, dict):
+                        return f"nodes[{j}] must be a dict"
+                    if n.get("role") not in _TOPOLOGY_NODE_ROLES:
+                        return (
+                            f"nodes[{j}].role must be one of "
+                            f"{sorted(_TOPOLOGY_NODE_ROLES)}"
+                        )
+                return None
+
+            def _check_edges(es: object) -> str | None:
+                if not isinstance(es, list):
+                    return "must be a list"
+                for j, e in enumerate(es):
+                    if not isinstance(e, dict):
+                        return f"edges[{j}] must be a dict"
+                    if e.get("type") not in _TOPOLOGY_EDGE_TYPES:
+                        return (
+                            f"edges[{j}].type must be one of "
+                            f"{sorted(_TOPOLOGY_EDGE_TYPES)}"
+                        )
+                return None
+
+            validate_items(
+                items,
+                required=["domain", "nodes"],
+                tool="think_topology",
+                item_validators={
+                    "nodes": _check_nodes,
+                    "edges": _check_edges,
+                },
+            )
+            defined_ids: list[str] = []
+            with engine.state_lock:
+                for it in items:
+                    record = TopologyRecord(
+                        id=it["id"],
+                        name=str(it.get("name", "") or it["id"]),
+                        source_domain=str(it["domain"]),
+                        source_description=str(it.get("source_description", "") or ""),
+                        nodes=list(it["nodes"]),
+                        edges=list(it["edges"]),
+                    )
+                    engine.upsert_topology(record)
+                    defined_ids.append(it["id"])
+            return (
+                f"Topologies defined: {len(defined_ids)}\n"
+                f"IDs: {', '.join(defined_ids)}\n"
+                "Status: defined"
+            )
+
         if not topology_id or not name:
             raise ValueError("topology_id and name are required for define")
         for i, node in enumerate(nodes or []):
@@ -3287,14 +3771,69 @@ async def think_evidence(
     inference_type: str | None = None,
     assumptions: list[str] | None = None,
     claim_id: str | None = None,
+    items: list[dict] | None = None,
     ctx: _MCPContext | None = None,
 ) -> str:
-    """Track evidence provenance chains and compute chain strength."""
+    """[ELABORATE] Track evidence provenance chains and compute chain strength.
+
+    PREFER items=[...] (or *_ids=[...] for invalidate/remove) on every action
+    when handling one-or-more records — list-form scales without added
+    round-trips. Single-record args remain supported for backward-compat.
+    """
     _validate_enum(action, _EVIDENCE_ACTIONS, "action")
     _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
     engine = _engine(info)
 
     if action == "register":
+        # ── List-form path ──────────────────────────────────
+        if items is not None:
+            from aismartbuddy.tools import validate_items
+
+            single_form_args = bool(
+                evidence_id or content or source_type
+                or domain or source_ref
+            )
+            if single_form_args:
+                raise ValueError(
+                    "think_evidence.register: pass either items=[...] "
+                    "(preferred) or single-record args, not both."
+                )
+
+            def _check_source_type(s: object) -> str | None:
+                if s not in _EVIDENCE_SOURCE_TYPES:
+                    return f"must be one of {sorted(_EVIDENCE_SOURCE_TYPES)}"
+                return None
+
+            validate_items(
+                items,
+                required=["content", "source_type"],
+                tool="think_evidence",
+                item_validators={"source_type": _check_source_type},
+            )
+            from aismartbuddy.tools import collect_item_refs as _collect_refs
+
+            registered_ids: list[str] = []
+            with engine.state_lock:
+                for it in items:
+                    conf = float(it.get("confidence", 0.5))
+                    engine.upsert_evidence(
+                        EvidenceRecord(
+                            id=it["id"],
+                            content=str(it["content"]),
+                            source_type=str(it["source_type"]),
+                            domain=str(it.get("domain", "") or ""),
+                            confidence=max(0.0, min(1.0, conf)),
+                            source_ref=str(it.get("source_ref", "") or ""),
+                            refs=_collect_refs(it),
+                        )
+                    )
+                    registered_ids.append(it["id"])
+            return (
+                f"Evidence registered: {len(registered_ids)}\n"
+                f"IDs: {', '.join(registered_ids)}\n"
+                "Status: registered"
+            )
+
         if not evidence_id or not content or not source_type:
             raise ValueError("evidence_id, content, and source_type are required for register")
         _validate_enum(source_type, _EVIDENCE_SOURCE_TYPES, "source_type")
@@ -3311,6 +3850,48 @@ async def think_evidence(
         return f"Session: {info.session_id} | Evidence: {evidence_id}\nStatus: registered"
 
     if action == "chain":
+        # ── List-form path ──────────────────────────────────
+        if items is not None:
+            from aismartbuddy.tools import validate_items
+
+            single_form_args = bool(
+                from_id or to_id or inference_type or assumptions
+            )
+            if single_form_args:
+                raise ValueError(
+                    "think_evidence.chain: pass either items=[...] "
+                    "(preferred) or single-record args, not both."
+                )
+
+            def _check_inference_type(t: object) -> str | None:
+                if t not in _EVIDENCE_INFERENCE_TYPES:
+                    return f"must be one of {sorted(_EVIDENCE_INFERENCE_TYPES)}"
+                return None
+
+            validate_items(
+                items,
+                required=["from_id", "to_id", "inference_type"],
+                tool="think_evidence",
+                item_validators={"inference_type": _check_inference_type},
+            )
+            chain_ids: list[str] = []
+            with engine.state_lock:
+                for it in items:
+                    chain = EvidenceChainRecord(
+                        id=it["id"],
+                        from_id=str(it["from_id"]),
+                        to_id=str(it["to_id"]),
+                        inference_type=str(it["inference_type"]),
+                        assumptions=list(it.get("assumptions") or []),
+                    )
+                    engine.add_evidence_chain(chain)
+                    chain_ids.append(chain.id)
+            return (
+                f"Evidence chains added: {len(chain_ids)}\n"
+                f"IDs: {', '.join(chain_ids)}\n"
+                "Status: chained"
+            )
+
         if not from_id or not to_id or not inference_type:
             raise ValueError("from_id, to_id, and inference_type are required for chain")
         _validate_enum(inference_type, _EVIDENCE_INFERENCE_TYPES, "inference_type")
@@ -3365,7 +3946,7 @@ async def think_bridge(
     target_type: str | None = None,
     ctx: _MCPContext | None = None,
 ) -> str:
-    """Query across thought graph, hypotheses, constraints, evidence, and topology state.
+    """[ELABORATE] Query thought graph, hypotheses, constraints, evidence, topology state.
 
     When the current think session belongs to a unified think+graph workspace,
     the tool also attempts graph-backed context lookups. Those lookups are
@@ -3527,7 +4108,7 @@ async def think_summarize(
     max_items_per_category: int = 20,
     detail_level: str = "index",
 ) -> str:
-    """Get a token-optimized summary of all thinking activity in a session.
+    """[ASSESS] Get a token-optimized summary of all thinking activity in a session.
 
     Returns a compact overview of all thought graphs, mental models,
     decisions, debugging approaches, arguments, collaborations, inquiries,
@@ -3586,7 +4167,7 @@ async def think_create_session(
     project_id: str | None = None,
     ctx: _MCPContext | None = None,
 ) -> str:
-    """Create a new thinking session bound to (user_id, project_id).
+    """[INFRA] Create a new thinking session bound to (user_id, project_id).
 
     Most think_* tools auto-create sessions on first call, but this tool
     lets you create an identity-bound session explicitly when you need to
@@ -3621,7 +4202,7 @@ async def think_create_session(
 
 
 async def think_destroy_session(session_id: str) -> str:
-    """Destroy a thinking session and free its memory.
+    """[INFRA] Destroy a thinking session and free its memory.
 
     Args:
         session_id: Thinking session ID to destroy.
@@ -3781,7 +4362,7 @@ async def think_interfere(
     concept_as_law: str | None = None,
     ctx: _MCPContext | None = None,
 ) -> str:
-    """Interference Protocol — structured novelty generation.
+    """[ELABORATE] Interference Protocol — structured novelty generation.
 
     A multi-phase thinking framework that produces genuinely novel
     concepts by forcing unrelated structural laws into simultaneous

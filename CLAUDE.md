@@ -86,6 +86,25 @@ For SCAFFOLD/ASSESS family, calling with `items=[{id, ...required_fields}, ...]`
 
 When a SCAFFOLD/ASSESS items[] call sets `auto_graph=True` AND the session has a graph backend (created via `session_create(backends=["think","graph"])`), the server materialises each item as a `KnowledgeNode` row in the graph backend. Each `connects_to: ["other_id"]` becomes a `DerivedFrom` edge. One round trip = N structured records + N KG nodes + all declared edges. Eliminates the manual KG construction phase.
 
+**auto_graph-capable batch tools and their edge labels:**
+
+- `think_model(items=[...], auto_graph=True)` — `connects_to` → `DerivedFrom` edge
+- `think_science(items=[...], auto_graph=True)` — `connects_to` → `DerivedFrom` edge
+- `think_monitor(items=[...], auto_graph=True)` — `connects_to` → `DerivedFrom` edge
+- `think_graph(thoughts=[...], auto_graph=True)` — `parent_ref` → `BranchOf` edge
+- `think_decide(items=[...], auto_graph=True)` — `connects_to` → `DerivedFrom` edge
+- `think_argue(chain=[...], auto_graph=True)` — `responds_to_index` → `RespondsTo` edge
+- `think_validate(items=[...], auto_graph=True)` — `subject_id` → `Validates` edge. **Caveat**: the subject must already be a KnowledgeNode — chain auto_graph from your scaffold/decision tools earlier in the session, or expect the edge to be skipped.
+- `holon_create(holons=[...], auto_graph=True)` — `parent_ref` → `PartOf` edge. `parent_ref` may be a batch ref-string (resolved against the just-created holons) OR an existing holon id (passes through unchanged).
+
+### Single-record-action tools with items[] retrofit
+
+The 4 single-record-action tools (`think_hypothesis`, `think_constraint`, `think_evidence`, `think_topology`) now accept `items=[...]` (or `*_ids=[...]` for invalidate/remove actions) on their existing actions — no new action names. Single-record args remain supported for backward-compat. Passing BOTH `items=[...]` AND single-record args in the same call raises a mutual-exclusion `ValueError`. PREFER items[] even for N=1 — it scales without added round-trips.
+
+### score_evaluate auto_finalize
+
+`score_evaluate(action="batch_findings", auto_finalize=True, summary=..., dimensions_reviewed=...)` collapses the 3-call `start_with_rubric → batch_findings → finalize` sequence into a single round-trip. Requires `summary` to be non-empty when `auto_finalize=True`.
+
 ### Removed tools (don't use; not registered)
 
 `scaffold`, `hypothesize`, `self_assess` (functionality merged into `think_model`/`think_science`/`think_monitor` with items[] form). `think_collaborate`, `think_visualize`, `think_graph_validate`, `workflow`, `bridge`, `session_export`, `session_snapshot` (ceremony / out-of-scope features).

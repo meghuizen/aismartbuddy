@@ -1756,3 +1756,528 @@ class TestRuleRegistryAndValidation:
         assert "model:plan_graph" in graph
         assert "rule_profile:arch-rules" in graph
         assert "rule:least-privilege" in graph
+
+
+# ── auto_graph wirings on think_graph / think_decide / think_argue / think_validate ──
+
+
+def _extract_session_id(result: str) -> str:
+    for line in result.splitlines():
+        line = line.strip()
+        if line.startswith("session_id:"):
+            return line[len("session_id:") :].strip()
+    raise AssertionError(f"No session_id in {result!r}")
+
+
+@pytest.mark.usefixtures("_init_session_manager")
+class TestThinkGraphAutoGraph:
+    """think_graph(thoughts=[...], auto_graph=True) materialises BranchOf KG."""
+
+    @pytest.mark.anyio
+    async def test_auto_graph_default_false_byte_identical(self):
+        """auto_graph=False (default) MUST produce byte-for-byte identical
+        response to an explicit auto_graph=False call."""
+        thoughts = [
+            {"thought": "First insight"},
+            {"thought": "Building", "parent_ref": 0},
+            {"thought": "Conclusion", "parent_ref": 1},
+        ]
+        r_default = await think_graph(thoughts=list(thoughts))
+        r_explicit = await think_graph(thoughts=list(thoughts), auto_graph=False)
+
+        def _normalize(s: str) -> str:
+            lines = []
+            for line in s.split("\n"):
+                if line.startswith("Session:"):
+                    if " | Batch nodes created:" in line:
+                        _, rhs = line.split(" | ", 1)
+                        lines.append(f"Session: <SID> | {rhs}")
+                    else:
+                        lines.append("Session: <SID>")
+                elif line.startswith("Node IDs:"):
+                    lines.append("Node IDs: <IDS>")
+                elif line.startswith("Trees:"):
+                    lines.append("Trees: <TIDS>")
+                else:
+                    lines.append(line)
+            return "\n".join(lines)
+
+        assert _normalize(r_default) == _normalize(r_explicit)
+        assert "Graph nodes created:" not in r_default
+        assert "Graph nodes created:" not in r_explicit
+
+    @pytest.mark.anyio
+    async def test_auto_graph_no_graph_backend_raises(self):
+        """auto_graph=True against a think-only session raises canonical error."""
+        from aismartbuddy.tools.infra import session_create
+
+        sess = await session_create(backends=["think"])
+        sid = _extract_session_id(sess)
+        with pytest.raises(ValueError, match="auto_graph requires a graph backend"):
+            await think_graph(
+                session_id=sid,
+                auto_graph=True,
+                thoughts=[{"thought": "root"}],
+            )
+
+    @pytest.mark.anyio
+    async def test_auto_graph_creates_nodes_and_branchof_edges(self):
+        """N thoughts → N KnowledgeNode rows + correct BranchOf edges."""
+        from aismartbuddy.tools.graph import graph_query
+        from aismartbuddy.tools.infra import session_create
+
+        sess = await session_create(backends=["think", "graph"], mode="analyze")
+        sid = _extract_session_id(sess)
+
+        result = await think_graph(
+            session_id=sid,
+            auto_graph=True,
+            thoughts=[
+                {"thought": "Root insight"},
+                {"thought": "Builds on root", "parent_ref": 0},
+                {"thought": "Sibling of B", "parent_ref": 0},
+                {"thought": "Conclusion", "parent_ref": 1},
+            ],
+        )
+        assert "Batch nodes created: 4" in result
+        assert "Graph nodes created: 4" in result
+
+        # Extract assigned node ids from "Node IDs: <id1>, <id2>, ..."
+        node_ids: list[str] = []
+        for line in result.split("\n"):
+            if line.startswith("Node IDs:"):
+                payload = line[len("Node IDs:") :].strip()
+                node_ids = [p.strip() for p in payload.split(",") if p.strip()]
+                break
+        assert len(node_ids) == 4
+
+        et_csv = await graph_query(
+            session_id=sid,
+            query=(
+                "MATCH (k:KnowledgeNode) "
+                "RETURN k.entity_type AS et, count(*) AS n "
+                "ORDER BY et;"
+            ),
+        )
+        assert "thought" in et_csv
+        assert ",4" in et_csv.replace('"', "")
+
+        edges_csv = await graph_query(
+            session_id=sid,
+            query=(
+                "MATCH (a:KnowledgeNode)-[r:BranchOf]->(b:KnowledgeNode) "
+                "RETURN a.name AS src, b.name AS dst ORDER BY src, dst;"
+            ),
+        )
+        normalized = edges_csv.replace('"', "")
+        # 3 BranchOf edges from index 1, 2, 3 to assigned ids 0, 0, 1
+        assert f"{node_ids[1]},{node_ids[0]}" in normalized
+        assert f"{node_ids[2]},{node_ids[0]}" in normalized
+        assert f"{node_ids[3]},{node_ids[1]}" in normalized
+
+
+@pytest.mark.usefixtures("_init_session_manager")
+class TestThinkDecideAutoGraph:
+    """think_decide(items=[...], auto_graph=True) materialises DerivedFrom KG."""
+
+    @pytest.mark.anyio
+    async def test_auto_graph_default_false_byte_identical(self):
+        items = [
+            {
+                "id": "d1",
+                "decision_statement": "Pick stack",
+                "options": ["A", "B"],
+                "criteria": [{"name": "cost", "weight": 1.0}],
+                "recommendation": "A",
+            },
+        ]
+        r_default = await think_decide(items=items)
+        r_explicit = await think_decide(items=items, auto_graph=False)
+
+        def _normalize(s: str) -> str:
+            return "\n".join(
+                "Session: <SID>" if line.startswith("Session:") else line
+                for line in s.split("\n")
+            )
+
+        assert _normalize(r_default) == _normalize(r_explicit)
+        assert "Graph nodes created:" not in r_default
+        assert "Graph nodes created:" not in r_explicit
+
+    @pytest.mark.anyio
+    async def test_auto_graph_no_graph_backend_raises(self):
+        from aismartbuddy.tools.infra import session_create
+
+        sess = await session_create(backends=["think"])
+        sid = _extract_session_id(sess)
+        with pytest.raises(ValueError, match="auto_graph requires a graph backend"):
+            await think_decide(
+                session_id=sid,
+                auto_graph=True,
+                items=[
+                    {
+                        "id": "d1",
+                        "decision_statement": "x",
+                        "options": ["a", "b"],
+                        "criteria": [{"name": "c", "weight": 1.0}],
+                        "recommendation": "a",
+                    }
+                ],
+            )
+
+    @pytest.mark.anyio
+    async def test_auto_graph_creates_nodes_and_derivedfrom_edges(self):
+        from aismartbuddy.tools.graph import graph_query
+        from aismartbuddy.tools.infra import session_create
+
+        sess = await session_create(backends=["think", "graph"], mode="analyze")
+        sid = _extract_session_id(sess)
+
+        result = await think_decide(
+            session_id=sid,
+            auto_graph=True,
+            items=[
+                {
+                    "id": "dec_a",
+                    "decision_statement": "Pick A",
+                    "options": ["x", "y"],
+                    "criteria": [{"name": "cost", "weight": 1.0}],
+                    "recommendation": "x",
+                },
+                {
+                    "id": "dec_b",
+                    "decision_statement": "Pick B",
+                    "options": ["p", "q"],
+                    "criteria": [{"name": "speed", "weight": 1.0}],
+                    "recommendation": "p",
+                    "connects_to": ["dec_a"],
+                },
+            ],
+        )
+        assert "Decisions: 2" in result
+        assert "Graph nodes created: 2" in result
+
+        et_csv = await graph_query(
+            session_id=sid,
+            query=(
+                "MATCH (k:KnowledgeNode {entity_type: 'decision'}) "
+                "RETURN count(*) AS n;"
+            ),
+        )
+        assert "2" in et_csv
+
+        edges_csv = await graph_query(
+            session_id=sid,
+            query=(
+                "MATCH (a:KnowledgeNode)-[r:DerivedFrom]->(b:KnowledgeNode) "
+                "RETURN a.name AS src, b.name AS dst ORDER BY src, dst;"
+            ),
+        )
+        normalized = edges_csv.replace('"', "")
+        assert "dec_b,dec_a" in normalized
+
+
+@pytest.mark.usefixtures("_init_session_manager")
+class TestThinkArgueAutoGraph:
+    """think_argue(chain=[...], auto_graph=True) materialises RespondsTo KG."""
+
+    @pytest.mark.anyio
+    async def test_auto_graph_default_false_byte_identical(self):
+        chain = [
+            {
+                "type": "thesis",
+                "claim": "X",
+                "premises": ["p1"],
+                "conclusion": "y",
+                "argument_id": "a1",
+            },
+            {
+                "type": "antithesis",
+                "claim": "Not X",
+                "premises": ["p2"],
+                "conclusion": "z",
+                "argument_id": "a2",
+                "responds_to_index": 0,
+            },
+        ]
+        r_default = await think_argue(chain=[dict(c) for c in chain])
+        r_explicit = await think_argue(
+            chain=[dict(c) for c in chain], auto_graph=False
+        )
+
+        def _normalize(s: str) -> str:
+            lines = []
+            for line in s.split("\n"):
+                if line.startswith("Session:"):
+                    # strip Session id and chain id (random per call)
+                    if " | Batch:" in line:
+                        _, rhs = line.split(" | Batch:", 1)
+                        lines.append(f"Session: <SID> | Chain: <CID> | Batch:{rhs}")
+                    else:
+                        lines.append("Session: <SID>")
+                else:
+                    lines.append(line)
+            return "\n".join(lines)
+
+        assert _normalize(r_default) == _normalize(r_explicit)
+        assert "Graph nodes created:" not in r_default
+        assert "Graph nodes created:" not in r_explicit
+
+    @pytest.mark.anyio
+    async def test_auto_graph_no_graph_backend_raises(self):
+        from aismartbuddy.tools.infra import session_create
+
+        sess = await session_create(backends=["think"])
+        sid = _extract_session_id(sess)
+        with pytest.raises(ValueError, match="auto_graph requires a graph backend"):
+            await think_argue(
+                session_id=sid,
+                auto_graph=True,
+                chain=[
+                    {
+                        "type": "thesis",
+                        "claim": "x",
+                        "premises": ["p"],
+                        "conclusion": "y",
+                    }
+                ],
+            )
+
+    @pytest.mark.anyio
+    async def test_auto_graph_creates_nodes_and_respondsto_edges(self):
+        from aismartbuddy.tools.graph import graph_query
+        from aismartbuddy.tools.infra import session_create
+
+        sess = await session_create(backends=["think", "graph"], mode="analyze")
+        sid = _extract_session_id(sess)
+
+        result = await think_argue(
+            session_id=sid,
+            auto_graph=True,
+            chain=[
+                {
+                    "type": "thesis",
+                    "claim": "Use Postgres",
+                    "premises": ["mature"],
+                    "conclusion": "go pg",
+                    "argument_id": "arg_t",
+                },
+                {
+                    "type": "antithesis",
+                    "claim": "Use SQLite",
+                    "premises": ["simple"],
+                    "conclusion": "go sqlite",
+                    "argument_id": "arg_a",
+                    "responds_to_index": 0,
+                },
+                {
+                    "type": "synthesis",
+                    "claim": "Use both per env",
+                    "premises": ["context"],
+                    "conclusion": "split deploy",
+                    "argument_id": "arg_s",
+                    "responds_to_index": 1,
+                },
+            ],
+        )
+        assert "Batch: 3 arguments" in result
+        assert "Graph nodes created: 3" in result
+
+        et_csv = await graph_query(
+            session_id=sid,
+            query=(
+                "MATCH (k:KnowledgeNode {entity_type: 'argument'}) "
+                "RETURN count(*) AS n;"
+            ),
+        )
+        assert "3" in et_csv
+
+        edges_csv = await graph_query(
+            session_id=sid,
+            query=(
+                "MATCH (a:KnowledgeNode)-[r:RespondsTo]->(b:KnowledgeNode) "
+                "RETURN a.name AS src, b.name AS dst ORDER BY src, dst;"
+            ),
+        )
+        normalized = edges_csv.replace('"', "")
+        assert "arg_a,arg_t" in normalized
+        assert "arg_s,arg_a" in normalized
+
+
+@pytest.mark.usefixtures("_init_session_manager")
+class TestThinkValidateAutoGraph:
+    """think_validate(items=[...], auto_graph=True) materialises Validates KG."""
+
+    @pytest.mark.anyio
+    async def test_auto_graph_default_false_byte_identical(self):
+        # Use shared session so both calls reference the same materialised subject.
+        from aismartbuddy.tools.infra import session_create
+
+        sess = await session_create(backends=["think"])
+        sid = _extract_session_id(sess)
+        # Materialise two decisions to validate against (one per call).
+        await think_decide(
+            session_id=sid,
+            items=[
+                {
+                    "id": "subj1",
+                    "decision_statement": "x",
+                    "options": ["a", "b"],
+                    "criteria": [{"name": "c", "weight": 1.0}],
+                    "recommendation": "a",
+                },
+                {
+                    "id": "subj2",
+                    "decision_statement": "y",
+                    "options": ["a", "b"],
+                    "criteria": [{"name": "c", "weight": 1.0}],
+                    "recommendation": "a",
+                },
+            ],
+        )
+        r_default = await think_validate(
+            session_id=sid,
+            items=[{"id": "v1", "subject_id": "subj1"}],
+        )
+        r_explicit = await think_validate(
+            session_id=sid,
+            auto_graph=False,
+            items=[{"id": "v2", "subject_id": "subj2"}],
+        )
+
+        def _normalize(s: str) -> str:
+            lines = []
+            for line in s.split("\n"):
+                if line.startswith("Session:"):
+                    if " | Validations:" in line:
+                        _, rhs = line.split(" | ", 1)
+                        lines.append(f"Session: <SID> | {rhs}")
+                    else:
+                        lines.append("Session: <SID>")
+                elif line.startswith("IDs:"):
+                    lines.append("IDs: <IDS>")
+                else:
+                    lines.append(line)
+            return "\n".join(lines)
+
+        assert _normalize(r_default) == _normalize(r_explicit)
+        assert "Graph nodes created:" not in r_default
+        assert "Graph nodes created:" not in r_explicit
+
+    @pytest.mark.anyio
+    async def test_auto_graph_no_graph_backend_raises(self):
+        from aismartbuddy.tools.infra import session_create
+
+        sess = await session_create(backends=["think"])
+        sid = _extract_session_id(sess)
+        # Materialise a real decision to validate against.
+        await think_decide(
+            session_id=sid,
+            items=[
+                {
+                    "id": "subj_x",
+                    "decision_statement": "x",
+                    "options": ["a", "b"],
+                    "criteria": [{"name": "c", "weight": 1.0}],
+                    "recommendation": "a",
+                }
+            ],
+        )
+        with pytest.raises(ValueError, match="auto_graph requires a graph backend"):
+            await think_validate(
+                session_id=sid,
+                auto_graph=True,
+                items=[{"id": "v1", "subject_id": "subj_x"}],
+            )
+
+    @pytest.mark.anyio
+    async def test_auto_graph_creates_nodes_and_validates_edges(self):
+        """Validations materialise as KnowledgeNodes; the Validates edge lands
+        only on a subject already in the KG (chained from think_decide with
+        auto_graph)."""
+        from aismartbuddy.tools.graph import graph_query
+        from aismartbuddy.tools.infra import session_create
+
+        sess = await session_create(backends=["think", "graph"], mode="analyze")
+        sid = _extract_session_id(sess)
+
+        # Materialise two decisions: subject_x lands in KG (auto_graph=True),
+        # subject_skip lands in the engine but NOT in the KG.
+        await think_decide(
+            session_id=sid,
+            auto_graph=True,
+            items=[
+                {
+                    "id": "subject_x",
+                    "decision_statement": "Pick stack",
+                    "options": ["a", "b"],
+                    "criteria": [{"name": "cost", "weight": 1.0}],
+                    "recommendation": "a",
+                },
+            ],
+        )
+        await think_decide(
+            session_id=sid,
+            items=[
+                {
+                    "id": "subject_skip",
+                    "decision_statement": "Other",
+                    "options": ["a", "b"],
+                    "criteria": [{"name": "c", "weight": 1.0}],
+                    "recommendation": "a",
+                }
+            ],
+        )
+
+        result = await think_validate(
+            session_id=sid,
+            auto_graph=True,
+            items=[
+                {
+                    "id": "v_a",
+                    "validation_id": "val_a",
+                    "subject_id": "subject_x",
+                    "rationale": "passed soft rules",
+                },
+                {
+                    "id": "v_b",
+                    "validation_id": "val_b",
+                    "subject_id": "subject_skip",  # not a KnowledgeNode → edge skipped
+                    "rationale": "checks against missing-in-KG",
+                },
+            ],
+        )
+        assert "Validations: 2" in result
+        assert "Graph nodes created: 2" in result
+
+        # Pull the engine-assigned validation ids from the response.
+        validation_ids: list[str] = []
+        for line in result.split("\n"):
+            if line.startswith("IDs:"):
+                payload = line[len("IDs:") :].strip()
+                validation_ids = [p.strip() for p in payload.split(",") if p.strip()]
+                break
+        assert len(validation_ids) == 2
+
+        et_csv = await graph_query(
+            session_id=sid,
+            query=(
+                "MATCH (k:KnowledgeNode {entity_type: 'validation'}) "
+                "RETURN count(*) AS n;"
+            ),
+        )
+        assert "2" in et_csv
+
+        edges_csv = await graph_query(
+            session_id=sid,
+            query=(
+                "MATCH (a:KnowledgeNode)-[r:Validates]->(b:KnowledgeNode) "
+                "RETURN a.name AS src, b.name AS dst ORDER BY src, dst;"
+            ),
+        )
+        normalized = edges_csv.replace('"', "")
+        # Only the first validation has a real KG subject (subject_x); the
+        # second is silently skipped because subject_skip was not auto_graphed.
+        assert f"{validation_ids[0]},subject_x" in normalized
+        # No edge from the second validation (skipped target).
+        assert f"{validation_ids[1]}," not in normalized

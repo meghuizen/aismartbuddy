@@ -374,8 +374,12 @@ class TestScoreEvaluate:
             ],
         )
         assert "Batch: 2 findings applied" in batch
-        assert "evaluation_id:" in batch
-        assert "->" in batch
+        # Verbosity trim (Section 7): evaluation_id echo and Running scores
+        # arrow chain are removed from batch_findings response. Per-finding
+        # running_score lives in the Results JSON instead.
+        assert "evaluation_id:" not in batch
+        assert "Running scores:" not in batch
+        assert "running_score" in batch  # in the Results: [...] JSON
         alias = await score_evaluate(
             action="finding_batch",
             evaluation_id=eid,
@@ -795,3 +799,233 @@ class TestScoreTemplatesAndGraph:
         )
         assert f"evaluation:{eid}" in result
         assert f"finding:{eid}:f-001" in result
+
+
+# ── Section 6+7: auto_finalize + verbosity trim ──────────────
+
+
+@pytest.mark.usefixtures("_init_session_manager")
+class TestScoreEvaluateAutoFinalize:
+    """Section 6 (auto_finalize) and Section 7 (verbosity trim)
+    of plans/tool-call-efficiency-improvements.md.
+    """
+
+    async def _setup_rubric(self) -> tuple[str, str]:
+        r = await score_rubric(
+            action="create",
+            rubric_id="auto-final-rubric",
+            dimensions=PLAN_REVIEW_DIMS,
+        )
+        return _extract(r, "Session:"), "auto-final-rubric"
+
+    @staticmethod
+    def _extract_dim_lines(response: str) -> list[str]:
+        """Pull out the per-dimension lines from a finalize-shaped block."""
+        out: list[str] = []
+        capture = False
+        for line in response.splitlines():
+            if line.strip() == "Dimension scores:":
+                capture = True
+                continue
+            if capture:
+                if not line.startswith("  "):
+                    break
+                out.append(line.rstrip())
+        return out
+
+    @pytest.mark.anyio
+    async def test_batch_findings_auto_finalize_produces_same_outcome_as_two_calls(self):
+        # Path A: traditional 2-call sequence (batch_findings then finalize).
+        sid_a, rid = await self._setup_rubric()
+        start_a = await score_evaluate(action="start", session_id=sid_a, rubric_id=rid)
+        eid_a = _extract(start_a, "Eval:")
+        findings_payload = [
+            {
+                "dimension": "feasibility",
+                "severity": "moderate",
+                "description": "Issue F",
+            },
+            {
+                "dimension": "completeness",
+                "severity": "low",
+                "description": "Issue C",
+            },
+        ]
+        await score_evaluate(
+            action="batch_findings",
+            evaluation_id=eid_a,
+            findings=findings_payload,
+        )
+        final_a = await score_evaluate(
+            action="finalize",
+            evaluation_id=eid_a,
+            summary="auto-finalize parity check",
+            dimensions_reviewed=["correctness", "integration"],
+        )
+
+        # Path B: single batch_findings call with auto_finalize=True.
+        sid_b, _ = await self._setup_rubric()
+        start_b = await score_evaluate(action="start", session_id=sid_b, rubric_id=rid)
+        eid_b = _extract(start_b, "Eval:")
+        combined_b = await score_evaluate(
+            action="batch_findings",
+            evaluation_id=eid_b,
+            findings=findings_payload,
+            auto_finalize=True,
+            summary="auto-finalize parity check",
+            dimensions_reviewed=["correctness", "integration"],
+        )
+
+        # Final score must match.
+        score_a = _extract(final_a, "Final score:").split("/")[0]
+        score_b = _extract(combined_b, "Final score:").split("/")[0]
+        assert score_a == score_b
+        # Pass/fail verdict must match.
+        verdict_a = _extract(final_a, "Pass:").split(" ")[0].rstrip("|").strip()
+        verdict_b = _extract(combined_b, "Pass:").split(" ")[0].rstrip("|").strip()
+        assert verdict_a == verdict_b
+        # Per-dimension table content must match line-for-line.
+        dim_a = self._extract_dim_lines(final_a)
+        dim_b = self._extract_dim_lines(combined_b)
+        assert dim_a == dim_b
+        assert dim_a, "expected at least one dimension line"
+
+    @pytest.mark.anyio
+    async def test_batch_findings_auto_finalize_requires_summary(self):
+        sid, rid = await self._setup_rubric()
+        start = await score_evaluate(action="start", session_id=sid, rubric_id=rid)
+        eid = _extract(start, "Eval:")
+        with pytest.raises(ValueError, match="summary"):
+            await score_evaluate(
+                action="batch_findings",
+                evaluation_id=eid,
+                findings=[
+                    {
+                        "dimension": "feasibility",
+                        "severity": "low",
+                        "description": "x",
+                    }
+                ],
+                auto_finalize=True,
+            )
+        # Whitespace-only summary also rejected.
+        with pytest.raises(ValueError, match="summary"):
+            await score_evaluate(
+                action="batch_findings",
+                evaluation_id=eid,
+                findings=[
+                    {
+                        "dimension": "feasibility",
+                        "severity": "low",
+                        "description": "x",
+                    }
+                ],
+                auto_finalize=True,
+                summary="   ",
+            )
+
+    @pytest.mark.anyio
+    async def test_batch_findings_auto_finalize_missing_required_dims(self):
+        sid, rid = await self._setup_rubric()
+        start = await score_evaluate(action="start", session_id=sid, rubric_id=rid)
+        eid = _extract(start, "Eval:")
+        # PLAN_REVIEW_DIMS has 3 required dims (feasibility/completeness/correctness).
+        # Submit only one finding on a non-required dim and don't pass any
+        # dimensions_reviewed — finalization should refuse.
+        result = await score_evaluate(
+            action="batch_findings",
+            evaluation_id=eid,
+            findings=[
+                {
+                    "dimension": "integration",
+                    "severity": "low",
+                    "description": "Minor",
+                }
+            ],
+            auto_finalize=True,
+            summary="should not finalize",
+        )
+        assert "CANNOT FINALIZE" in result
+        assert "required dimensions not reviewed" in result
+        # The findings part of the response is still produced.
+        assert "Batch: 1 findings applied" in result
+        assert "Final:" in result
+
+    @pytest.mark.anyio
+    async def test_batch_findings_drops_running_scores_chain(self):
+        sid, rid = await self._setup_rubric()
+        start = await score_evaluate(action="start", session_id=sid, rubric_id=rid)
+        eid = _extract(start, "Eval:")
+        result = await score_evaluate(
+            action="batch_findings",
+            evaluation_id=eid,
+            findings=[
+                {
+                    "dimension": "feasibility",
+                    "severity": "low",
+                    "description": "a",
+                },
+                {
+                    "dimension": "completeness",
+                    "severity": "low",
+                    "description": "b",
+                },
+            ],
+        )
+        assert "Running scores:" not in result
+
+    @pytest.mark.anyio
+    async def test_batch_findings_drops_evaluation_id_echo(self):
+        sid, rid = await self._setup_rubric()
+        start = await score_evaluate(action="start", session_id=sid, rubric_id=rid)
+        eid = _extract(start, "Eval:")
+        result = await score_evaluate(
+            action="batch_findings",
+            evaluation_id=eid,
+            findings=[
+                {
+                    "dimension": "feasibility",
+                    "severity": "low",
+                    "description": "a",
+                }
+            ],
+        )
+        assert "evaluation_id:" not in result
+
+    @pytest.mark.anyio
+    async def test_batch_findings_keeps_final_and_finding_ids(self):
+        sid, rid = await self._setup_rubric()
+        start = await score_evaluate(action="start", session_id=sid, rubric_id=rid)
+        eid = _extract(start, "Eval:")
+        result = await score_evaluate(
+            action="batch_findings",
+            evaluation_id=eid,
+            findings=[
+                {
+                    "dimension": "feasibility",
+                    "severity": "low",
+                    "description": "a",
+                }
+            ],
+        )
+        assert "Final:" in result
+        assert "Finding IDs:" in result
+
+    @pytest.mark.anyio
+    async def test_finding_action_unchanged(self):
+        """Section 7 explicitly preserves the single-finding path. The
+        evaluation_id echo at score.py:547 (start) and the per-finding
+        echo around score.py:545 stay.
+        """
+        sid, rid = await self._setup_rubric()
+        start = await score_evaluate(action="start", session_id=sid, rubric_id=rid)
+        eid = _extract(start, "Eval:")
+        finding = await score_evaluate(
+            action="finding",
+            evaluation_id=eid,
+            dimension="feasibility",
+            severity="low",
+            description="single-finding path preserved",
+        )
+        # The single-finding response keeps the evaluation_id echo line.
+        assert f"evaluation_id: {eid}" in finding

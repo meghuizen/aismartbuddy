@@ -196,16 +196,25 @@ async def materialize_auto_graph(
     entity_type: str = "concept",
     description_field: str = "conclusion",
     edge_label: str = "DerivedFrom",
+    ref_field: str = "connects_to",
+    ref_resolver: Callable[[Any], str | None] | None = None,
 ) -> int:
-    """Materialise items[] outputs as KnowledgeNode rows + connects_to edges.
+    """Materialise items[] outputs as KnowledgeNode rows + outgoing edges.
 
     Requires the parent session (resolved via resolve_backend_session) to
     have a 'graph' backend. Each item becomes a KnowledgeNode where:
       - name = item['id']
       - description = item.get(description_field, '')[:200]
       - entity_type, source = passed-in tags
-    For each item, every entry in item.get('connects_to', []) becomes an
-    `edge_label` edge from this item's id to the referenced id.
+    For each item, every entry in ``item.get(ref_field, [])`` becomes an
+    ``edge_label`` edge from this item's id to the referenced target.
+
+    ``ref_resolver`` (optional) is applied to every ref value before the edge
+    is built. It returns the final node-name string the edge should point to,
+    or None to mean "use the value as-is". Use it for tools whose ref field
+    holds int batch-indexes (think_argue.responds_to_index, think_graph.parent_ref)
+    or batch-ref strings that need lookup against an existing ref→id map
+    (holon_create). Resolver returns of ``None`` fall through to ``str(ref)``.
 
     Returns the number of KnowledgeNode rows created.
 
@@ -271,8 +280,15 @@ async def materialize_auto_graph(
 
             for item in items:
                 src_id = escape_cypher_string(item["id"])
-                for ref in item.get("connects_to") or []:
-                    tgt = escape_cypher_string(str(ref))
+                for ref in item.get(ref_field) or []:
+                    if ref_resolver is not None:
+                        resolved = ref_resolver(ref)
+                        target_value = resolved if resolved is not None else str(ref)
+                    else:
+                        target_value = str(ref)
+                    if not target_value:
+                        continue
+                    tgt = escape_cypher_string(target_value)
                     try:
                         graph_info.engine.execute(
                             f"MATCH (a:KnowledgeNode {{name: '{src_id}'}}), "
@@ -283,7 +299,7 @@ async def materialize_auto_graph(
                             f"created_at: '{ts}'}}]->(b);"
                         )
                     except Exception:
-                        # Edge target may not exist if connects_to references
+                        # Edge target may not exist if the ref points to
                         # an external entity — silently skip rather than fail
                         # the whole materialisation.
                         pass

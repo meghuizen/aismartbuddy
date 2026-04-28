@@ -1144,7 +1144,7 @@ async def knowledge_batch(
     relations: list[dict] | None = None,
     idempotency_key: str | None = None,
 ) -> str:
-    """Bulk-create knowledge graph nodes and relations in one call.
+    """[ELABORATE] Bulk-create knowledge graph nodes and relations in one call.
 
     Use INSTEAD of multiple sequential graph_knowledge_add /
     graph_knowledge_relate calls when adding 3+ items. Same per-item

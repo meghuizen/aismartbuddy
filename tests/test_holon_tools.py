@@ -923,3 +923,213 @@ class TestHolonDisplayTruncateConfig:
                 raise AssertionError(f"no ancestor context line in {view!r}")
         finally:
             cfg.runtime_config.holon_truncate_chars = original_chars
+
+
+def _extract_session_id_from_create(result: str) -> str:
+    """Pull session_id from a session_create response."""
+    for line in result.splitlines():
+        line = line.strip()
+        if line.startswith("session_id:"):
+            return line[len("session_id:"):].strip()
+    raise AssertionError(f"No session_id in {result!r}")
+
+
+@pytest.mark.usefixtures("_init_session_manager")
+class TestHolonCreateAutoGraph:
+    """holon_create(holons=[...], auto_graph=True) materialises PartOf KG."""
+
+    @pytest.mark.anyio
+    async def test_auto_graph_default_false_byte_identical(self):
+        """auto_graph=False (default) MUST produce structurally identical
+        response to an explicit auto_graph=False call (modulo volatile ids)."""
+        holons_payload = [
+            {"ref": "root", "name": "Root", "description": "the root"},
+            {
+                "ref": "child_a",
+                "name": "Child A",
+                "description": "first child",
+                "parent_ref": "root",
+            },
+        ]
+        r_default = await holon_create(holons=[dict(h) for h in holons_payload])
+        r_explicit = await holon_create(
+            holons=[dict(h) for h in holons_payload],
+            auto_graph=False,
+        )
+
+        def _normalize(s: str) -> str:
+            lines: list[str] = []
+            for line in s.split("\n"):
+                if line.startswith("Session:"):
+                    if " | Batch:" in line:
+                        _, rhs = line.split(" | ", 1)
+                        lines.append(f"Session: <SID> | {rhs}")
+                    else:
+                        lines.append("Session: <SID>")
+                elif line.startswith("Holarchies:"):
+                    lines.append("Holarchies: <HIDS>")
+                elif line.startswith("Refs:"):
+                    # Refs uses ref=id pairs; ids are uuid.hex[:10] — keep
+                    # the ref names but normalize the ids.
+                    payload = line[len("Refs:"):].strip()
+                    pairs = [p.strip() for p in payload.split(",") if p.strip()]
+                    norm_pairs: list[str] = []
+                    for p in pairs:
+                        if "=" in p:
+                            ref, _id = p.split("=", 1)
+                            norm_pairs.append(f"{ref.strip()}=<ID>")
+                        else:
+                            norm_pairs.append(p)
+                    lines.append("Refs: " + ", ".join(norm_pairs))
+                else:
+                    lines.append(line)
+            return "\n".join(lines)
+
+        assert _normalize(r_default) == _normalize(r_explicit)
+        assert "Graph nodes created:" not in r_default
+        assert "Graph nodes created:" not in r_explicit
+
+    @pytest.mark.anyio
+    async def test_auto_graph_no_graph_backend_raises(self):
+        """auto_graph=True against a think-only session raises canonical
+        'requires a graph backend' error from materialize_auto_graph."""
+        from aismartbuddy.tools.infra import session_create
+
+        sess = await session_create(backends=["think"])
+        sid = _extract_session_id_from_create(sess)
+        with pytest.raises(ValueError, match="auto_graph requires a graph backend"):
+            await holon_create(
+                session_id=sid,
+                auto_graph=True,
+                holons=[
+                    {"ref": "root", "name": "Root", "description": "x"},
+                ],
+            )
+
+    @pytest.mark.anyio
+    async def test_auto_graph_requires_explicit_session_id(self):
+        """auto_graph=True without session_id raises the explicit-session-id error."""
+        with pytest.raises(ValueError, match="explicit unified session_id"):
+            await holon_create(
+                auto_graph=True,
+                holons=[
+                    {"ref": "root", "name": "Root", "description": "x"},
+                ],
+            )
+
+    @pytest.mark.anyio
+    async def test_auto_graph_creates_knowledge_nodes_and_partof_edges(self):
+        """N holons with batch-ref parents → N KnowledgeNode rows
+        (entity_type='holon') + correct PartOf edges."""
+        from aismartbuddy.tools.graph import graph_query
+        from aismartbuddy.tools.infra import session_create
+
+        sess = await session_create(backends=["think", "graph"], mode="analyze")
+        sid = _extract_session_id_from_create(sess)
+
+        result = await holon_create(
+            session_id=sid,
+            auto_graph=True,
+            holons=[
+                {"ref": "root", "name": "Root", "description": "the root"},
+                {
+                    "ref": "child_a",
+                    "name": "Child A",
+                    "description": "first child",
+                    "parent_ref": "root",
+                },
+                {
+                    "ref": "child_b",
+                    "name": "Child B",
+                    "description": "second child",
+                    "parent_ref": "root",
+                },
+                {
+                    "ref": "grandchild",
+                    "name": "Grandchild",
+                    "description": "deep",
+                    "parent_ref": "child_a",
+                },
+            ],
+        )
+        assert "Batch: 4 holons created" in result
+        assert "Graph nodes created: 4" in result
+
+        et_csv = await graph_query(
+            session_id=sid,
+            query=(
+                "MATCH (k:KnowledgeNode {entity_type: 'holon'}) "
+                "RETURN count(*) AS n;"
+            ),
+        )
+        assert "4" in et_csv
+
+        edges_csv = await graph_query(
+            session_id=sid,
+            query=(
+                "MATCH (a:KnowledgeNode)-[r:PartOf]->(b:KnowledgeNode) "
+                "RETURN count(*) AS n;"
+            ),
+        )
+        # 3 PartOf edges: child_a->root, child_b->root, grandchild->child_a
+        assert "3" in edges_csv
+
+    @pytest.mark.anyio
+    async def test_auto_graph_partof_edge_to_existing_holon_id(self):
+        """Second batch with parent_ref set to an already-materialised
+        holon-id produces PartOf edges via the pass-through path."""
+        from aismartbuddy.tools.graph import graph_query
+        from aismartbuddy.tools.infra import session_create
+
+        sess = await session_create(backends=["think", "graph"], mode="analyze")
+        sid = _extract_session_id_from_create(sess)
+
+        # First batch: create root, materialise it as a KnowledgeNode.
+        r1 = await holon_create(
+            session_id=sid,
+            auto_graph=True,
+            holons=[
+                {"ref": "root", "name": "Root", "description": "the root"},
+            ],
+        )
+        assert "Batch: 1 holons created" in r1
+        # Extract assigned root holon id
+        root_id = ""
+        for line in r1.split("\n"):
+            if line.startswith("Refs:"):
+                payload = line[len("Refs:"):].strip()
+                # Format: root=<holon_id>
+                for part in payload.split(","):
+                    part = part.strip()
+                    if part.startswith("root="):
+                        root_id = part[len("root="):].strip()
+                        break
+                break
+        assert root_id, f"could not extract root holon id from {r1!r}"
+
+        # Second batch: child references the existing root id (not a batch ref).
+        r2 = await holon_create(
+            session_id=sid,
+            auto_graph=True,
+            holons=[
+                {
+                    "ref": "child",
+                    "name": "Child",
+                    "description": "child of existing",
+                    "parent_ref": root_id,
+                },
+            ],
+        )
+        assert "Batch: 1 holons created" in r2
+        assert "Graph nodes created: 1" in r2
+
+        # PartOf edge from child -> root should now exist.
+        edges_csv = await graph_query(
+            session_id=sid,
+            query=(
+                "MATCH (a:KnowledgeNode)-[r:PartOf]->(b:KnowledgeNode) "
+                f"WHERE b.name = '{root_id}' "
+                "RETURN count(*) AS n;"
+            ),
+        )
+        assert "1" in edges_csv

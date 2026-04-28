@@ -94,7 +94,7 @@ async def brainstorm(
     session_id: str | None = None,
     ctx: _MCPContext | None = None,
 ) -> str:
-    """Generate quantity and diversity of ideas BEFORE evaluation.
+    """[ELABORATE] Generate quantity and diversity of ideas BEFORE evaluation.
 
     REJECTS submissions below min_ideas. Forces expansion. There is NO
     conclusion field. NO reasoning field. NO confidence. Just ideas + the
