@@ -49,6 +49,18 @@ def _require_sql_session(session_id: str | None):
     return mgr, info
 
 
+def _get_or_create_sql_session(session_id: str | None, ctx=None):
+    """Return an existing SQL session or auto-create an in-memory one."""
+    mgr = get_session_manager()
+    session_id = resolve_active_or_provided_session_id(session_id)
+    if session_id:
+        info = mgr.resolve_backend_session(session_id, "sql")
+        return mgr, info
+    user_id, project_id = resolve_identity(ctx, None, None)
+    info = mgr.create_session("sql", user_id, project_id)
+    return mgr, info
+
+
 async def sql_create_session(
     user_id: str | None = None,
     project_id: str | None = None,
@@ -112,7 +124,7 @@ async def sql_query(
     See also: sql_query_next for cursor-based pagination, sql_schema for table info.
 
     Args:
-        session_id: Session token from sql_create_session.
+        session_id: SQL session; omit to auto-create in-memory session or reuse active session.
         query: SQL statement to execute.
         output_format: Result format — "csv" (default, most token-efficient) or "table".
         offset: Skip this many rows from the start (for random-access paging).
@@ -122,7 +134,7 @@ async def sql_query(
     Returns:
         Query results formatted according to output_format.
     """
-    mgr, info = _require_sql_session(session_id)
+    mgr, info = _get_or_create_sql_session(session_id)
     return await execute_and_format(
         info,
         mgr,
@@ -147,7 +159,7 @@ async def sql_query_next(session_id: str | None = None, cursor_id: str = "") -> 
     See also: sql_query with paginate=True to start pagination.
 
     Args:
-        session_id: Session token from sql_create_session.
+        session_id: SQL session token (required; must have an open cursor).
         cursor_id: Cursor token from a previous sql_query(..., paginate=True) call.
 
     Returns:
@@ -170,16 +182,12 @@ async def sql_import(
     create_table: bool = True,
     delimiter: str | None = None,
 ) -> str:
-    """Import tabular data into a SQL session table.
-
-    Supports multiple formats with automatic schema detection.
-    For bulk imports, CSV is the most token-efficient format.
-    Use one of the supported general-purpose shapes so downstream tools can
-    profile and extract findings reliably before reasoning.
+    """Import tabular data into a SQL session table. Then query it with sql_query.
 
     Supported formats:
     - "csv" — Comma-separated values (default). Auto-detects headers and types.
-    - "tsv" — Tab-separated values. Same auto-detection as CSV.
+    - "tsv" — Tab-separated values. Pass a literal tab-delimited string:
+        data_format="tsv", data="gene\\tz_score\\tpathway\\nTLR3\\t-3.01\\tantiviral"
     - "txt" — Generic delimited text. Use `delimiter` to specify the separator.
     - "json" — JSON array of objects, e.g. [{"name": "Alice", "age": 30}, ...].
     - "jsonl" — JSON Lines (one JSON object per line).
@@ -188,7 +196,7 @@ async def sql_import(
     For custom delimiters (pipe, semicolon, etc.), use data_format="txt"
     with delimiter="|" or delimiter=";".
 
-    Reusable input shapes:
+    Reusable input shapes (CSV or TSV):
     - entity-score table: `entity,score,direction,panel,source`
     - differential table: `feature,log2fc,pvalue,padj`
     - ranked list: `entity,rank,metric,source`
@@ -198,10 +206,8 @@ async def sql_import(
     `sql_import` → `data_profile` / `data_anomalies` →
     `extract_findings_from_sql` → `think_model` / `think_science`
 
-    Example: sql_import(session_id, "users", "name,age\\nAlice,30\\nBob,25")
-
     Args:
-        session_id: Session token from sql_create_session.
+        session_id: SQL session; omit to auto-create in-memory session or reuse active session.
         table_name: Name for the target table.
         data: The data to import as a string. For parquet, base64-encode the binary.
         data_format: Format of the data — "csv" (default), "tsv", "txt",
@@ -215,7 +221,7 @@ async def sql_import(
     Returns:
         Import confirmation with row count.
     """
-    mgr, info = _require_sql_session(session_id)
+    mgr, info = _get_or_create_sql_session(session_id)
     count = await run_with_lock(
         info,
         lambda: info.engine.import_data(table_name, data, data_format, create_table, delimiter),
@@ -254,7 +260,7 @@ async def sql_import_batch(
     Example: sql_import_batch(session_id, "logs", [chunk1, chunk2, chunk3])
 
     Args:
-        session_id: Session token from sql_create_session.
+        session_id: SQL session; omit to auto-create in-memory session or reuse active session.
         table_name: Name for the target table.
         chunks: List of data strings to import sequentially.
         data_format: Format of all chunks — "csv" (default), "tsv", "txt",
@@ -264,7 +270,7 @@ async def sql_import_batch(
     Returns:
         Import confirmation with total row count and chunk count.
     """
-    mgr, info = _require_sql_session(session_id)
+    mgr, info = _get_or_create_sql_session(session_id)
     total = await run_with_lock(
         info,
         lambda: info.engine.import_batch(table_name, chunks or [], data_format, delimiter),
@@ -284,13 +290,13 @@ async def sql_schema(session_id: str | None = None, table_name: str | None = Non
     Example: sql_schema(session_id) or sql_schema(session_id, "users")
 
     Args:
-        session_id: Session token from sql_create_session.
+        session_id: SQL session; omit to auto-create in-memory session or reuse active session.
         table_name: Optional — specific table to describe.
 
     Returns:
         Schema information in compact format.
     """
-    mgr, info = _require_sql_session(session_id)
+    mgr, info = _get_or_create_sql_session(session_id)
 
     if table_name:
         columns, rows = await run_with_lock(info, lambda: info.engine.describe_table(table_name))
@@ -328,7 +334,7 @@ async def data_profile(
         unique_count, min/max/mean/median/stddev, quantiles, top_values
         (categorical), outlier_count.
     """
-    mgr, info = _require_sql_session(session_id)
+    mgr, info = _get_or_create_sql_session(session_id)
     _validate_sql_identifier(table, "table")
     if columns:
         for c in columns:
@@ -380,7 +386,7 @@ async def data_anomalies(
             "isolation_forest requires an external library (scikit-learn). "
             "Use 'zscore' or 'iqr' for built-in detection."
         )
-    mgr, info = _require_sql_session(session_id)
+    mgr, info = _get_or_create_sql_session(session_id)
     _validate_sql_identifier(table, "table")
     for c in columns:
         _validate_sql_identifier(c, "column")

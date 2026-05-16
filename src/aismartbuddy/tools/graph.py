@@ -42,6 +42,18 @@ def _require_graph_session(session_id: str | None):
     return mgr, info
 
 
+def _get_or_create_graph_session(session_id: str | None, ctx=None):
+    """Return an existing graph session or auto-create an in-memory one."""
+    mgr = get_session_manager()
+    session_id = resolve_active_or_provided_session_id(session_id)
+    if session_id:
+        info = mgr.resolve_backend_session(session_id, "graph")
+        return mgr, info
+    user_id, project_id = resolve_identity(ctx, None, None)
+    info = mgr.create_session("graph", user_id, project_id)
+    return mgr, info
+
+
 def _require_graph_session_pair(session_id_a: str, session_id_b: str):
     """Validate and return two graph sessions for comparison tools."""
     mgr = get_session_manager()
@@ -145,7 +157,7 @@ async def graph_query(
     See also: graph_query_next for cursor pagination, graph_schema for table info.
 
     Args:
-        session_id: Session token from graph_create_session.
+        session_id: Graph session; omit to auto-create in-memory session or reuse active session.
         query: Cypher query to execute.
         output_format: Result format — "csv" (default, most token-efficient) or "table".
         offset: Skip this many rows from the start (for random-access paging).
@@ -157,7 +169,7 @@ async def graph_query(
     Returns:
         Query results in the chosen format, or a timeout error message.
     """
-    mgr, info = _require_graph_session(session_id)
+    mgr, info = _get_or_create_graph_session(session_id)
     return await execute_and_format(
         info,
         mgr,
@@ -196,7 +208,7 @@ async def graph_import(
     - pathway membership: `from,to,panel,source`
 
     Args:
-        session_id: Session token from graph_create_session.
+        session_id: Graph session; omit to auto-create in-memory session or reuse active session.
         table_name: Name of the node or relationship table.
         data: CSV content with header row.
         table_type: "node" (default) or "relationship".
@@ -207,7 +219,7 @@ async def graph_import(
     Returns:
         Import confirmation with row count.
     """
-    mgr, info = _require_graph_session(session_id)
+    mgr, info = _get_or_create_graph_session(session_id)
     count = await run_with_lock(
         info,
         lambda: info.engine.import_csv(table_name, data, table_type, schema, from_table, to_table),
@@ -219,12 +231,12 @@ async def graph_schema(session_id: str | None = None) -> str:
     """Get graph database schema — node tables, relationship tables, and their properties.
 
     Args:
-        session_id: Session token from graph_create_session.
+        session_id: Graph session; omit to auto-create in-memory session or reuse active session.
 
     Returns:
         Schema information showing all tables and their structure.
     """
-    mgr, info = _require_graph_session(session_id)
+    mgr, info = _get_or_create_graph_session(session_id)
     columns, rows = await run_with_lock(info, info.engine.get_schema)
     if not rows:
         return "No tables in graph database. Create tables with graph_query or graph_import."
@@ -259,7 +271,7 @@ async def graph_query_next(session_id: str | None = None, cursor_id: str = "") -
     See also: graph_query with paginate=True to start pagination.
 
     Args:
-        session_id: Session token from graph_create_session.
+        session_id: Graph session token (required; must have an open cursor).
         cursor_id: Cursor token from a previous graph_query(..., paginate=True) call.
 
     Returns:
@@ -279,19 +291,14 @@ async def graph_query_next(session_id: str | None = None, cursor_id: str = "") -
 
 @size_guarded
 async def graph_statistics(session_id: str | None = None) -> str:
-    """Get a complete overview of the graph in one call.
-
-    Returns node counts by type, relationship counts by type,
-    total nodes/edges, and the top 5 most-connected nodes.
-    Use this to get a "holistic view" of the graph before diving into queries.
-
-    Args:
-        session_id: Session token from graph_create_session.
-
-    Returns:
-        Compact graph overview with all statistics.
+    """[ELABORATE] Graph overview in one call. Returns node counts by type, edge counts by
+    type, total nodes, total edges, and top 5 nodes by connection count (text format).
+    Use before graph_analyze to understand what types and volumes exist.
+    Does NOT compute centrality metrics -- use graph_analyze(analysis_type="hubs") for degree
+    leaders.
+    session_id: graph session; omit to auto-create in-memory session or reuse active session
     """
-    mgr, info = _require_graph_session(session_id)
+    mgr, info = _get_or_create_graph_session(session_id)
     stats = await run_with_lock(info, info.engine.get_statistics)
 
     lines = ["## Graph Overview"]
@@ -324,7 +331,7 @@ async def graph_neighbors(
     Use this to "focus on a sub-part" of the graph around a specific entity.
 
     Args:
-        session_id: Session token from graph_create_session.
+        session_id: Graph session; omit to auto-create in-memory session or reuse active session.
         node_name: Name of the node to explore.
         node_type: Node table name (e.g., "Gene", "Pathway").
         depth: How many hops to explore (default 1, max 5).
@@ -333,7 +340,7 @@ async def graph_neighbors(
     Returns:
         Neighborhood nodes and their relationship to the target.
     """
-    mgr, info = _require_graph_session(session_id)
+    mgr, info = _get_or_create_graph_session(session_id)
     _validate_id(node_type, "node_type")
     safe_name = _escape_cypher_string(node_name)
     depth = min(depth, 5)
@@ -370,7 +377,7 @@ async def graph_focus_summary(
     without spending one round trip per `graph_neighbors` call.
 
     Args:
-        session_id: Session token from graph_create_session.
+        session_id: Graph session; omit to auto-create in-memory session or reuse active session.
         node_names: Node names to inspect (up to 10).
         node_type: Node table name (e.g., "Gene", "Pathway", "KnowledgeNode").
         depth: How many hops to explore around each node (default 1, max 5).
@@ -381,7 +388,7 @@ async def graph_focus_summary(
     """
     if not node_names:
         raise ValueError("node_names must be non-empty")
-    mgr, info = _require_graph_session(session_id)
+    mgr, info = _get_or_create_graph_session(session_id)
     _validate_id(node_type, "node_type")
     depth = min(depth, 5)
     names = []
@@ -442,7 +449,7 @@ async def graph_find_connections(
     Use for path finding, shortest path analysis, and connection discovery.
 
     Args:
-        session_id: Session token from graph_create_session.
+        session_id: Graph session; omit to auto-create in-memory session or reuse active session.
         from_name: Name of the source node.
         from_type: Table type of the source node (e.g., "Gene").
         to_name: Name of the target node.
@@ -453,7 +460,7 @@ async def graph_find_connections(
     Returns:
         Paths between the two nodes with intermediate nodes listed.
     """
-    mgr, info = _require_graph_session(session_id)
+    mgr, info = _get_or_create_graph_session(session_id)
     _validate_id(from_type, "from_type")
     _validate_id(to_type, "to_type")
     safe_from = _escape_cypher_string(from_name)
@@ -677,26 +684,23 @@ async def _analyze_domain_bridges(info, mgr, stats) -> str:
 
 
 async def graph_analyze(session_id: str | None = None, analysis_type: str = "") -> str:
-    """Run pre-built analytical queries on the graph.
+    """[ELABORATE] Run pre-built graph analysis. Returns formatted text result per type.
 
-    Saves you from writing complex Cypher for common graph analysis tasks.
+    analysis_type (required):
+      orphans           - nodes with no relationships
+      hubs              - top 10 most-connected nodes per type (degree leaders)
+      bottlenecks       - same as hubs (highest-degree nodes)
+      categories        - group nodes by property values (status, direction, etc.)
+      cross_connections - nodes that participate in multiple relationship types
+      feedback_loops    - 2-cycle detection: (a)-->(b)-->(a) patterns
+      motifs            - recurring patterns: mutual pairs and feed-forward triads
+      domain_bridges    - KnowledgeNode edges where r.domain IS NOT NULL
 
-    Args:
-        session_id: Session token from graph_create_session.
-        analysis_type: Type of analysis to run:
-            - "orphans" — find nodes with no relationships
-            - "hubs" — find the 10 most-connected nodes (highest degree)
-            - "categories" — group all nodes by type and key properties
-            - "cross_connections" — find nodes linking different node types
-            - "motifs" — recurring small subgraph patterns
-            - "bottlenecks" — high-connectivity bridge nodes
-            - "domain_bridges" — cross-domain relationships using edge domain metadata
-            - "feedback_loops" — simple directed cycles
-
-    Returns:
-        Analysis results in table format.
+    Use hubs/bottlenecks for degree centrality. Use feedback_loops for cycle detection.
+    Does NOT compute betweenness centrality or minimum vertex cut.
+    session_id: graph session; omit to auto-create in-memory session or reuse active session
     """
-    mgr, info = _require_graph_session(session_id)
+    mgr, info = _get_or_create_graph_session(session_id)
     stats = await run_with_lock(info, info.engine.get_statistics)
 
     dispatch = {
@@ -954,7 +958,7 @@ async def graph_knowledge_add(
     to create multiple nodes in one call. Each item is one entity.
 
     Args:
-        session_id: Session token from graph_create_session.
+        session_id: Graph session; omit to auto-create in-memory session or reuse active session.
         entity: Name/label of the knowledge entity.
         entity_type: Documented defaults: concept, entity, fact, evidence,
             question, insight. Any non-empty string is accepted and registered
@@ -966,7 +970,7 @@ async def graph_knowledge_add(
     Returns:
         Confirmation with node details.
     """
-    mgr, info = _require_graph_session(session_id)
+    mgr, info = _get_or_create_graph_session(session_id)
     if items is not None:
         return await knowledge_batch(
             session_id=session_id,
@@ -1050,7 +1054,7 @@ async def graph_knowledge_relate(
     multiple semantic relationships in one call.
 
     Args:
-        session_id: Session token from graph_create_session.
+        session_id: Graph session; omit to auto-create in-memory session or reuse active session.
         from_name: Name of the source knowledge node.
         to_name: Name of the target knowledge node.
         relation: Semantic relationship type. Documented defaults are
@@ -1068,7 +1072,7 @@ async def graph_knowledge_relate(
     Returns:
         Confirmation with relationship details.
     """
-    mgr, info = _require_graph_session(session_id)
+    mgr, info = _get_or_create_graph_session(session_id)
     if items is not None:
         return await knowledge_batch(
             session_id=session_id,
@@ -1145,36 +1149,24 @@ async def knowledge_batch(
     idempotency_key: str | None = None,
 ) -> str:
     """[ELABORATE] Bulk-create knowledge graph nodes and relations in one call.
+    Returns: "Session: X | Nodes added: N | Relations added: R" plus any per-relation errors.
 
-    Use INSTEAD of multiple sequential graph_knowledge_add /
-    graph_knowledge_relate calls when adding 3+ items. Same per-item
-    validation as the single-item tools — invalid items abort the batch.
-    Each node entry should be one entity and each relation entry should be
-    one semantic relationship. Batch mode reduces round-trips; it is not a
-    place to pack multiple entities or multiple meanings into one dict.
+    Use INSTEAD of sequential graph_knowledge_add / graph_knowledge_relate when adding 3+
+    items. No hard volume limit -- tested with 50+ nodes and 49+ edges in a single call.
+    Invalid items abort the entire batch (fail-fast).
 
-    Two-phase: nodes are created first (so relations can match), then
-    relations. All operations execute under a single session lock —
-    other agents on the same session serialize.
+    Node schema:     {entity (required), entity_type?, confidence?, properties?, source?}
+    Relation schema: {from_name, to_name, relation (all required), weight?,
+                      justification?, source?, domain?, directionality?, confidence_basis?}
 
-    Args:
-        session_id: Session token from graph_create_session.
-        nodes: List of node dicts. Each: {entity, entity_type?, confidence?,
-            properties?, source?}. entity is required;
-            entity_type defaults to "concept", confidence to 1.0, source to "ai".
-            Alias accepted: hypothesis -> question. entity_type is open-ended.
-        relations: List of relation dicts. Each: {from_name, to_name, relation,
-            weight?, justification?, source?, domain?, directionality?,
-            confidence_basis?}. relation is open-ended; documented defaults are
-            supports/contradicts/refines/causes/prevents/requires/
-            part_of/similar_to/derived_from.
-
-    Returns:
-        Counts of nodes/relations created plus any per-item errors.
+    Two-phase: nodes first (so relations can resolve them), then relations.
+    Single session lock for the full batch.
+    idempotency_key: optional stable string to deduplicate retried calls.
+    session_id: graph session; omit to auto-create in-memory session or reuse active session
     """
     from datetime import datetime, timezone
 
-    mgr, info = _require_graph_session(session_id)
+    mgr, info = _get_or_create_graph_session(session_id)
     if idempotency_key:
         cached = mgr.get_idempotent_result(info.session_id, idempotency_key)
         if cached is not None:
@@ -1304,7 +1296,7 @@ async def graph_knowledge_infer(
     Finds patterns, contradictions, gaps, and chains in the knowledge.
 
     Args:
-        session_id: Session token from graph_create_session.
+        session_id: Graph session; omit to auto-create in-memory session or reuse active session.
         inference_type: Type of inference to run:
             - "contradictions" — pairs connected by both supports AND contradicts
             - "gaps" — high-degree nodes with low avg edge confidence
@@ -1320,7 +1312,7 @@ async def graph_knowledge_infer(
     Returns:
         Inference results.
     """
-    mgr, info = _require_graph_session(session_id)
+    mgr, info = _get_or_create_graph_session(session_id)
     # Bound max_depth to prevent runaway transitive closure
     max_depth = max(2, min(max_depth, 10))
     try:
@@ -1506,12 +1498,12 @@ async def graph_knowledge_summary(session_id: str | None = None) -> str:
     This is the "total knowledge perspective" for the AI.
 
     Args:
-        session_id: Session token from graph_create_session.
+        session_id: Graph session; omit to auto-create in-memory session or reuse active session.
 
     Returns:
         Complete knowledge graph overview.
     """
-    mgr, info = _require_graph_session(session_id)
+    mgr, info = _get_or_create_graph_session(session_id)
 
     lines = ["## Knowledge Graph Summary"]
 

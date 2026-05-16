@@ -3068,10 +3068,20 @@ async def think_hypothesis(
     ctx: _MCPContext | None = None,
 ) -> str:
     """[SCAFFOLD] Register, compare, update, and invalidate competing hypotheses.
+    Returns text summary of hypotheses, evidence rankings, or comparison matrix.
+    PREFER items=[...] (or hypothesis_ids=[...] for invalidate) for batch ops.
 
-    PREFER items=[...] (or *_ids=[...] for invalidate/remove) on every action
-    when handling one-or-more records — list-form scales without added
-    round-trips. Single-record args remain supported for backward-compat.
+    Actions:
+      register(statement, confidence?, predictions?, prior_weight?, domain?, refs?)
+          -- add hypothesis; items=[] for N at once
+      evidence(hypothesis_id, evidence_text, direction)
+          -- attach supporting or contradicting evidence
+      compare()                              -- rank all by evidence strength
+      discriminate(hypothesis_ids[>=2])      -- identify discriminating observations
+      update(hypothesis_id, new_predictions?, revised_statement?)
+      invalidate(hypothesis_id or hypothesis_ids[], reason?, invalidated_by?)
+
+    session_id: think session; omit to auto-create or reuse active session
     """
     _validate_enum(action, _HYPOTHESIS_ACTIONS, "action")
     _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
@@ -3280,15 +3290,21 @@ async def think_constraint(
     ctx: _MCPContext | None = None,
 ) -> str:
     """[ELABORATE] Register constraints and validate targets against them.
+    Returns validation matrix, compliance results, or constraint list (text format).
+    PREFER items=[...] (or constraint_ids=[...] for remove).
 
-    PREFER items=[...] (or *_ids=[...] for invalidate/remove) on every action
-    when handling one-or-more records — list-form scales without added
-    round-trips. Single-record args remain supported for backward-compat.
+    type:        "hard" (must not be violated) | "soft" (should not be violated)
+    target_type: hypothesis | thought | model | decision | holon | evaluation
 
-    `check_all` performs a real sweep: for each applicable constraint and each
-    matching target, it returns a matrix row. Existing validations are reused;
-    missing ones are created as `uncertain` so the gap remains explicit rather
-    than silently skipped.
+    Actions:
+      register(constraint_id, domain, type, statement, check_description?, applies_to?)
+      list()                                         -- all registered constraints
+      remove(constraint_id or constraint_ids[])
+      validate(constraint_id, target_type, target_id?, target_text?, status?, note?)
+      check_all(target_type, target_id?)             -- sweep all applicable constraints;
+          reuses existing validations; creates uncertain placeholders for gaps
+
+    session_id: think session; omit to auto-create or reuse active session
     """
     _validate_enum(action, _CONSTRAINT_ACTIONS, "action")
     _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
@@ -3562,11 +3578,23 @@ async def think_topology(
     items: list[dict] | None = None,
     ctx: _MCPContext | None = None,
 ) -> str:
-    """[ELABORATE] Define, compare, and translate domain-neutral structural topologies.
+    """[ELABORATE] Define, abstract, compare, and translate domain-neutral structural topologies.
+    Returns topology definitions, similarity scores, or translated vocabulary (text format).
+    PREFER items=[...] for define and abstract when creating N topologies.
 
-    PREFER items=[...] (or *_ids=[...] for invalidate/remove) on every action
-    when handling one-or-more records — list-form scales without added
-    round-trips. Single-record args remain supported for backward-compat.
+    Node role values: SOURCE | SINK | SENSOR | EFFECTOR | BUFFER | SWITCH | GATE | JUNCTION
+    Edge type values: AMPLIFIES | SUPPRESSES | DELAYS | SATURATES | OSCILLATES | THRESHOLDS |
+                      COUPLES
+
+    Actions:
+      define(topology_id, name, nodes[{role}], edges[{type}]?, source_description?, source_domain?)
+      abstract(source_description, topology_id?, name?, source_domain?, edges?)
+          -- infer topology from natural language
+      compare(topology_a_id, topology_b_id)         -- structural similarity
+      translate(topology_id, target_domain)          -- map into target domain's vocabulary
+      search(pattern?)                               -- find matching topologies
+
+    session_id: think session; omit to auto-create or reuse active session
     """
     _validate_enum(action, _TOPOLOGY_ACTIONS, "action")
     _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
@@ -3946,12 +3974,20 @@ async def think_bridge(
     target_type: str | None = None,
     ctx: _MCPContext | None = None,
 ) -> str:
-    """[ELABORATE] Query thought graph, hypotheses, constraints, evidence, topology state.
+    """[ELABORATE] Query think session state by entity, node, hypothesis, or topic.
+    Returns integrated context from the think graph and (if available) the graph backend.
 
-    When the current think session belongs to a unified think+graph workspace,
-    the tool also attempts graph-backed context lookups. Those lookups are
-    best-effort and fail safe: if no graph backend exists, or the graph query
-    fails, the think-side response still succeeds.
+    Six actions -- each requires different params:
+      full_context(target_id, target_type?)          - everything known about a specific record ID
+      thoughts_for_entity(entity_name)               - all ThoughtNodes referencing an entity
+      entities_for_thought(node_id)                  - entities referenced in a specific thought
+                                                          node
+      hypotheses_for_entity(entity_name)             - hypotheses where entity appears
+      evidence_for_hypothesis(hypothesis_id)         - evidence chain + computed strength score
+      constraints_for_hypothesis(hypothesis_id)      - constraint validations on a hypothesis
+
+    Graph backend lookup is best-effort: if no graph backend, think-side result still returns.
+    session_id: think session; omit to auto-create or reuse active session
     """
     _validate_enum(action, _BRIDGE_ACTIONS, "action")
     _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
