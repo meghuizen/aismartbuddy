@@ -52,8 +52,9 @@ def _require_sql_session(session_id: str | None):
 def _get_or_create_sql_session(session_id: str | None):
     """Return an existing SQL session or auto-create an in-memory one.
 
-    Callers must wrap this in anyio.to_thread.run_sync — create_session
-    does blocking disk I/O (mkdir + DB connect).
+    Callers must wrap in anyio.to_thread.run_sync -- create_session does
+    blocking disk I/O (mkdir + DB connect). Side effect: if no active
+    session exists, the new session becomes the process-wide active session.
     """
     mgr = get_session_manager()
     session_id = resolve_active_or_provided_session_id(session_id)

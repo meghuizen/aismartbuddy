@@ -3072,8 +3072,8 @@ async def think_hypothesis(
     PREFER items=[...] (or hypothesis_ids=[...] for invalidate) for batch ops.
 
     Actions:
-      register(statement, confidence?, predictions?, prior_weight?, domain?, refs?)
-          -- add hypothesis; items=[] for N at once
+      register(statement, prior_weight?, predictions?, domain?)
+          -- single form; items=[] also adds: confidence?, refs?
       evidence(hypothesis_id, evidence_text, direction)
           -- attach supporting or contradicting evidence
       compare()                              -- rank all by evidence strength
@@ -3295,6 +3295,7 @@ async def think_constraint(
 
     type:        "hard" (must not be violated) | "soft" (should not be violated)
     target_type: hypothesis | thought | model | decision | holon | evaluation
+    status:      pass | fail | uncertain  (used in validate action)
 
     Actions:
       register(constraint_id, domain, type, statement, check_description?, applies_to?)

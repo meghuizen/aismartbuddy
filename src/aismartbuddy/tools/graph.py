@@ -45,8 +45,9 @@ def _require_graph_session(session_id: str | None):
 def _get_or_create_graph_session(session_id: str | None):
     """Return an existing graph session or auto-create an in-memory one.
 
-    Callers must wrap this in anyio.to_thread.run_sync — create_session
-    does blocking disk I/O (mkdir + DB connect).
+    Callers must wrap in anyio.to_thread.run_sync -- create_session does
+    blocking disk I/O (mkdir + DB connect). Side effect: if no active
+    session exists, the new session becomes the process-wide active session.
     """
     mgr = get_session_manager()
     session_id = resolve_active_or_provided_session_id(session_id)
@@ -692,8 +693,8 @@ async def graph_analyze(session_id: str | None = None, analysis_type: str = "") 
 
     analysis_type (required):
       orphans           - nodes with no relationships
-      hubs              - top 10 most-connected nodes per type (degree leaders)
-      bottlenecks       - same as hubs (highest-degree nodes)
+      hubs              - top 10 nodes overall by degree (candidates drawn per-type)
+      bottlenecks       - top 20 nodes overall by degree (broader view than hubs)
       categories        - group nodes by property values (status, direction, etc.)
       cross_connections - nodes that participate in multiple relationship types
       feedback_loops    - 2-cycle detection: (a)-->(b)-->(a) patterns
@@ -1157,7 +1158,9 @@ async def knowledge_batch(
 
     Use INSTEAD of sequential graph_knowledge_add / graph_knowledge_relate when adding 3+
     items. No hard volume limit -- tested with 50+ nodes and 49+ edges in a single call.
-    Invalid items abort the entire batch (fail-fast).
+    Missing required fields abort the whole batch upfront. Runtime relation errors
+    (unresolvable from_name/to_name) are collected per-row and returned in the summary;
+    already-inserted nodes are NOT rolled back.
 
     Node schema:     {entity (required), entity_type?, confidence?, properties?, source?}
     Relation schema: {from_name, to_name, relation (all required), weight?,
