@@ -42,14 +42,18 @@ def _require_graph_session(session_id: str | None):
     return mgr, info
 
 
-def _get_or_create_graph_session(session_id: str | None, ctx=None):
-    """Return an existing graph session or auto-create an in-memory one."""
+def _get_or_create_graph_session(session_id: str | None):
+    """Return an existing graph session or auto-create an in-memory one.
+
+    Callers must wrap this in anyio.to_thread.run_sync — create_session
+    does blocking disk I/O (mkdir + DB connect).
+    """
     mgr = get_session_manager()
     session_id = resolve_active_or_provided_session_id(session_id)
     if session_id:
         info = mgr.resolve_backend_session(session_id, "graph")
         return mgr, info
-    user_id, project_id = resolve_identity(ctx, None, None)
+    user_id, project_id = resolve_identity(None, None, None)
     info = mgr.create_session("graph", user_id, project_id)
     return mgr, info
 
@@ -169,7 +173,7 @@ async def graph_query(
     Returns:
         Query results in the chosen format, or a timeout error message.
     """
-    mgr, info = _get_or_create_graph_session(session_id)
+    mgr, info = await anyio.to_thread.run_sync(lambda: _get_or_create_graph_session(session_id))
     return await execute_and_format(
         info,
         mgr,
@@ -219,7 +223,7 @@ async def graph_import(
     Returns:
         Import confirmation with row count.
     """
-    mgr, info = _get_or_create_graph_session(session_id)
+    mgr, info = await anyio.to_thread.run_sync(lambda: _get_or_create_graph_session(session_id))
     count = await run_with_lock(
         info,
         lambda: info.engine.import_csv(table_name, data, table_type, schema, from_table, to_table),
@@ -236,7 +240,7 @@ async def graph_schema(session_id: str | None = None) -> str:
     Returns:
         Schema information showing all tables and their structure.
     """
-    mgr, info = _get_or_create_graph_session(session_id)
+    mgr, info = await anyio.to_thread.run_sync(lambda: _get_or_create_graph_session(session_id))
     columns, rows = await run_with_lock(info, info.engine.get_schema)
     if not rows:
         return "No tables in graph database. Create tables with graph_query or graph_import."
@@ -298,7 +302,7 @@ async def graph_statistics(session_id: str | None = None) -> str:
     leaders.
     session_id: graph session; omit to auto-create in-memory session or reuse active session
     """
-    mgr, info = _get_or_create_graph_session(session_id)
+    mgr, info = await anyio.to_thread.run_sync(lambda: _get_or_create_graph_session(session_id))
     stats = await run_with_lock(info, info.engine.get_statistics)
 
     lines = ["## Graph Overview"]
@@ -340,7 +344,7 @@ async def graph_neighbors(
     Returns:
         Neighborhood nodes and their relationship to the target.
     """
-    mgr, info = _get_or_create_graph_session(session_id)
+    mgr, info = await anyio.to_thread.run_sync(lambda: _get_or_create_graph_session(session_id))
     _validate_id(node_type, "node_type")
     safe_name = _escape_cypher_string(node_name)
     depth = min(depth, 5)
@@ -388,7 +392,7 @@ async def graph_focus_summary(
     """
     if not node_names:
         raise ValueError("node_names must be non-empty")
-    mgr, info = _get_or_create_graph_session(session_id)
+    mgr, info = await anyio.to_thread.run_sync(lambda: _get_or_create_graph_session(session_id))
     _validate_id(node_type, "node_type")
     depth = min(depth, 5)
     names = []
@@ -460,7 +464,7 @@ async def graph_find_connections(
     Returns:
         Paths between the two nodes with intermediate nodes listed.
     """
-    mgr, info = _get_or_create_graph_session(session_id)
+    mgr, info = await anyio.to_thread.run_sync(lambda: _get_or_create_graph_session(session_id))
     _validate_id(from_type, "from_type")
     _validate_id(to_type, "to_type")
     safe_from = _escape_cypher_string(from_name)
@@ -700,7 +704,7 @@ async def graph_analyze(session_id: str | None = None, analysis_type: str = "") 
     Does NOT compute betweenness centrality or minimum vertex cut.
     session_id: graph session; omit to auto-create in-memory session or reuse active session
     """
-    mgr, info = _get_or_create_graph_session(session_id)
+    mgr, info = await anyio.to_thread.run_sync(lambda: _get_or_create_graph_session(session_id))
     stats = await run_with_lock(info, info.engine.get_statistics)
 
     dispatch = {
@@ -970,7 +974,7 @@ async def graph_knowledge_add(
     Returns:
         Confirmation with node details.
     """
-    mgr, info = _get_or_create_graph_session(session_id)
+    mgr, info = await anyio.to_thread.run_sync(lambda: _get_or_create_graph_session(session_id))
     if items is not None:
         return await knowledge_batch(
             session_id=session_id,
@@ -1072,7 +1076,7 @@ async def graph_knowledge_relate(
     Returns:
         Confirmation with relationship details.
     """
-    mgr, info = _get_or_create_graph_session(session_id)
+    mgr, info = await anyio.to_thread.run_sync(lambda: _get_or_create_graph_session(session_id))
     if items is not None:
         return await knowledge_batch(
             session_id=session_id,
@@ -1166,7 +1170,7 @@ async def knowledge_batch(
     """
     from datetime import datetime, timezone
 
-    mgr, info = _get_or_create_graph_session(session_id)
+    mgr, info = await anyio.to_thread.run_sync(lambda: _get_or_create_graph_session(session_id))
     if idempotency_key:
         cached = mgr.get_idempotent_result(info.session_id, idempotency_key)
         if cached is not None:
@@ -1312,7 +1316,7 @@ async def graph_knowledge_infer(
     Returns:
         Inference results.
     """
-    mgr, info = _get_or_create_graph_session(session_id)
+    mgr, info = await anyio.to_thread.run_sync(lambda: _get_or_create_graph_session(session_id))
     # Bound max_depth to prevent runaway transitive closure
     max_depth = max(2, min(max_depth, 10))
     try:
@@ -1503,7 +1507,7 @@ async def graph_knowledge_summary(session_id: str | None = None) -> str:
     Returns:
         Complete knowledge graph overview.
     """
-    mgr, info = _get_or_create_graph_session(session_id)
+    mgr, info = await anyio.to_thread.run_sync(lambda: _get_or_create_graph_session(session_id))
 
     lines = ["## Knowledge Graph Summary"]
 

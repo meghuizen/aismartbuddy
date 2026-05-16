@@ -49,14 +49,18 @@ def _require_sql_session(session_id: str | None):
     return mgr, info
 
 
-def _get_or_create_sql_session(session_id: str | None, ctx=None):
-    """Return an existing SQL session or auto-create an in-memory one."""
+def _get_or_create_sql_session(session_id: str | None):
+    """Return an existing SQL session or auto-create an in-memory one.
+
+    Callers must wrap this in anyio.to_thread.run_sync — create_session
+    does blocking disk I/O (mkdir + DB connect).
+    """
     mgr = get_session_manager()
     session_id = resolve_active_or_provided_session_id(session_id)
     if session_id:
         info = mgr.resolve_backend_session(session_id, "sql")
         return mgr, info
-    user_id, project_id = resolve_identity(ctx, None, None)
+    user_id, project_id = resolve_identity(None, None, None)
     info = mgr.create_session("sql", user_id, project_id)
     return mgr, info
 
@@ -134,7 +138,7 @@ async def sql_query(
     Returns:
         Query results formatted according to output_format.
     """
-    mgr, info = _get_or_create_sql_session(session_id)
+    mgr, info = await anyio.to_thread.run_sync(lambda: _get_or_create_sql_session(session_id))
     return await execute_and_format(
         info,
         mgr,
@@ -221,7 +225,7 @@ async def sql_import(
     Returns:
         Import confirmation with row count.
     """
-    mgr, info = _get_or_create_sql_session(session_id)
+    mgr, info = await anyio.to_thread.run_sync(lambda: _get_or_create_sql_session(session_id))
     count = await run_with_lock(
         info,
         lambda: info.engine.import_data(table_name, data, data_format, create_table, delimiter),
@@ -270,7 +274,7 @@ async def sql_import_batch(
     Returns:
         Import confirmation with total row count and chunk count.
     """
-    mgr, info = _get_or_create_sql_session(session_id)
+    mgr, info = await anyio.to_thread.run_sync(lambda: _get_or_create_sql_session(session_id))
     total = await run_with_lock(
         info,
         lambda: info.engine.import_batch(table_name, chunks or [], data_format, delimiter),
@@ -296,7 +300,7 @@ async def sql_schema(session_id: str | None = None, table_name: str | None = Non
     Returns:
         Schema information in compact format.
     """
-    mgr, info = _get_or_create_sql_session(session_id)
+    mgr, info = await anyio.to_thread.run_sync(lambda: _get_or_create_sql_session(session_id))
 
     if table_name:
         columns, rows = await run_with_lock(info, lambda: info.engine.describe_table(table_name))
@@ -334,7 +338,7 @@ async def data_profile(
         unique_count, min/max/mean/median/stddev, quantiles, top_values
         (categorical), outlier_count.
     """
-    mgr, info = _get_or_create_sql_session(session_id)
+    mgr, info = await anyio.to_thread.run_sync(lambda: _get_or_create_sql_session(session_id))
     _validate_sql_identifier(table, "table")
     if columns:
         for c in columns:
@@ -386,7 +390,7 @@ async def data_anomalies(
             "isolation_forest requires an external library (scikit-learn). "
             "Use 'zscore' or 'iqr' for built-in detection."
         )
-    mgr, info = _get_or_create_sql_session(session_id)
+    mgr, info = await anyio.to_thread.run_sync(lambda: _get_or_create_sql_session(session_id))
     _validate_sql_identifier(table, "table")
     for c in columns:
         _validate_sql_identifier(c, "column")
