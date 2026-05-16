@@ -167,16 +167,27 @@ async def holon_create(
     ctx: _MCPContext | None = None,
 ) -> str:
     """[ELABORATE] Create a holon — an entity that is both a whole and a part.
+    Returns: created holon IDs, holarchy IDs, and parent-child edge summaries (text format).
 
     Single mode: omit `holons`. Provide name + description (+ optional
     parent_id, holarchy_id, role_in_parent, context, rules, properties,
     projection). If parent_id is None, creates a new holarchy with this
     holon as root.
 
-    Batch mode: pass `holons=[{ref, name, description, parent_ref, ...}, ...]`
-    to create N holons atomically in one call. parent_ref may reference
-    another holon in the batch (by its temp ref) or an existing holon_id.
-    All-or-nothing: validation failures abort the whole batch.
+    Batch mode: pass `holons=[...]` to create N holons atomically. All-or-nothing:
+    validation failures abort the whole batch.
+
+    holons item schema (all fields):
+      ref (required)         - temp reference for resolving parent_ref within same batch
+      name (required)        - human-readable label
+      description (required) - what this holon IS
+      parent_ref?            - ref or existing holon_id of parent
+      holarchy_id?           - which holarchy; auto-created if this is root
+      role_in_parent?        - what this holon DOES as a part
+      context?               - working state/knowledge at this level
+      rules?                 - internal constraints (list of strings)
+      properties?            - observable properties (list of strings)
+      projection?            - what this holon exposes upward in the holarchy
 
     Pass auto_graph=True (requires session_create(backends=['think','graph']))
     to materialise each holon as a KnowledgeNode with PartOf edges in one
@@ -184,6 +195,7 @@ async def holon_create(
 
     To add an existing holon to a second holarchy, use holon_update
     with action="join_holarchy".
+    session_id: think session; omit to auto-create or reuse active session
 
     Args:
         name: Human-readable label (single mode).
