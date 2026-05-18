@@ -70,7 +70,7 @@ A tool's value depends on **schema-structure × sequence-position**:
 
 - **SCAFFOLD** — call FIRST (reasoning not yet done). Schema FORCES structure. Tools: `think_model`, `think_science`, `think_decide`, `think_interfere`. Use the strict `items=[...]` form for a forcing function: each item must include id + per-tool required fields, server REJECTS lazy items.
 - **ELABORATE** — call MIDDLE. Flexible thinking, branching, navigation. Tools: `think_graph` (with `children=[...]`), `holon_*`, `think_argue` (with `chain=[...]`), `think_debug`, `brainstorm`, `iterate`, `think_refs_query`.
-- **ASSESS** — call LAST. Forcing function for honest self-critique. Tools: `score_rubric`, `score_evaluate` (+ `finding_batch`), `think_monitor` (with `items=[...]` for self-assessment).
+- **ASSESS** — call LAST. Forcing function for honest self-critique. Tools: `score_rubric`, `score_evaluate` (+ `finding_batch`), `think_monitor` (with `items=[...]` for self-assessment, or `action="density"` for session load stats).
 
 ### The items[] forcing-function pattern
 
@@ -84,7 +84,7 @@ For SCAFFOLD/ASSESS family, calling with `items=[{id, ...required_fields}, ...]`
 
 ### Auto-graph pipeline (items[] + auto_graph=True)
 
-When a SCAFFOLD/ASSESS items[] call sets `auto_graph=True` AND the session has a graph backend (created via `session_create(backends=["think","graph"])`), the server materialises each item as a `KnowledgeNode` row in the graph backend. Each `connects_to: ["other_id"]` becomes a `DerivedFrom` edge. One round trip = N structured records + N KG nodes + all declared edges. Eliminates the manual KG construction phase.
+When a SCAFFOLD/ASSESS items[] call sets `auto_graph=True` AND the session has a graph backend (created via `session_create(backends=["think","graph"])`), the server materialises each item as a `KnowledgeNode` row in the graph backend. Each `connects_to: ["other_id"]` becomes a `DerivedFrom` edge. One round trip = N structured records + N KG nodes + all declared edges. Eliminates the manual KG construction phase. **Auto-materialised nodes carry `authority="inferred"` automatically** — distinguishable from user-supplied ground-truth nodes.
 
 **auto_graph-capable batch tools and their edge labels:**
 
@@ -117,7 +117,7 @@ The 4 single-record-action tools (`think_hypothesis`, `think_constraint`, `think
 - `holon_*` tools model domains holonically — entities that are simultaneously wholes and parts. Multi-membership: holons participate in multiple holarchies. Bridge finds paths between distant holons across holarchies. Propagation leaves structural traces (stale projections).
 - Thinking tools (`think_*`) auto-create sessions on first call when `session_id` is omitted. Return compact text (not JSON) for token efficiency.
 - SQL import supports 6 formats: csv, tsv, txt (custom delimiter), json, jsonl, parquet (base64). Plus batch import via `sql_import_batch`.
-- Knowledge graph tools (`graph_knowledge_*`) layer semantic patterns: confidence scores, provenance, typed relations (supports/contradicts/etc.), inference (contradictions, gaps, chains, clusters).
+- Knowledge graph tools (`graph_knowledge_*`) layer semantic patterns: confidence scores, provenance, typed relations (supports/contradicts/etc.), inference (contradictions, gaps, chains, clusters). `graph_knowledge_add` and `knowledge_batch` accept `authority: "ground_truth" | "primary" | "inferred" | "external"` on each node — omit for `""` (unset). Use `think_bridge(action="authoritative_source", entity_name=...)` to rank nodes by authority.
 - **Data flow (SQL/graph):** `engine.execute_arrow(query)` → `pyarrow.Table` → `polars.from_arrow()` → `df.write_csv()` → str. Falls back to tuple-based `execute()` + `csv.writer` if Arrow unavailable.
 - **Pagination:** `sql_query`/`graph_query` accept `offset`/`limit` (random access) and `paginate=True` (cursor-based). Cursor paging uses DuckDB's `to_arrow_reader()` for streaming without full materialization. Use `sql_query_next`/`graph_query_next` for subsequent pages.
 - All database operations are blocking C calls wrapped in `anyio.to_thread.run_sync()` for async safety.

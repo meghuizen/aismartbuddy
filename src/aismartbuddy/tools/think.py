@@ -217,6 +217,8 @@ _BRIDGE_ACTIONS = frozenset(
         "evidence_for_hypothesis",
         "constraints_for_hypothesis",
         "full_context",
+        "bundle",
+        "authoritative_source",
     }
 )
 
@@ -2266,6 +2268,7 @@ def _validate_monitor_claims(claims_list: list) -> str | None:
 
 
 async def think_monitor(
+    action: str | None = None,
     task: str = "",
     stage: str = "monitoring",
     overall_confidence: float = 0.5,
@@ -2292,6 +2295,10 @@ async def think_monitor(
     limits, cell-composition confounding, assay-boundary constraints, and
     mechanistic-overreach risks before conclusions or scoring.
 
+    action="density": return session load stats (node_count, tree_count, max_depth,
+      entity_refs, export_token_estimate, recommendation: summarize|delegate|continue).
+      No items or stage needed. session_id: omit to auto-create or reuse active session.
+
     items[]: STRICT batch — each item: id, task, knowledge {domain, level∈
       {expert,proficient,familiar,basic,minimal,none}, confidence,
        limitations[≥1]}, claims[≥1] of {claim, status∈{fact,inference,
@@ -2302,6 +2309,8 @@ async def think_monitor(
     Single-form: backward-compat staged form for iterative monitoring.
 
     Args:
+      action: optional dispatch — "density" returns session load stats; omit
+        for the standard items[]/single-form monitoring behavior.
       items: STRICT — list of monitoring items as above.
       auto_graph: when True + parent session has graph backend, materialise
         each item as a KnowledgeNode (entity_type=insight).
@@ -2322,6 +2331,29 @@ async def think_monitor(
     Returns a 'Suggested next:' line at end of response (items[] path) with
     canonical follow-up call pre-filled. Read it before deciding the next step.
     """
+    if action == "density":
+        _, info = await anyio.to_thread.run_sync(
+            lambda: _get_or_create_think_session(session_id, ctx)
+        )
+        engine = _engine(info)
+        stats = await anyio.to_thread.run_sync(engine.get_session_stats)
+        if stats["node_count"] > 80 or stats["export_token_estimate"] > 6000:
+            rec = "summarize"
+        elif stats["tree_count"] > 4 and stats["node_count"] > 40:
+            rec = "delegate"
+        else:
+            rec = "continue"
+        lines = [
+            f"Session: {info.session_id}",
+            f"nodes: {stats['node_count']}  trees: {stats['tree_count']}  "
+            f"max_depth: {stats['max_depth']}",
+            f"entity_refs: {stats['entity_count']}  revisions: {stats['revision_count']}",
+            f"export_token_estimate: {stats['export_token_estimate']} "
+            "(thought content only; hypotheses/evidence not counted)",
+            f"recommendation: {rec}",
+        ]
+        return "\n".join(lines)
+
     _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
     engine = _engine(info)
 
@@ -3068,20 +3100,10 @@ async def think_hypothesis(
     ctx: _MCPContext | None = None,
 ) -> str:
     """[SCAFFOLD] Register, compare, update, and invalidate competing hypotheses.
-    Returns text summary of hypotheses, evidence rankings, or comparison matrix.
-    PREFER items=[...] (or hypothesis_ids=[...] for invalidate) for batch ops.
 
-    Actions:
-      register(statement, prior_weight?, predictions?, domain?)
-          -- single form; items=[] also adds: confidence?, refs?
-      evidence(hypothesis_id, evidence_text, direction)
-          -- attach supporting or contradicting evidence
-      compare()                              -- rank all by evidence strength
-      discriminate(hypothesis_ids[>=2])      -- identify discriminating observations
-      update(hypothesis_id, new_predictions?, revised_statement?)
-      invalidate(hypothesis_id or hypothesis_ids[], reason?, invalidated_by?)
-
-    session_id: think session; omit to auto-create or reuse active session
+    PREFER items=[...] (or *_ids=[...] for invalidate/remove) on every action
+    when handling one-or-more records — list-form scales without added
+    round-trips. Single-record args remain supported for backward-compat.
     """
     _validate_enum(action, _HYPOTHESIS_ACTIONS, "action")
     _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
@@ -3290,22 +3312,15 @@ async def think_constraint(
     ctx: _MCPContext | None = None,
 ) -> str:
     """[ELABORATE] Register constraints and validate targets against them.
-    Returns validation matrix, compliance results, or constraint list (text format).
-    PREFER items=[...] (or constraint_ids=[...] for remove).
 
-    type:        "hard" (must not be violated) | "soft" (should not be violated)
-    target_type: hypothesis | thought | model | decision | holon | evaluation
-    status:      pass | fail | uncertain  (used in validate action)
+    PREFER items=[...] (or *_ids=[...] for invalidate/remove) on every action
+    when handling one-or-more records — list-form scales without added
+    round-trips. Single-record args remain supported for backward-compat.
 
-    Actions:
-      register(constraint_id, domain, type, statement, check_description?, applies_to?)
-      list()                                         -- all registered constraints
-      remove(constraint_id or constraint_ids[])
-      validate(constraint_id, target_type, target_id?, target_text?, status?, note?)
-      check_all(target_type, target_id?)             -- sweep all applicable constraints;
-          reuses existing validations; creates uncertain placeholders for gaps
-
-    session_id: think session; omit to auto-create or reuse active session
+    `check_all` performs a real sweep: for each applicable constraint and each
+    matching target, it returns a matrix row. Existing validations are reused;
+    missing ones are created as `uncertain` so the gap remains explicit rather
+    than silently skipped.
     """
     _validate_enum(action, _CONSTRAINT_ACTIONS, "action")
     _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
@@ -3579,23 +3594,11 @@ async def think_topology(
     items: list[dict] | None = None,
     ctx: _MCPContext | None = None,
 ) -> str:
-    """[ELABORATE] Define, abstract, compare, and translate domain-neutral structural topologies.
-    Returns topology definitions, similarity scores, or translated vocabulary (text format).
-    PREFER items=[...] for define and abstract when creating N topologies.
+    """[ELABORATE] Define, compare, and translate domain-neutral structural topologies.
 
-    Node role values: SOURCE | SINK | SENSOR | EFFECTOR | BUFFER | SWITCH | GATE | JUNCTION
-    Edge type values: AMPLIFIES | SUPPRESSES | DELAYS | SATURATES | OSCILLATES | THRESHOLDS |
-                      COUPLES
-
-    Actions:
-      define(topology_id, name, nodes[{role}], edges[{type}]?, source_description?, source_domain?)
-      abstract(source_description, topology_id?, name?, source_domain?, edges?)
-          -- infer topology from natural language
-      compare(topology_a_id, topology_b_id)         -- structural similarity
-      translate(topology_id, target_domain)          -- map into target domain's vocabulary
-      search(pattern?)                               -- find matching topologies
-
-    session_id: think session; omit to auto-create or reuse active session
+    PREFER items=[...] (or *_ids=[...] for invalidate/remove) on every action
+    when handling one-or-more records — list-form scales without added
+    round-trips. Single-record args remain supported for backward-compat.
     """
     _validate_enum(action, _TOPOLOGY_ACTIONS, "action")
     _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
@@ -3973,22 +3976,30 @@ async def think_bridge(
     hypothesis_id: str | None = None,
     target_id: str | None = None,
     target_type: str | None = None,
+    entity_ids: list[str] | None = None,
+    confidence_min: float | None = None,
+    include_sql_tables: list[str] | None = None,
     ctx: _MCPContext | None = None,
 ) -> str:
-    """[ELABORATE] Query think session state by entity, node, hypothesis, or topic.
-    Returns integrated context from the think graph and (if available) the graph backend.
+    """[ELABORATE] Query thought graph, hypotheses, constraints, evidence, topology state.
 
-    Six actions -- each requires different params:
-      full_context(target_id, target_type?)          - everything known about a specific record ID
-      thoughts_for_entity(entity_name)               - all ThoughtNodes referencing an entity
-      entities_for_thought(node_id)                  - entities referenced in a specific thought
-                                                          node
-      hypotheses_for_entity(entity_name)             - hypotheses where entity appears
-      evidence_for_hypothesis(hypothesis_id)         - evidence chain + computed strength score
-      constraints_for_hypothesis(hypothesis_id)      - constraint validations on a hypothesis
+    Eight actions:
+      thoughts_for_entity(entity_name) -- thoughts mentioning the entity.
+      entities_for_thought(node_id) -- entities referenced by a thought.
+      hypotheses_for_entity(entity_name) -- hypotheses mentioning the entity.
+      evidence_for_hypothesis(hypothesis_id) -- direct + chained evidence.
+      constraints_for_hypothesis(hypothesis_id) -- constraint validation rows.
+      full_context(target_id, target_type?) -- everything we know about an id.
+      bundle(entity_ids[], confidence_min?, include_sql_tables[])
+          -- assemble think + graph + SQL context in one call
+      authoritative_source(entity_name)
+          -- ranked knowledge nodes by authority tier
+             (ground_truth > primary > external > inferred)
 
-    Graph backend lookup is best-effort: if no graph backend, think-side result still returns.
-    session_id: think session; omit to auto-create or reuse active session
+    When the current think session belongs to a unified think+graph workspace,
+    the tool also attempts graph-backed context lookups. Those lookups are
+    best-effort and fail safe: if no graph backend exists, or the graph query
+    fails, the think-side response still succeeds.
     """
     _validate_enum(action, _BRIDGE_ACTIONS, "action")
     _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
@@ -4095,6 +4106,143 @@ async def think_bridge(
         if graph_lines:
             lines.append("Graph context:")
             lines.extend(f"  {line}" for line in graph_lines)
+        return "\n".join(lines)
+
+    if action == "authoritative_source":
+        if not entity_name:
+            raise ValueError("authoritative_source requires entity_name")
+        from aismartbuddy.tools.graph import _escape_cypher_string
+
+        think_session_id = info.session_id
+        lines: list[str] = [
+            f"Session: {think_session_id}",
+            f"action: authoritative_source | entity: {entity_name}",
+        ]
+        # think-side: hypotheses referencing the entity
+        hyps = engine.get_hypotheses()
+        matching_hyps = [h for h in hyps if entity_name.lower() in h.statement.lower()]
+        if matching_hyps:
+            lines.append("## Think hypotheses")
+            for h in matching_hyps[:5]:
+                lines.append(
+                    f"  {h.id}: {h.statement[:80]} "
+                    f"(posterior={h.posterior_weight:.3f})"
+                )
+        # graph-side: knowledge nodes ranked by authority
+        graph_lines = await _safe_graph_context_lines(
+            think_session_id, entity_names=[entity_name]
+        )
+        companion_id = _companion_graph_session_id(think_session_id)
+        if companion_id:
+            mgr2 = get_session_manager()
+            g_info = mgr2.resolve_backend_session(companion_id, "graph")
+            q = (
+                f"MATCH (n:KnowledgeNode) "
+                f"WHERE n.name = '{_escape_cypher_string(entity_name)}' "
+                f"RETURN n.name, n.authority, n.source, n.confidence"
+            )
+            try:
+                cols, rows = await anyio.to_thread.run_sync(
+                    lambda: g_info.engine.execute(q)
+                )
+                if rows:
+                    rank = {
+                        "ground_truth": 0,
+                        "primary": 1,
+                        "external": 2,
+                        "inferred": 3,
+                    }
+                    sorted_rows = sorted(rows, key=lambda r: rank.get(str(r[1]), 4))
+                    lines.append("## Knowledge nodes (ranked by authority)")
+                    for row in sorted_rows[:5]:
+                        lines.append(
+                            f"  name={row[0]} authority={row[1] or 'unset'} "
+                            f"source={row[2]} confidence={row[3]}"
+                        )
+            except Exception:
+                pass
+        elif graph_lines:
+            lines.append("## Graph context")
+            lines.extend(graph_lines)
+        return "\n".join(lines)
+
+    if action == "bundle":
+        if not entity_ids:
+            raise ValueError("bundle requires entity_ids (non-empty list)")
+        from aismartbuddy.tools.graph import _escape_cypher_string
+
+        think_session_id = info.session_id
+        lines = [
+            f"Session: {think_session_id}",
+            f"action: bundle | entities: {', '.join(entity_ids)}",
+        ]
+        # think section
+        think_lines: list[str] = []
+        all_nodes = list(engine.thought_nodes.values())
+        for eid in entity_ids:
+            nodes_for_entity = [
+                n
+                for n in all_nodes
+                if eid.lower() in (n.content or "").lower() or eid in (n.refs or [])
+            ]
+            for n in nodes_for_entity[:10]:
+                think_lines.append(f"  [{n.id}] {n.content[:120]}")
+        if think_lines:
+            lines.append("## Think")
+            lines.extend(think_lines)
+        # graph section
+        for eid in entity_ids:
+            if confidence_min is not None:
+                companion_id = _companion_graph_session_id(think_session_id)
+                if companion_id:
+                    mgr2 = get_session_manager()
+                    g_info = mgr2.resolve_backend_session(companion_id, "graph")
+                    q = (
+                        f"MATCH (n:KnowledgeNode) "
+                        f"WHERE n.name = '{_escape_cypher_string(eid)}' "
+                        f"AND n.confidence >= {confidence_min} "
+                        f"RETURN n.name, n.confidence, n.source, n.authority LIMIT 10"
+                    )
+                    try:
+                        cols, rows = await anyio.to_thread.run_sync(
+                            lambda q=q, g_info=g_info: g_info.engine.execute(q)
+                        )
+                        if rows:
+                            lines.append(f"## Graph (confidence>={confidence_min})")
+                            for row in rows:
+                                lines.append(
+                                    f"  name={row[0]} conf={row[1]} src={row[2]} "
+                                    f"auth={row[3] or 'unset'}"
+                                )
+                    except Exception:
+                        pass
+            else:
+                graph_ctx = await _safe_graph_context_lines(
+                    think_session_id, entity_names=[eid]
+                )
+                if graph_ctx:
+                    lines.append(f"## Graph [{eid}]")
+                    lines.extend(graph_ctx)
+        # SQL section
+        if include_sql_tables:
+            mgr3 = get_session_manager()
+            sql_companion_id = mgr3.find_companion_session(think_session_id, "sql")
+            if sql_companion_id:
+                sql_info = mgr3.get_session(sql_companion_id)
+                from aismartbuddy.tools import execute_and_format
+
+                for table in include_sql_tables:
+                    if not re.match(r"^[A-Za-z0-9_]+$", table):
+                        lines.append(f"## SQL [{table}] — skipped (invalid identifier)")
+                        continue
+                    try:
+                        csv_result = await execute_and_format(
+                            sql_info, mgr3, f"SELECT * FROM {table} LIMIT 20"
+                        )
+                        lines.append(f"## SQL [{table}]")
+                        lines.append(csv_result)
+                    except Exception as exc:
+                        lines.append(f"## SQL [{table}] — error: {exc}")
         return "\n".join(lines)
 
     if not target_id:

@@ -2281,3 +2281,40 @@ class TestThinkValidateAutoGraph:
         assert f"{validation_ids[0]},subject_x" in normalized
         # No edge from the second validation (skipped target).
         assert f"{validation_ids[1]}," not in normalized
+
+
+@pytest.mark.usefixtures("_init_session_manager")
+class TestThinkMonitorDensity:
+    """think_monitor(action='density') returns session load stats."""
+
+    @pytest.mark.anyio
+    async def test_think_monitor_density_empty_session(self):
+        result = await think_monitor(action="density")
+        # response includes a "nodes: N" line (node_count rendered as 'nodes')
+        # plus an entity_refs/export_token_estimate/recommendation block.
+        assert "nodes: 0" in result
+        assert "export_token_estimate:" in result
+        assert "recommendation: continue" in result
+
+
+@pytest.mark.usefixtures("_init_session_manager")
+class TestThinkBridgeBundle:
+    """think_bridge bundle action — multi-backend context assembly."""
+
+    @pytest.mark.anyio
+    async def test_think_bridge_bundle_no_companion(self):
+        from aismartbuddy.tools.think import think_bridge
+
+        result = await think_bridge(action="bundle", entity_ids=["x"])
+        # No companion graph/SQL, but think section may or may not match — at
+        # minimum we expect no error and the canonical session header.
+        assert result.startswith("Session:") or "## Think" in result
+
+    @pytest.mark.anyio
+    async def test_think_bridge_bundle_missing_entity_ids(self):
+        from aismartbuddy.tools.think import think_bridge
+
+        with pytest.raises(ValueError, match="bundle requires entity_ids"):
+            await think_bridge(action="bundle", entity_ids=[])
+        with pytest.raises(ValueError, match="bundle requires entity_ids"):
+            await think_bridge(action="bundle", entity_ids=None)

@@ -5,6 +5,21 @@ from __future__ import annotations
 import pytest
 
 from aismartbuddy.engines.ladybug_engine import LadybugEngine
+from aismartbuddy.tools.graph import (
+    graph_create_session,
+    graph_knowledge_add,
+    graph_query,
+    knowledge_batch,
+)
+
+
+async def _create_graph_session() -> str:
+    result = await graph_create_session()
+    for line in result.split("\n"):
+        line = line.strip()
+        if line.startswith("session_id:"):
+            return line[len("session_id:"):].strip()
+    raise AssertionError(f"no session_id in {result!r}")
 
 
 @pytest.fixture
@@ -159,3 +174,80 @@ class TestLadybugEngine:
         assert table is not None
         assert table.column("id").to_pylist() == [3, 4]
         assert has_more is False
+
+
+@pytest.mark.usefixtures("_init_session_manager")
+class TestKnowledgeNodeAuthority:
+    """authority tier on KnowledgeNode persists via graph_knowledge_add/knowledge_batch."""
+
+    @pytest.mark.anyio
+    async def test_graph_knowledge_add_authority(self):
+        sid = await _create_graph_session()
+        await graph_knowledge_add(
+            session_id=sid,
+            entity="GroundTruthNode",
+            entity_type="fact",
+            authority="ground_truth",
+        )
+        result = await graph_query(
+            session_id=sid,
+            query=(
+                "MATCH (n:KnowledgeNode) WHERE n.name = 'GroundTruthNode' "
+                "RETURN n.name, n.authority;"
+            ),
+        )
+        assert "ground_truth" in result
+        assert "GroundTruthNode" in result
+
+    @pytest.mark.anyio
+    async def test_graph_knowledge_add_invalid_authority(self):
+        sid = await _create_graph_session()
+        with pytest.raises(ValueError, match="authority must be one of"):
+            await graph_knowledge_add(
+                session_id=sid,
+                entity="BadAuthNode",
+                entity_type="fact",
+                authority="bad",
+            )
+
+    @pytest.mark.anyio
+    async def test_knowledge_batch_authority(self):
+        sid = await _create_graph_session()
+        result = await knowledge_batch(
+            session_id=sid,
+            nodes=[
+                {"entity": "WithAuth", "entity_type": "concept", "authority": "primary"},
+                {"entity": "NoAuth", "entity_type": "concept"},
+            ],
+        )
+        assert "Nodes added: 2" in result
+        # Verify authority stored: 'primary' on WithAuth, "" on NoAuth.
+        with_auth = await graph_query(
+            session_id=sid,
+            query=(
+                "MATCH (n:KnowledgeNode) WHERE n.name = 'WithAuth' "
+                "RETURN n.authority;"
+            ),
+        )
+        assert "primary" in with_auth
+        no_auth = await graph_query(
+            session_id=sid,
+            query=(
+                "MATCH (n:KnowledgeNode) WHERE n.name = 'NoAuth' "
+                "RETURN n.authority;"
+            ),
+        )
+        # Empty string in CSV — header line present plus an empty value row.
+        # We assert that 'primary' is NOT present (i.e. the field is the empty string).
+        assert "primary" not in no_auth
+
+    @pytest.mark.anyio
+    async def test_knowledge_batch_invalid_authority(self):
+        sid = await _create_graph_session()
+        with pytest.raises(ValueError, match="authority must be one of"):
+            await knowledge_batch(
+                session_id=sid,
+                nodes=[
+                    {"entity": "X", "entity_type": "concept", "authority": "nope"},
+                ],
+            )

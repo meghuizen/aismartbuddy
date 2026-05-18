@@ -42,23 +42,6 @@ def _require_graph_session(session_id: str | None):
     return mgr, info
 
 
-def _get_or_create_graph_session(session_id: str | None):
-    """Return an existing graph session or auto-create an in-memory one.
-
-    Callers must wrap in anyio.to_thread.run_sync -- create_session does
-    blocking disk I/O (mkdir + DB connect). Side effect: if no active
-    session exists, the new session becomes the process-wide active session.
-    """
-    mgr = get_session_manager()
-    session_id = resolve_active_or_provided_session_id(session_id)
-    if session_id:
-        info = mgr.resolve_backend_session(session_id, "graph")
-        return mgr, info
-    user_id, project_id = resolve_identity(None, None, None)
-    info = mgr.create_session("graph", user_id, project_id)
-    return mgr, info
-
-
 def _require_graph_session_pair(session_id_a: str, session_id_b: str):
     """Validate and return two graph sessions for comparison tools."""
     mgr = get_session_manager()
@@ -162,7 +145,7 @@ async def graph_query(
     See also: graph_query_next for cursor pagination, graph_schema for table info.
 
     Args:
-        session_id: Graph session; omit to auto-create in-memory session or reuse active session.
+        session_id: Session token from graph_create_session.
         query: Cypher query to execute.
         output_format: Result format — "csv" (default, most token-efficient) or "table".
         offset: Skip this many rows from the start (for random-access paging).
@@ -174,7 +157,7 @@ async def graph_query(
     Returns:
         Query results in the chosen format, or a timeout error message.
     """
-    mgr, info = await anyio.to_thread.run_sync(lambda: _get_or_create_graph_session(session_id))
+    mgr, info = _require_graph_session(session_id)
     return await execute_and_format(
         info,
         mgr,
@@ -213,7 +196,7 @@ async def graph_import(
     - pathway membership: `from,to,panel,source`
 
     Args:
-        session_id: Graph session; omit to auto-create in-memory session or reuse active session.
+        session_id: Session token from graph_create_session.
         table_name: Name of the node or relationship table.
         data: CSV content with header row.
         table_type: "node" (default) or "relationship".
@@ -224,7 +207,7 @@ async def graph_import(
     Returns:
         Import confirmation with row count.
     """
-    mgr, info = await anyio.to_thread.run_sync(lambda: _get_or_create_graph_session(session_id))
+    mgr, info = _require_graph_session(session_id)
     count = await run_with_lock(
         info,
         lambda: info.engine.import_csv(table_name, data, table_type, schema, from_table, to_table),
@@ -236,12 +219,12 @@ async def graph_schema(session_id: str | None = None) -> str:
     """Get graph database schema — node tables, relationship tables, and their properties.
 
     Args:
-        session_id: Graph session; omit to auto-create in-memory session or reuse active session.
+        session_id: Session token from graph_create_session.
 
     Returns:
         Schema information showing all tables and their structure.
     """
-    mgr, info = await anyio.to_thread.run_sync(lambda: _get_or_create_graph_session(session_id))
+    mgr, info = _require_graph_session(session_id)
     columns, rows = await run_with_lock(info, info.engine.get_schema)
     if not rows:
         return "No tables in graph database. Create tables with graph_query or graph_import."
@@ -276,7 +259,7 @@ async def graph_query_next(session_id: str | None = None, cursor_id: str = "") -
     See also: graph_query with paginate=True to start pagination.
 
     Args:
-        session_id: Graph session token (required; must have an open cursor).
+        session_id: Session token from graph_create_session.
         cursor_id: Cursor token from a previous graph_query(..., paginate=True) call.
 
     Returns:
@@ -296,14 +279,19 @@ async def graph_query_next(session_id: str | None = None, cursor_id: str = "") -
 
 @size_guarded
 async def graph_statistics(session_id: str | None = None) -> str:
-    """[ELABORATE] Graph overview in one call. Returns node counts by type, edge counts by
-    type, total nodes, total edges, and top 5 nodes by connection count (text format).
-    Use before graph_analyze to understand what types and volumes exist.
-    Does NOT compute centrality metrics -- use graph_analyze(analysis_type="hubs") for degree
-    leaders.
-    session_id: graph session; omit to auto-create in-memory session or reuse active session
+    """Get a complete overview of the graph in one call.
+
+    Returns node counts by type, relationship counts by type,
+    total nodes/edges, and the top 5 most-connected nodes.
+    Use this to get a "holistic view" of the graph before diving into queries.
+
+    Args:
+        session_id: Session token from graph_create_session.
+
+    Returns:
+        Compact graph overview with all statistics.
     """
-    mgr, info = await anyio.to_thread.run_sync(lambda: _get_or_create_graph_session(session_id))
+    mgr, info = _require_graph_session(session_id)
     stats = await run_with_lock(info, info.engine.get_statistics)
 
     lines = ["## Graph Overview"]
@@ -336,7 +324,7 @@ async def graph_neighbors(
     Use this to "focus on a sub-part" of the graph around a specific entity.
 
     Args:
-        session_id: Graph session; omit to auto-create in-memory session or reuse active session.
+        session_id: Session token from graph_create_session.
         node_name: Name of the node to explore.
         node_type: Node table name (e.g., "Gene", "Pathway").
         depth: How many hops to explore (default 1, max 5).
@@ -345,7 +333,7 @@ async def graph_neighbors(
     Returns:
         Neighborhood nodes and their relationship to the target.
     """
-    mgr, info = await anyio.to_thread.run_sync(lambda: _get_or_create_graph_session(session_id))
+    mgr, info = _require_graph_session(session_id)
     _validate_id(node_type, "node_type")
     safe_name = _escape_cypher_string(node_name)
     depth = min(depth, 5)
@@ -382,7 +370,7 @@ async def graph_focus_summary(
     without spending one round trip per `graph_neighbors` call.
 
     Args:
-        session_id: Graph session; omit to auto-create in-memory session or reuse active session.
+        session_id: Session token from graph_create_session.
         node_names: Node names to inspect (up to 10).
         node_type: Node table name (e.g., "Gene", "Pathway", "KnowledgeNode").
         depth: How many hops to explore around each node (default 1, max 5).
@@ -393,7 +381,7 @@ async def graph_focus_summary(
     """
     if not node_names:
         raise ValueError("node_names must be non-empty")
-    mgr, info = await anyio.to_thread.run_sync(lambda: _get_or_create_graph_session(session_id))
+    mgr, info = _require_graph_session(session_id)
     _validate_id(node_type, "node_type")
     depth = min(depth, 5)
     names = []
@@ -454,7 +442,7 @@ async def graph_find_connections(
     Use for path finding, shortest path analysis, and connection discovery.
 
     Args:
-        session_id: Graph session; omit to auto-create in-memory session or reuse active session.
+        session_id: Session token from graph_create_session.
         from_name: Name of the source node.
         from_type: Table type of the source node (e.g., "Gene").
         to_name: Name of the target node.
@@ -465,7 +453,7 @@ async def graph_find_connections(
     Returns:
         Paths between the two nodes with intermediate nodes listed.
     """
-    mgr, info = await anyio.to_thread.run_sync(lambda: _get_or_create_graph_session(session_id))
+    mgr, info = _require_graph_session(session_id)
     _validate_id(from_type, "from_type")
     _validate_id(to_type, "to_type")
     safe_from = _escape_cypher_string(from_name)
@@ -689,23 +677,26 @@ async def _analyze_domain_bridges(info, mgr, stats) -> str:
 
 
 async def graph_analyze(session_id: str | None = None, analysis_type: str = "") -> str:
-    """[ELABORATE] Run pre-built graph analysis. Returns formatted text result per type.
+    """Run pre-built analytical queries on the graph.
 
-    analysis_type (required):
-      orphans           - nodes with no relationships
-      hubs              - top 10 nodes overall by degree (candidates drawn per-type)
-      bottlenecks       - top 20 nodes overall by degree (broader view than hubs)
-      categories        - group nodes by property values (status, direction, etc.)
-      cross_connections - nodes that participate in multiple relationship types
-      feedback_loops    - 2-cycle detection: (a)-->(b)-->(a) patterns
-      motifs            - recurring patterns: mutual pairs and feed-forward triads
-      domain_bridges    - KnowledgeNode edges where r.domain IS NOT NULL
+    Saves you from writing complex Cypher for common graph analysis tasks.
 
-    Use hubs/bottlenecks for degree centrality. Use feedback_loops for cycle detection.
-    Does NOT compute betweenness centrality or minimum vertex cut.
-    session_id: graph session; omit to auto-create in-memory session or reuse active session
+    Args:
+        session_id: Session token from graph_create_session.
+        analysis_type: Type of analysis to run:
+            - "orphans" — find nodes with no relationships
+            - "hubs" — find the 10 most-connected nodes (highest degree)
+            - "categories" — group all nodes by type and key properties
+            - "cross_connections" — find nodes linking different node types
+            - "motifs" — recurring small subgraph patterns
+            - "bottlenecks" — high-connectivity bridge nodes
+            - "domain_bridges" — cross-domain relationships using edge domain metadata
+            - "feedback_loops" — simple directed cycles
+
+    Returns:
+        Analysis results in table format.
     """
-    mgr, info = await anyio.to_thread.run_sync(lambda: _get_or_create_graph_session(session_id))
+    mgr, info = _require_graph_session(session_id)
     stats = await run_with_lock(info, info.engine.get_statistics)
 
     dispatch = {
@@ -950,6 +941,7 @@ async def graph_knowledge_add(
     properties: dict | None = None,
     confidence: float = 1.0,
     source: str = "ai",
+    authority: str | None = None,
     items: list[dict] | None = None,
     idempotency_key: str | None = None,
 ) -> str:
@@ -959,11 +951,12 @@ async def graph_knowledge_add(
     typed entities, confidence scores, and provenance tracking.
 
     The first call auto-creates a KnowledgeNode table if it doesn't exist.
-    Batch mode: pass items=[{entity, entity_type?, confidence?, properties?, source?}, ...]
-    to create multiple nodes in one call. Each item is one entity.
+    Batch mode: pass items=[{entity, entity_type?, confidence?, properties?,
+    source?, authority?}, ...] to create multiple nodes in one call. Each
+    item is one entity.
 
     Args:
-        session_id: Graph session; omit to auto-create in-memory session or reuse active session.
+        session_id: Session token from graph_create_session.
         entity: Name/label of the knowledge entity.
         entity_type: Documented defaults: concept, entity, fact, evidence,
             question, insight. Any non-empty string is accepted and registered
@@ -971,11 +964,14 @@ async def graph_knowledge_add(
         properties: Optional dict of additional properties (stored as description).
         confidence: Confidence score 0.0 to 1.0 (default 1.0).
         source: Provenance — who/what added this (default "ai").
+        authority: Optional authority tier — one of
+            ``ground_truth | primary | inferred | external``. Stored on the
+            node so downstream tools can rank knowledge by trust level.
 
     Returns:
         Confirmation with node details.
     """
-    mgr, info = await anyio.to_thread.run_sync(lambda: _get_or_create_graph_session(session_id))
+    mgr, info = _require_graph_session(session_id)
     if items is not None:
         return await knowledge_batch(
             session_id=session_id,
@@ -994,9 +990,22 @@ async def graph_knowledge_add(
         raise ValueError("entity_type must be a non-empty string")
     confidence = max(0.0, min(1.0, confidence))
 
+    if authority is not None and authority not in {
+        "ground_truth",
+        "primary",
+        "inferred",
+        "external",
+    }:
+        raise ValueError(
+            f"authority must be one of ground_truth|primary|inferred|external, "
+            f"got {authority!r}"
+        )
+    authority_val = authority or ""
+
     safe_name = _escape_cypher_string(entity)
     safe_source = _escape_cypher_string(source)
     safe_type = _escape_cypher_string(entity_type)
+    safe_authority = _escape_cypher_string(authority_val)
     desc = _escape_cypher_string(str(properties) if properties else "")
 
     from datetime import datetime, timezone
@@ -1011,7 +1020,7 @@ async def graph_knowledge_add(
                 "CREATE NODE TABLE IF NOT EXISTS KnowledgeNode ("
                 "id SERIAL PRIMARY KEY, name STRING, description STRING, "
                 "entity_type STRING, confidence DOUBLE, "
-                "source STRING, created_at STRING);"
+                "source STRING, created_at STRING, authority STRING);"
             ),
         )
     except Exception:
@@ -1026,7 +1035,8 @@ async def graph_knowledge_add(
             f"entity_type: '{safe_type}', "
             f"confidence: {confidence}, "
             f"source: '{safe_source}', "
-            f"created_at: '{ts}'"
+            f"created_at: '{ts}', "
+            f"authority: '{safe_authority}'"
             f"}});"
         ),
     )
@@ -1059,7 +1069,7 @@ async def graph_knowledge_relate(
     multiple semantic relationships in one call.
 
     Args:
-        session_id: Graph session; omit to auto-create in-memory session or reuse active session.
+        session_id: Session token from graph_create_session.
         from_name: Name of the source knowledge node.
         to_name: Name of the target knowledge node.
         relation: Semantic relationship type. Documented defaults are
@@ -1077,7 +1087,7 @@ async def graph_knowledge_relate(
     Returns:
         Confirmation with relationship details.
     """
-    mgr, info = await anyio.to_thread.run_sync(lambda: _get_or_create_graph_session(session_id))
+    mgr, info = _require_graph_session(session_id)
     if items is not None:
         return await knowledge_batch(
             session_id=session_id,
@@ -1154,26 +1164,38 @@ async def knowledge_batch(
     idempotency_key: str | None = None,
 ) -> str:
     """[ELABORATE] Bulk-create knowledge graph nodes and relations in one call.
-    Returns: "Session: X | Nodes added: N | Relations added: R" plus any per-relation errors.
 
-    Use INSTEAD of sequential graph_knowledge_add / graph_knowledge_relate when adding 3+
-    items. No hard volume limit -- tested with 50+ nodes and 49+ edges in a single call.
-    Missing required fields abort the whole batch upfront. Runtime relation errors
-    (unresolvable from_name/to_name) are collected per-row and returned in the summary;
-    already-inserted nodes are NOT rolled back.
+    Use INSTEAD of multiple sequential graph_knowledge_add /
+    graph_knowledge_relate calls when adding 3+ items. Same per-item
+    validation as the single-item tools — invalid items abort the batch.
+    Each node entry should be one entity and each relation entry should be
+    one semantic relationship. Batch mode reduces round-trips; it is not a
+    place to pack multiple entities or multiple meanings into one dict.
 
-    Node schema:     {entity (required), entity_type?, confidence?, properties?, source?}
-    Relation schema: {from_name, to_name, relation (all required), weight?,
-                      justification?, source?, domain?, directionality?, confidence_basis?}
+    Two-phase: nodes are created first (so relations can match), then
+    relations. All operations execute under a single session lock —
+    other agents on the same session serialize.
 
-    Two-phase: nodes first (so relations can resolve them), then relations.
-    Single session lock for the full batch.
-    idempotency_key: optional stable string to deduplicate retried calls.
-    session_id: graph session; omit to auto-create in-memory session or reuse active session
+    Args:
+        session_id: Session token from graph_create_session.
+        nodes: List of node dicts. Each: {entity, entity_type?, confidence?,
+            properties?, source?, authority?}. entity is required;
+            entity_type defaults to "concept", confidence to 1.0, source to "ai".
+            Alias accepted: hypothesis -> question. entity_type is open-ended.
+            authority (optional) must be one of
+            ``ground_truth | primary | inferred | external`` when supplied.
+        relations: List of relation dicts. Each: {from_name, to_name, relation,
+            weight?, justification?, source?, domain?, directionality?,
+            confidence_basis?}. relation is open-ended; documented defaults are
+            supports/contradicts/refines/causes/prevents/requires/
+            part_of/similar_to/derived_from.
+
+    Returns:
+        Counts of nodes/relations created plus any per-item errors.
     """
     from datetime import datetime, timezone
 
-    mgr, info = await anyio.to_thread.run_sync(lambda: _get_or_create_graph_session(session_id))
+    mgr, info = _require_graph_session(session_id)
     if idempotency_key:
         cached = mgr.get_idempotent_result(info.session_id, idempotency_key)
         if cached is not None:
@@ -1190,6 +1212,17 @@ async def knowledge_batch(
         et = _normalize_entity_type(n.get("entity_type", "concept"))
         if not str(et).strip():
             raise ValueError(f"nodes[{i}] entity_type must be non-empty")
+        auth = n.get("authority")
+        if auth is not None and auth not in {
+            "ground_truth",
+            "primary",
+            "inferred",
+            "external",
+        }:
+            raise ValueError(
+                f"nodes[{i}] authority must be one of "
+                f"ground_truth|primary|inferred|external, got {auth!r}"
+            )
     for i, r in enumerate(relations):
         if not r.get("from_name") or not r.get("to_name"):
             raise ValueError(f"relations[{i}] missing 'from_name' or 'to_name'")
@@ -1206,7 +1239,7 @@ async def knowledge_batch(
                 "CREATE NODE TABLE IF NOT EXISTS KnowledgeNode ("
                 "id SERIAL PRIMARY KEY, name STRING, description STRING, "
                 "entity_type STRING, confidence DOUBLE, "
-                "source STRING, created_at STRING);"
+                "source STRING, created_at STRING, authority STRING);"
             )
         except Exception:
             pass
@@ -1217,11 +1250,13 @@ async def knowledge_batch(
             conf = max(0.0, min(1.0, float(n.get("confidence", 1.0))))
             src = _escape_cypher_string(n.get("source", "ai"))
             props = _escape_cypher_string(str(n["properties"]) if n.get("properties") else "")
+            authority_val = _escape_cypher_string(n.get("authority") or "")
             info.engine.execute(
                 f"CREATE (n:KnowledgeNode {{"
                 f"name: '{entity}', description: '{props}', "
                 f"entity_type: '{etype}', confidence: {conf}, "
-                f"source: '{src}', created_at: '{ts}'"
+                f"source: '{src}', created_at: '{ts}', "
+                f"authority: '{authority_val}'"
                 f"}});"
             )
             count += 1
@@ -1303,7 +1338,7 @@ async def graph_knowledge_infer(
     Finds patterns, contradictions, gaps, and chains in the knowledge.
 
     Args:
-        session_id: Graph session; omit to auto-create in-memory session or reuse active session.
+        session_id: Session token from graph_create_session.
         inference_type: Type of inference to run:
             - "contradictions" — pairs connected by both supports AND contradicts
             - "gaps" — high-degree nodes with low avg edge confidence
@@ -1319,7 +1354,7 @@ async def graph_knowledge_infer(
     Returns:
         Inference results.
     """
-    mgr, info = await anyio.to_thread.run_sync(lambda: _get_or_create_graph_session(session_id))
+    mgr, info = _require_graph_session(session_id)
     # Bound max_depth to prevent runaway transitive closure
     max_depth = max(2, min(max_depth, 10))
     try:
@@ -1505,12 +1540,12 @@ async def graph_knowledge_summary(session_id: str | None = None) -> str:
     This is the "total knowledge perspective" for the AI.
 
     Args:
-        session_id: Graph session; omit to auto-create in-memory session or reuse active session.
+        session_id: Session token from graph_create_session.
 
     Returns:
         Complete knowledge graph overview.
     """
-    mgr, info = await anyio.to_thread.run_sync(lambda: _get_or_create_graph_session(session_id))
+    mgr, info = _require_graph_session(session_id)
 
     lines = ["## Knowledge Graph Summary"]
 

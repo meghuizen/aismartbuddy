@@ -855,6 +855,18 @@ class ThinkingEngine:
     def get_node_count(self) -> int:
         return len(self.thought_nodes)
 
+    def get_session_stats(self) -> dict:
+        nodes = list(self.thought_nodes.values())
+        all_refs = {r for n in nodes for r in n.refs}
+        return {
+            "node_count": len(nodes),
+            "tree_count": len(self.thought_trees),
+            "max_depth": max((n.depth for n in nodes), default=0),
+            "entity_count": len(all_refs),
+            "revision_count": sum(len(n.revision_history) for n in nodes),
+            "export_token_estimate": sum(len(n.content) for n in nodes) // 4,
+        }
+
     # ── Unified artifacts ───────────────────────────────
 
     @_synchronized
