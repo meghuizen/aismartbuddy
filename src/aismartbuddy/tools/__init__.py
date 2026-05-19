@@ -117,6 +117,39 @@ def resolve_active_or_provided_session_id(session_id: str | None) -> str | None:
     return get_session_manager().get_active_session_id()
 
 
+def effective_session_id(session_id: str | None, info: SessionInfo) -> str | None:
+    """Return the effective parent_id for auto_graph materialisation.
+
+    When session_id was explicit, return it (parent_id or child — both work
+    with resolve_backend_session). When omitted (auto-create path), walk up to
+    the parent so materialize_auto_graph can find the graph backend sibling.
+    """
+    if session_id:
+        return session_id
+    mgr = get_session_manager()
+    parent = mgr.find_parent_for_child(info.session_id)
+    return parent.parent_id if parent is not None else None
+
+
+def resolve_auto_graph(per_call: bool, info: SessionInfo, session_id: str | None) -> bool:
+    """Determine whether auto_graph materialisation should run.
+
+    Per-call flag takes priority. When False, checks the ParentSession.auto_graph
+    policy so that session_create(auto_graph=True) propagates automatically
+    without per-call flags on every tool invocation.
+    """
+    if per_call:
+        return True
+    mgr = get_session_manager()
+    parent = mgr.find_parent_for_child(info.session_id)
+    if parent is None and session_id:
+        try:
+            parent = mgr.get_parent_session(session_id)
+        except ValueError:
+            pass
+    return parent.auto_graph if parent is not None else False
+
+
 # ── Items[] forcing-function helpers ──────────────────────────────────
 
 

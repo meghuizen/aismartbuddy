@@ -863,13 +863,32 @@ class ThinkingEngine:
     def get_session_stats(self) -> dict:
         nodes = list(self.thought_nodes.values())
         all_refs = {r for n in nodes for r in n.refs}
+        # Per-type counts for accurate session load reporting
+        type_counts = {
+            "thought_nodes": len(nodes),
+            "models": len(self.models),
+            "decisions": len(self.decisions),
+            "inquiries": len(self.inquiries),
+            "monitors": len(self.monitors),
+            "holons": len(self.holon_nodes),
+            "hypotheses": len(self.hypotheses),
+            "constraints": len(self.constraints),
+            "evidence": len(self.evidence),
+            "args": sum(len(v) for v in self.args.values()),
+        }
+        total_records = sum(type_counts.values())
+        # Token estimate: thought content + 50-char average for other record types
+        thought_chars = sum(len(n.content) for n in nodes)
+        other_chars = (total_records - len(nodes)) * 50
         return {
             "node_count": len(nodes),
             "tree_count": len(self.thought_trees),
             "max_depth": max((n.depth for n in nodes), default=0),
             "entity_count": len(all_refs),
             "revision_count": sum(len(n.revision_history) for n in nodes),
-            "export_token_estimate": sum(len(n.content) for n in nodes) // 4,
+            "export_token_estimate": (thought_chars + other_chars) // 4,
+            "total_records": total_records,
+            "record_counts": type_counts,
         }
 
     # ── Unified artifacts ───────────────────────────────
@@ -2658,7 +2677,7 @@ class ThinkingEngine:
             ]
             if unvalidated:
                 next_focus.append(
-                    "Run constraint sweep on hypotheses: "
+                    "Constraint sweep available if needed for hypotheses: "
                     + ", ".join(unvalidated[:5])
                     + (" ..." if len(unvalidated) > 5 else "")
                 )

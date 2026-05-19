@@ -21,7 +21,7 @@ if TYPE_CHECKING:
     from aismartbuddy.engines.thinking_engine import ThinkingEngine
     from aismartbuddy.session import SessionInfo
 
-from aismartbuddy.tools import size_guarded
+from aismartbuddy.tools import effective_session_id, resolve_auto_graph, size_guarded
 from aismartbuddy.tools.think import (
     _engine,
     _get_or_create_think_session,
@@ -254,14 +254,17 @@ async def holon_create(
             hids_used.add(hid_val)
         ref_lines = ", ".join(f"{r}={i}" for r, i in ref_to_id.items())
 
+        eff_auto_graph = resolve_auto_graph(auto_graph, info, session_id)
+        eff_sid = effective_session_id(session_id, info)
         graph_count = 0
-        if auto_graph:
+        if eff_auto_graph:
             from aismartbuddy.tools import materialize_auto_graph
 
-            if not session_id:
+            if not eff_sid:
                 raise ValueError(
-                    "auto_graph requires an explicit unified session_id from "
-                    "session_create(backends=['think','graph'])."
+                    "auto_graph requires a parent session with a graph backend. "
+                    "Use session_create(backends=['think','graph']) or omit session_id "
+                    "to auto-create a session with graph support."
                 )
             # Build a synthetic items list keyed on the FINAL assigned holon-id
             # so KnowledgeNode rows match how downstream tools reference holons.
@@ -280,7 +283,7 @@ async def holon_create(
                 for h in holons
             ]
             graph_count = await materialize_auto_graph(
-                session_id,
+                eff_sid,
                 synthetic,
                 source_tag="holon_create",
                 entity_type="holon",
@@ -294,7 +297,7 @@ async def holon_create(
             f"Holarchies: {', '.join(sorted(hids_used))}",
             f"Refs: {ref_lines}",
         ]
-        if auto_graph:
+        if eff_auto_graph:
             out_lines.append(f"Graph nodes created: {graph_count}")
         out_lines.append("Status: created")
         return "\n".join(out_lines)

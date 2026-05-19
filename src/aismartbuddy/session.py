@@ -57,6 +57,7 @@ class ParentSession:
     mode: str = "analyze"
     enforcement: str = "advisory"
     max_node_chars: int = 500
+    auto_graph: bool = False
 
 
 @dataclass
@@ -327,6 +328,7 @@ class SessionManager:
         mode: str = "analyze",
         enforcement: str = "advisory",
         max_node_chars: int = 500,
+        auto_graph: bool = False,
     ) -> ParentSession:
         """Create a parent session that holds one child session per backend.
 
@@ -388,6 +390,7 @@ class SessionManager:
             mode=mode,
             enforcement=enforcement,
             max_node_chars=max_node_chars,
+            auto_graph=auto_graph,
             created_at=now,
             last_accessed=now,
         )
@@ -543,6 +546,45 @@ class SessionManager:
         if parent is None:
             return None
         return parent.children.get(backend)
+
+    def add_backend(self, parent_id: str, backend: str) -> str:
+        """Attach a new backend child to an existing parent session.
+
+        Internal use only — not exposed as an MCP tool.
+        Returns the new child session_id.
+        Raises ValueError if parent not found or backend already exists.
+        """
+        with self._lock:
+            parent = self._parent_sessions.get(parent_id)
+            if parent is None:
+                raise ValueError(_NOT_FOUND_MSG_TMPL.format(session_id=parent_id))
+            if backend in parent.children:
+                raise ValueError(
+                    f"Parent session '{parent_id}' already has a '{backend}' backend."
+                )
+        child = self.create_session(
+            backend,
+            parent.user_id,
+            parent.project_id,
+            mode=parent.mode,
+            enforcement=parent.enforcement,
+            max_node_chars=parent.max_node_chars,
+        )
+        cleanup_child: str | None = None
+        with self._lock:
+            parent = self._parent_sessions.get(parent_id)
+            if parent is None:
+                cleanup_child = child.session_id
+            else:
+                parent.children[backend] = child.session_id
+        if cleanup_child is not None:
+            self.destroy_session(cleanup_child)
+            raise ValueError(_NOT_FOUND_MSG_TMPL.format(session_id=parent_id))
+        logger.info(
+            "Added '%s' backend to parent session %s (child=%s)",
+            backend, parent_id, child.session_id,
+        )
+        return child.session_id
 
     def get_idempotent_result(self, session_id: str, idempotency_key: str) -> str | None:
         """Return a stored idempotent result if this write already completed."""

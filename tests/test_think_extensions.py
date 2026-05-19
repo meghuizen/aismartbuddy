@@ -428,7 +428,7 @@ class TestPlanSparklingGrowingOrbit:
                 }
             ],
         )
-        assert "Suggested next: think_evidence" in result
+        assert "Suggested next: think_argue" in result
 
     @pytest.mark.anyio
     async def test_think_monitor_items_emits_compose_next_hint(self):

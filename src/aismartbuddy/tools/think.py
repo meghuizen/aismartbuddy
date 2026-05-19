@@ -42,8 +42,10 @@ from aismartbuddy.engines.thinking_engine import (
 )
 from aismartbuddy.identity import resolve_identity
 from aismartbuddy.tools import (
+    effective_session_id,
     get_session_manager,
     resolve_active_or_provided_session_id,
+    resolve_auto_graph,
     run_with_lock,
     size_guarded,
 )
@@ -254,9 +256,11 @@ def _get_or_create_think_session(
         # cases; raises if the parent has no think backend.
         info = mgr.resolve_backend_session(session_id, "think")
         return mgr, info
-    # Auto-create with caller-scoped identity (standalone think session)
+    # Auto-create: parent session with think + graph backends so auto_graph works
+    # without requiring an explicit session_create call first.
     user_id, project_id = resolve_identity(ctx, None, None)
-    info = mgr.create_session("think", user_id, project_id)
+    parent = mgr.create_parent_session(["think", "graph"], user_id, project_id)
+    info = mgr.resolve_backend_session(parent.parent_id, "think")
     return mgr, info
 
 
@@ -1004,14 +1008,17 @@ async def think_graph(
                 source="think_graph",
             )
 
+        eff_auto_graph = resolve_auto_graph(auto_graph, info, session_id)
+        eff_sid = effective_session_id(session_id, info)
         graph_count = 0
-        if auto_graph:
+        if eff_auto_graph:
             from aismartbuddy.tools import materialize_auto_graph
 
-            if not session_id:
+            if not eff_sid:
                 raise ValueError(
-                    "auto_graph requires an explicit unified session_id from "
-                    "session_create(backends=['think','graph'])."
+                    "auto_graph requires a parent session with a graph backend. "
+                    "Use session_create(backends=['think','graph']) or omit session_id "
+                    "to auto-create a session with graph support."
                 )
             # Build assigned-id list in batch order so int parent_ref values
             # resolve to the engine-assigned node ids.
@@ -1040,7 +1047,7 @@ async def think_graph(
                 return None
 
             graph_count = await materialize_auto_graph(
-                session_id,
+                eff_sid,
                 synthetic,
                 source_tag="think_graph",
                 entity_type="thought",
@@ -1058,7 +1065,7 @@ async def think_graph(
             "Node IDs: " + ", ".join(created_refs),
             "Trees: " + ", ".join(dict.fromkeys(node.tree_id for node in created)),
         ]
-        if auto_graph:
+        if eff_auto_graph:
             out_lines.append(f"Graph nodes created: {graph_count}")
         out_lines.append("Status: batch added")
         result = warning + "\n".join(out_lines)
@@ -1379,17 +1386,20 @@ async def think_decide(
                 source="think_decide",
             )
 
+        eff_auto_graph = resolve_auto_graph(auto_graph, info, session_id)
+        eff_sid = effective_session_id(session_id, info)
         graph_count = 0
-        if auto_graph:
+        if eff_auto_graph:
             from aismartbuddy.tools import materialize_auto_graph
 
-            if not session_id:
+            if not eff_sid:
                 raise ValueError(
-                    "auto_graph requires an explicit unified session_id from "
-                    "session_create(backends=['think','graph'])."
+                    "auto_graph requires a parent session with a graph backend. "
+                    "Use session_create(backends=['think','graph']) or omit session_id "
+                    "to auto-create a session with graph support."
                 )
             graph_count = await materialize_auto_graph(
-                session_id,
+                eff_sid,
                 items,
                 source_tag="think_decide",
                 entity_type="decision",
@@ -1401,7 +1411,7 @@ async def think_decide(
             f"Session: {info.session_id} | Decisions: {len(ids)}",
             f"IDs: {', '.join(ids)}",
         ]
-        if auto_graph:
+        if eff_auto_graph:
             out_lines.append(f"Graph nodes created: {graph_count}")
         out_lines.append("Status: decided")
         base = "\n".join(out_lines)
@@ -1688,15 +1698,18 @@ async def think_model(
                 source="think_model",
             )
 
+        eff_auto_graph = resolve_auto_graph(auto_graph, info, session_id)
+        eff_sid = effective_session_id(session_id, info)
         graph_count = 0
-        if auto_graph:
-            if not session_id:
+        if eff_auto_graph:
+            if not eff_sid:
                 raise ValueError(
-                    "auto_graph requires an explicit unified session_id from "
-                    "session_create(backends=['think','graph'])."
+                    "auto_graph requires a parent session with a graph backend. "
+                    "Use session_create(backends=['think','graph']) or omit session_id "
+                    "to auto-create a session with graph support."
                 )
             graph_count = await materialize_auto_graph(
-                session_id,
+                eff_sid,
                 items,
                 source_tag=f"think_model:{model_name}",
                 entity_type="concept",
@@ -1707,7 +1720,7 @@ async def think_model(
             f"Session: {info.session_id} | Model: {model_name} | Items: {len(item_ids)}",
             f"Item IDs: {', '.join(item_ids)}",
         ]
-        if auto_graph:
+        if eff_auto_graph:
             out.append(f"Graph nodes created: {graph_count}")
         out.append("Status: scaffolded")
         hint = _compose_next_hint("score_evaluate", "analysis_refs", item_ids)
@@ -1992,14 +2005,17 @@ async def think_argue(
                 engine.add_argument(chain_id, rec)
                 ids.append(aid)
 
+        eff_auto_graph = resolve_auto_graph(auto_graph, info, session_id)
+        eff_sid = effective_session_id(session_id, info)
         graph_count = 0
-        if auto_graph:
+        if eff_auto_graph:
             from aismartbuddy.tools import materialize_auto_graph
 
-            if not session_id:
+            if not eff_sid:
                 raise ValueError(
-                    "auto_graph requires an explicit unified session_id from "
-                    "session_create(backends=['think','graph'])."
+                    "auto_graph requires a parent session with a graph backend. "
+                    "Use session_create(backends=['think','graph']) or omit session_id "
+                    "to auto-create a session with graph support."
                 )
             argument_ids = list(ids)
             synthetic = [
@@ -2021,7 +2037,7 @@ async def think_argue(
                 return None
 
             graph_count = await materialize_auto_graph(
-                session_id,
+                eff_sid,
                 synthetic,
                 source_tag="think_argue",
                 entity_type="argument",
@@ -2036,7 +2052,7 @@ async def think_argue(
             f" | Batch: {len(ids)} arguments",
             f"Arg IDs: {', '.join(ids)}",
         ]
-        if auto_graph:
+        if eff_auto_graph:
             out_lines.append(f"Graph nodes created: {graph_count}")
         out_lines.append("Status: dialectic batch applied")
         base = "\n".join(out_lines)
@@ -2207,17 +2223,20 @@ async def think_science(
                 engine.upsert_inquiry(rec)
                 ids.append(it["id"])
 
+        eff_auto_graph = resolve_auto_graph(auto_graph, info, session_id)
+        eff_sid = effective_session_id(session_id, info)
         graph_count = 0
-        if auto_graph:
-            if not session_id:
+        if eff_auto_graph:
+            if not eff_sid:
                 raise ValueError(
-                    "auto_graph requires explicit unified session_id from "
-                    "session_create(backends=['think','graph'])."
+                    "auto_graph requires a parent session with a graph backend. "
+                    "Use session_create(backends=['think','graph']) or omit session_id "
+                    "to auto-create a session with graph support."
                 )
             # Build description from hypothesis.statement
             normalized = [{**it, "_desc": it["hypothesis"]["statement"]} for it in items]
             graph_count = await materialize_auto_graph(
-                session_id,
+                eff_sid,
                 normalized,
                 source_tag="think_science",
                 entity_type="question",
@@ -2228,7 +2247,7 @@ async def think_science(
             f"Session: {info.session_id} | Hypotheses: {len(ids)}",
             f"IDs: {', '.join(ids)}",
         ]
-        if auto_graph:
+        if eff_auto_graph:
             out.append(f"Graph nodes created: {graph_count}")
         if len(ids) == 1 and len(engine.inquiries) == 1:
             out.append(
@@ -2236,13 +2255,12 @@ async def think_science(
                 "alternatives. Single-hypothesis analysis is harder to falsify."
             )
         out.append("Status: hypothesized")
-        hint = _compose_next_hint("think_evidence", "refs", ids)
+        hint = _compose_next_hint("think_argue", "chain", ids)
         if hint:
             out.append(hint)
         out.append(
-            "Also consider: think_argue(chain=[...]) to dialectically stress-test "
-            "these hypotheses — forced antithesis surfaces assumptions that forward "
-            "reasoning misses."
+            "Also consider: think_evidence(refs=[...]) to register supporting "
+            "or refuting evidence for each hypothesis."
         )
         return "\n".join(out)
 
@@ -2399,19 +2417,21 @@ async def think_monitor(
         )
         engine = _engine(info)
         stats = await anyio.to_thread.run_sync(engine.get_session_stats)
-        if stats["node_count"] > 80 or stats["export_token_estimate"] > 6000:
+        total = stats.get("total_records", stats["node_count"])
+        if total > 100 or stats["export_token_estimate"] > 6000:
             rec = "summarize"
-        elif stats["tree_count"] > 4 and stats["node_count"] > 40:
+        elif stats["tree_count"] > 4 and total > 50:
             rec = "delegate"
         else:
             rec = "continue"
+        by_type = stats.get("record_counts", {})
         lines = [
             f"Session: {info.session_id}",
-            f"nodes: {stats['node_count']}  trees: {stats['tree_count']}  "
-            f"max_depth: {stats['max_depth']}",
+            f"total_records: {total}  nodes: {stats['node_count']}  "
+            f"trees: {stats['tree_count']}  max_depth: {stats['max_depth']}",
             f"entity_refs: {stats['entity_count']}  revisions: {stats['revision_count']}",
-            f"export_token_estimate: {stats['export_token_estimate']} "
-            "(thought content only; hypotheses/evidence not counted)",
+            f"export_token_estimate: {stats['export_token_estimate']}",
+            f"by_type: {by_type}",
             f"recommendation: {rec}",
         ]
         return "\n".join(lines)
@@ -2460,16 +2480,19 @@ async def think_monitor(
                 engine.upsert_monitor(rec)
                 ids.append(it["id"])
 
+        eff_auto_graph = resolve_auto_graph(auto_graph, info, session_id)
+        eff_sid = effective_session_id(session_id, info)
         graph_count = 0
-        if auto_graph:
-            if not session_id:
+        if eff_auto_graph:
+            if not eff_sid:
                 raise ValueError(
-                    "auto_graph requires explicit unified session_id from "
-                    "session_create(backends=['think','graph'])."
+                    "auto_graph requires a parent session with a graph backend. "
+                    "Use session_create(backends=['think','graph']) or omit session_id "
+                    "to auto-create a session with graph support."
                 )
             normalized = [{**it, "_desc": it["task"]} for it in items]
             graph_count = await materialize_auto_graph(
-                session_id,
+                eff_sid,
                 normalized,
                 source_tag="think_monitor",
                 entity_type="insight",
@@ -2480,7 +2503,7 @@ async def think_monitor(
             f"Session: {info.session_id} | Assessments: {len(ids)}",
             f"IDs: {', '.join(ids)}",
         ]
-        if auto_graph:
+        if eff_auto_graph:
             out.append(f"Graph nodes created: {graph_count}")
         out.append("Status: monitored")
         hint = _compose_next_hint("think_validate", "refs", ids)
@@ -2814,6 +2837,8 @@ async def think_validate(
     """
     _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
     engine = _engine(info)
+    eff_auto_graph = resolve_auto_graph(auto_graph, info, session_id)
+    eff_sid = effective_session_id(session_id, info)
 
     if items is not None:
         from aismartbuddy.tools import validate_items
@@ -2859,16 +2884,17 @@ async def think_validate(
                 nuance_notes=item.get("nuance_notes"),
             )
             ids.append(record.id)
-            await _materialize_rule_graph(session_id, validation=record)
+            await _materialize_rule_graph(eff_sid, validation=record)
 
         graph_count = 0
-        if auto_graph:
+        if eff_auto_graph:
             from aismartbuddy.tools import materialize_auto_graph
 
-            if not session_id:
+            if not eff_sid:
                 raise ValueError(
-                    "auto_graph requires an explicit unified session_id from "
-                    "session_create(backends=['think','graph'])."
+                    "auto_graph requires a parent session with a graph backend. "
+                    "Use session_create(backends=['think','graph']) or omit session_id "
+                    "to auto-create a session with graph support."
                 )
             # subject_id is a single string per item — wrap as a 1-element list
             # so materialize_auto_graph iterates a single Validates edge per
@@ -2889,7 +2915,7 @@ async def think_validate(
                 for i, item in enumerate(items)
             ]
             graph_count = await materialize_auto_graph(
-                session_id,
+                eff_sid,
                 synthetic,
                 source_tag="think_validate",
                 entity_type="validation",
@@ -2902,7 +2928,7 @@ async def think_validate(
             f"Session: {info.session_id} | Validations: {len(ids)}",
             f"IDs: {', '.join(ids)}",
         ]
-        if auto_graph:
+        if eff_auto_graph:
             out_lines.append(f"Graph nodes created: {graph_count}")
         out_lines.append("Status: validated")
         return "\n".join(out_lines)
@@ -3405,6 +3431,12 @@ async def think_constraint(
     ctx: _MCPContext | None = None,
 ) -> str:
     """[ELABORATE] Register constraints and validate targets against them.
+
+    Constraints are composable informational units — named rules your reasoning
+    can reference and check against. `type` ("hard"/"soft") is a semantic label
+    only; the server does not auto-propagate constraint violations to confidence
+    scores or block other records. The value is in making constraints explicit,
+    addressable, and sweepable — not in enforcement.
 
     PREFER items=[...] (or *_ids=[...] for invalidate/remove) on every action
     when handling one-or-more records — list-form scales without added

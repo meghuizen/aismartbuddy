@@ -1007,15 +1007,16 @@ class TestHolonCreateAutoGraph:
             )
 
     @pytest.mark.anyio
-    async def test_auto_graph_requires_explicit_session_id(self):
-        """auto_graph=True without session_id raises the explicit-session-id error."""
-        with pytest.raises(ValueError, match="explicit unified session_id"):
-            await holon_create(
-                auto_graph=True,
-                holons=[
-                    {"ref": "root", "name": "Root", "description": "x"},
-                ],
-            )
+    async def test_auto_graph_auto_creates_session_with_graph(self):
+        """auto_graph=True without session_id succeeds — auto-create now provisions
+        think+graph backends."""
+        result = await holon_create(
+            auto_graph=True,
+            holons=[
+                {"ref": "root", "name": "Root", "description": "x"},
+            ],
+        )
+        assert "Graph nodes created:" in result
 
     @pytest.mark.anyio
     async def test_auto_graph_creates_knowledge_nodes_and_partof_edges(self):

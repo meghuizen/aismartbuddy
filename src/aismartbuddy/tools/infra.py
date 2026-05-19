@@ -26,29 +26,30 @@ async def session_create(
     mode: str = "analyze",
     enforcement: str = "advisory",
     max_node_chars: int = 500,
+    auto_graph: bool = False,
     user_id: str | None = None,
     project_id: str | None = None,
     ctx: Context | None = None,
 ) -> str:
     """[INFRA] Create a unified session that hosts one or more backends.
 
-    Use when: you need cross-backend workflows (e.g., scaffold thoughts then
-    auto_graph them into a knowledge graph). For single-backend use, the
-    individual *_create_session tools are simpler.
-
-    Do NOT use when: a single backend session is sufficient.
+    Use when: you need cross-backend workflows, or want auto_graph available
+    without per-call opt-in. Omit entirely to auto-create with think+graph.
 
     Args:
-      backends: list of "think" | "graph" | "sql". Default ["think"].
+      backends: list of "think" | "graph" | "sql". Default ["think", "graph"].
       mode: immutable session mode — explore | diverge | iterate | analyze.
       enforcement: advisory (default) or strict phase/mode enforcement.
       max_node_chars: reason_graph node cap for this session.
+      auto_graph: when True, all tools in this session materialise items[]
+        outputs as KnowledgeNode rows without per-call auto_graph=True.
+        Silent skip for tools that don't support auto_graph.
       user_id, project_id: multi-tenant identity. Bearer auth overrides.
 
     Returns: parent session_id and the per-backend child IDs.
     """
     if backends is None:
-        backends = ["think"]
+        backends = ["think", "graph"]
     if mode not in _MODES:
         raise ValueError(f"mode must be one of {sorted(_MODES)}")
     if enforcement not in _ENFORCEMENTS:
@@ -63,18 +64,20 @@ async def session_create(
             mode=mode,
             enforcement=enforcement,
             max_node_chars=max_node_chars,
+            auto_graph=auto_graph,
         )
     )
     children_str = ", ".join(
         f"{b}={cid}" for b, cid in parent.children.items()
     )
+    auto_graph_str = f" | auto_graph: {parent.auto_graph}" if parent.auto_graph else ""
     return (
         f"Unified session created.\n"
         f"session_id: {parent.parent_id}\n"
         f"parent_session_id: {parent.parent_id}\n"
         f"user_id: {parent.user_id} | project_id: {parent.project_id}\n"
         f"mode: {parent.mode} | enforcement: {parent.enforcement}"
-        f" | max_node_chars: {parent.max_node_chars}\n"
+        f" | max_node_chars: {parent.max_node_chars}{auto_graph_str}\n"
         f"backends: {', '.join(parent.children.keys())}\n"
         f"children: {children_str}\n"
         f"child_session_ids: {children_str}"

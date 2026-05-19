@@ -679,21 +679,23 @@ class TestThinkModelTool:
             )
 
     @pytest.mark.anyio
-    async def test_items_auto_graph_requires_session(self):
-        with pytest.raises(ValueError, match="explicit unified session_id"):
-            await think_model(
-                model_name="first_principles",
-                items=[
-                    {
-                        "id": "x",
-                        "problem": "p",
-                        "steps": ["s"],
-                        "reasoning": "r",
-                        "conclusion": "c",
-                    }
-                ],
-                auto_graph=True,
-            )
+    async def test_items_auto_graph_auto_creates_session_with_graph(self):
+        # auto-create now provisions think+graph backends so auto_graph works
+        # without an explicit session_create call.
+        result = await think_model(
+            model_name="first_principles",
+            items=[
+                {
+                    "id": "x",
+                    "problem": "p",
+                    "steps": ["s"],
+                    "reasoning": "r",
+                    "conclusion": "c",
+                }
+            ],
+            auto_graph=True,
+        )
+        assert "Graph nodes created:" in result
 
     @pytest.mark.anyio
     async def test_items_auto_graph_with_unified_session(self):
@@ -2511,11 +2513,15 @@ class TestDomainConnections:
 
     @pytest.mark.anyio
     async def test_no_graph_companion_think_side_only(self):
+        from aismartbuddy.tools.infra import session_create
         from aismartbuddy.tools.think import think_bridge
 
-        # Two thoughts in different domains share an entity_ref → think-side
-        # shared-entity reporting works without a graph companion.
-        r1 = await think_graph(
+        # Explicit think-only session (no graph backend) so domain_connections
+        # returns think-side shared entities without a "## Graph connections" block.
+        sess = await session_create(backends=["think"])
+        sid = _extract_field(sess, "session_id:")
+        await think_graph(
+            session_id=sid,
             thoughts=[
                 {
                     "thought": "frontend thought referencing user_login",
@@ -2529,7 +2535,6 @@ class TestDomainConnections:
                 },
             ],
         )
-        sid = _extract_field(r1, "Session:")
         result = await think_bridge(
             action="domain_connections",
             domain="frontend",
@@ -2538,7 +2543,7 @@ class TestDomainConnections:
         )
         assert "## Shared entities" in result
         assert "user_login" in result
-        # No companion → no "## Graph connections" header
+        # No graph backend → no "## Graph connections" header
         assert "## Graph connections" not in result
 
     @pytest.mark.anyio
