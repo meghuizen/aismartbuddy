@@ -48,7 +48,7 @@ __main__.py (Click CLI) → server.py (FastMCP + lifespan + optional Entra auth)
   ├── tools/infra.py      → session.py (parent-session facade for unified backends)
   ├── tools/youtube.py    → youtube_client.py + lxml XML cache
   ├── tools/meta.py       → suggest_database
-  └── tools/__init__.py   → validate_items, materialize_auto_graph (shared helpers)
+  └── tools/__init__.py   → validate_items, materialize_auto_graph, effective_session_id, resolve_auto_graph (shared helpers)
       formatting.py (Arrow/Polars CSV + legacy csv.writer) ─┘
 ```
 
@@ -70,7 +70,7 @@ A tool's value depends on **schema-structure × sequence-position**:
 
 - **SCAFFOLD** — call FIRST (reasoning not yet done). Schema FORCES structure. Tools: `think_model`, `think_science`, `think_decide`, `think_interfere`. Use the strict `items=[...]` form for a forcing function: each item must include id + per-tool required fields, server REJECTS lazy items.
 - **ELABORATE** — call MIDDLE. Flexible thinking, branching, navigation. Tools: `think_graph` (with `children=[...]`), `holon_*`, `think_argue` (with `chain=[...]`), `think_debug`, `brainstorm`, `iterate`, `think_refs_query`.
-- **ASSESS** — call LAST. Forcing function for honest self-critique. Tools: `score_rubric`, `score_evaluate` (+ `finding_batch`), `think_monitor` (with `items=[...]` for self-assessment, or `action="density"` for session load stats).
+- **ASSESS** — call LAST. Forcing function for honest self-critique. Tools: `score_rubric`, `score_evaluate` (+ `finding_batch`), `think_monitor` (with `items=[...]` for self-assessment, or `action="density"` for session load stats including `total_records` and `by_type` breakdown).
 
 ### The items[] forcing-function pattern
 
@@ -84,7 +84,12 @@ For SCAFFOLD/ASSESS family, calling with `items=[{id, ...required_fields}, ...]`
 
 ### Auto-graph pipeline (items[] + auto_graph=True)
 
-When a SCAFFOLD/ASSESS items[] call sets `auto_graph=True` AND the session has a graph backend (created via `session_create(backends=["think","graph"])`), the server materialises each item as a `KnowledgeNode` row in the graph backend. Each `connects_to: ["other_id"]` becomes a `DerivedFrom` edge. One round trip = N structured records + N KG nodes + all declared edges. Eliminates the manual KG construction phase. **Auto-materialised nodes carry `authority="inferred"` automatically** — distinguishable from user-supplied ground-truth nodes.
+When a SCAFFOLD/ASSESS items[] call sets `auto_graph=True` AND the session has a graph backend, the server materialises each item as a `KnowledgeNode` row in the graph backend. Each `connects_to: ["other_id"]` becomes a `DerivedFrom` edge. One round trip = N structured records + N KG nodes + all declared edges. Eliminates the manual KG construction phase. **Auto-materialised nodes carry `authority="inferred"` automatically** — distinguishable from user-supplied ground-truth nodes.
+
+**Three ways to get a graph backend:**
+1. **Omit session_id** (simplest) — auto-create provisions a parent session with both `think` and `graph` backends. `auto_graph=True` on any tool call works immediately.
+2. **`session_create(backends=["think","graph"])`** — explicit unified session. Pass the returned `session_id` to all tools.
+3. **`session_create(auto_graph=True)`** — session-level policy: every items[] call in this session materialises to the graph automatically without per-call `auto_graph=True`.
 
 **auto_graph-capable batch tools and their edge labels:**
 
@@ -119,7 +124,7 @@ The 4 single-record-action tools (`think_hypothesis`, `think_constraint`, `think
 - `think_model` is the primary SCAFFOLD tool. 16 models: first_principles, opportunity_cost, error_propagation, rubber_duck, pareto_principle, assumptions_xray, fishbone, value_of_info, swot, pre_mortem, design_review, complexity, root_cause, **kuba** (Know/Understand/Believe/Act progression — find the bottleneck stage), **systems_dynamics** (reinforcing/balancing loops, delays, leverage points), **inversion** (guaranteed-failure analysis first — work backward from disaster). Use pre_mortem before implementing, design_review before finalizing, root_cause for debugging, inversion when stuck in consensus thinking, systems_dynamics for feedback-heavy domains. **Strongly prefer the `items=[...]` form at analysis start** — it forces per-item structure (id/problem/steps/reasoning/conclusion) and unlocks `auto_graph`.
 - All record types (ThoughtNode, HolonNode, EvaluationRecord) support `refs: list[str]`. The `think_refs_query(entity_id)` tool finds records that reference an id — use to compose across tool calls structurally rather than via text search.
 - `holon_*` tools model domains holonically — entities that are simultaneously wholes and parts. Multi-membership: holons participate in multiple holarchies. Bridge finds paths between distant holons across holarchies. Propagation leaves structural traces (stale projections).
-- Thinking tools (`think_*`) auto-create sessions on first call when `session_id` is omitted. Return compact text (not JSON) for token efficiency.
+- Thinking tools (`think_*`) auto-create sessions on first call when `session_id` is omitted. Auto-created sessions are parent sessions with **both `think` and `graph` backends**, so `auto_graph=True` works without any prior `session_create` call. Return compact text (not JSON) for token efficiency.
 - SQL import supports 6 formats: csv, tsv, txt (custom delimiter), json, jsonl, parquet (base64). Plus batch import via `sql_import_batch`.
 - Knowledge graph tools (`graph_knowledge_*`) layer semantic patterns: confidence scores, provenance, typed relations (supports/contradicts/etc.), inference (contradictions, gaps, chains, clusters). `graph_knowledge_add` and `knowledge_batch` accept `authority: "ground_truth" | "primary" | "inferred" | "external"` AND `domain: str` (free-form tag) on each node — omit either for `""` (unset). Use `think_bridge(action="authoritative_source", entity_name=...)` to rank nodes by authority, and `think_bridge(action="domain_context", domain=...)` to roll up everything tagged with a domain.
 - `think_bridge` has **10 actions**: `thoughts_for_entity`, `entities_for_thought`, `hypotheses_for_entity`, `evidence_for_hypothesis`, `constraints_for_hypothesis`, `full_context`, `bundle`, `authoritative_source`, `domain_context(domain)`, `domain_connections(domain, domain_b)`. `thoughts_for_entity` falls back to substring search on ThoughtNode content (prefix `(text match) `) when no metadata.knowledge_refs match.
