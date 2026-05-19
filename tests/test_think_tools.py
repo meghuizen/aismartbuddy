@@ -2318,3 +2318,359 @@ class TestThinkBridgeBundle:
             await think_bridge(action="bundle", entity_ids=[])
         with pytest.raises(ValueError, match="bundle requires entity_ids"):
             await think_bridge(action="bundle", entity_ids=None)
+
+
+@pytest.mark.usefixtures("_init_session_manager")
+class TestThoughtsForEntity:
+    """think_bridge(action='thoughts_for_entity') registration + text fallback."""
+
+    @pytest.mark.anyio
+    async def test_unknown_entity_returns_none(self):
+        from aismartbuddy.tools.think import think_bridge
+
+        r1 = await think_graph(thought="totally unrelated content")
+        sid = _extract_field(r1, "Session:")
+        result = await think_bridge(
+            action="thoughts_for_entity",
+            entity_name="NLRX1",
+            session_id=sid,
+        )
+        assert "Thought matches: 0" in result
+
+    @pytest.mark.anyio
+    async def test_text_fallback_when_no_knowledge_refs(self):
+        from aismartbuddy.tools.think import think_bridge
+
+        r1 = await think_graph(
+            thought="NLRX1 mitochondrial reactive oxygen species pathway"
+        )
+        sid = _extract_field(r1, "Session:")
+        result = await think_bridge(
+            action="thoughts_for_entity",
+            entity_name="NLRX1",
+            session_id=sid,
+        )
+        assert "Thought matches: 1" in result
+        assert "(text match)" in result
+
+    @pytest.mark.anyio
+    async def test_prefers_knowledge_refs_over_text(self):
+        from aismartbuddy.tools.think import think_bridge
+
+        # Two thoughts: one tagged via entity_refs, one with text-only match.
+        r1 = await think_graph(
+            thoughts=[
+                {
+                    "thought": "First insight tagged via entity_refs",
+                    "entity_refs": ["NLRX1"],
+                },
+                {"thought": "Second mentions NLRX1 in body text only"},
+            ],
+        )
+        sid = _extract_field(r1, "Session:")
+        result = await think_bridge(
+            action="thoughts_for_entity",
+            entity_name="NLRX1",
+            session_id=sid,
+        )
+        # Only the registered match counts; text fallback is suppressed when
+        # we already have a knowledge_refs hit.
+        assert "Thought matches: 1" in result
+        assert "(text match)" not in result
+
+    @pytest.mark.anyio
+    async def test_entity_refs_register_to_knowledge_refs(self):
+        from aismartbuddy.tools.think import think_bridge
+
+        r1 = await think_graph(
+            thoughts=[
+                {
+                    "thought": "Thought referencing NLRX1 structurally",
+                    "entity_refs": ["NLRX1"],
+                }
+            ],
+        )
+        sid = _extract_field(r1, "Session:")
+        # Verify lookup finds the node WITHOUT relying on text content.
+        result = await think_bridge(
+            action="thoughts_for_entity",
+            entity_name="NLRX1",
+            session_id=sid,
+        )
+        assert "Thought matches: 1" in result
+        assert "(text match)" not in result
+
+
+@pytest.mark.usefixtures("_init_session_manager")
+class TestDomainContext:
+    """think_bridge(action='domain_context') aggregates by domain tag."""
+
+    @pytest.mark.anyio
+    async def test_domain_context_for_think_model(self):
+        from aismartbuddy.tools.think import think_bridge
+
+        r1 = await think_model(
+            model_name="first_principles",
+            items=[
+                {
+                    "id": "m_metab_1",
+                    "problem": "Mitochondrial ROS",
+                    "steps": ["s1"],
+                    "reasoning": "first principles",
+                    "conclusion": "ROS drives signal",
+                    "domain": "metabolism",
+                }
+            ],
+        )
+        sid = _extract_field(r1, "Session:")
+        result = await think_bridge(
+            action="domain_context",
+            domain="metabolism",
+            session_id=sid,
+        )
+        assert "domain: metabolism" in result
+        assert "models: 1" in result
+        assert "m_metab_1" in result
+
+    @pytest.mark.anyio
+    async def test_domain_context_for_think_science(self):
+        from aismartbuddy.tools.think import think_bridge
+
+        r1 = await think_science(
+            items=[
+                {
+                    "id": "inq_inf_1",
+                    "observation": "elevated cytokine levels",
+                    "question": "what drives this",
+                    "hypothesis": {
+                        "statement": "NLRX1 modulates response",
+                        "variables": [
+                            {"name": "NLRX1_level", "role": "independent"},
+                            {"name": "cytokine", "role": "dependent"},
+                        ],
+                        "assumptions": ["assay sensitivity sufficient"],
+                        "confidence": 0.6,
+                        "falsifiability": (
+                            "Knockout NLRX1 and observe no change in cytokine levels"
+                        ),
+                    },
+                    "domain": "inflammation",
+                }
+            ],
+        )
+        sid = _extract_field(r1, "Session:")
+        result = await think_bridge(
+            action="domain_context",
+            domain="inflammation",
+            session_id=sid,
+        )
+        assert "domain: inflammation" in result
+        assert "inquiries: 1" in result
+        assert "inq_inf_1" in result
+
+    @pytest.mark.anyio
+    async def test_domain_context_empty_domain_message(self):
+        from aismartbuddy.tools.think import think_bridge
+
+        r1 = await think_graph(thought="some unrelated thought")
+        sid = _extract_field(r1, "Session:")
+        result = await think_bridge(
+            action="domain_context",
+            domain="frontend",
+            session_id=sid,
+        )
+        assert "(no records found for domain 'frontend')" in result
+
+
+@pytest.mark.usefixtures("_init_session_manager")
+class TestDomainConnections:
+    """think_bridge(action='domain_connections') cross-domain inspection."""
+
+    @pytest.mark.anyio
+    async def test_missing_domain_b_raises(self):
+        from aismartbuddy.tools.think import think_bridge
+
+        with pytest.raises(
+            ValueError, match="domain_connections requires both domain and domain_b"
+        ):
+            await think_bridge(action="domain_connections", domain="a")
+
+    @pytest.mark.anyio
+    async def test_same_domain_returns_note(self):
+        from aismartbuddy.tools.think import think_bridge
+
+        r1 = await think_graph(thought="anchor")
+        sid = _extract_field(r1, "Session:")
+        result = await think_bridge(
+            action="domain_connections",
+            domain="x",
+            domain_b="x",
+            session_id=sid,
+        )
+        assert "same domain" in result
+
+    @pytest.mark.anyio
+    async def test_no_graph_companion_think_side_only(self):
+        from aismartbuddy.tools.think import think_bridge
+
+        # Two thoughts in different domains share an entity_ref → think-side
+        # shared-entity reporting works without a graph companion.
+        r1 = await think_graph(
+            thoughts=[
+                {
+                    "thought": "frontend thought referencing user_login",
+                    "entity_refs": ["user_login"],
+                    "domain": "frontend",
+                },
+                {
+                    "thought": "backend thought referencing user_login",
+                    "entity_refs": ["user_login"],
+                    "domain": "backend",
+                },
+            ],
+        )
+        sid = _extract_field(r1, "Session:")
+        result = await think_bridge(
+            action="domain_connections",
+            domain="frontend",
+            domain_b="backend",
+            session_id=sid,
+        )
+        assert "## Shared entities" in result
+        assert "user_login" in result
+        # No companion → no "## Graph connections" header
+        assert "## Graph connections" not in result
+
+    @pytest.mark.anyio
+    async def test_empty_shared_entities(self):
+        from aismartbuddy.tools.think import think_bridge
+
+        # Two thoughts with non-overlapping entity_refs — intersection is empty.
+        r1 = await think_graph(
+            thoughts=[
+                {
+                    "thought": "frontend thought",
+                    "entity_refs": ["login_form"],
+                    "domain": "frontend",
+                },
+                {
+                    "thought": "backend thought",
+                    "entity_refs": ["db_pool"],
+                    "domain": "backend",
+                },
+            ],
+        )
+        sid = _extract_field(r1, "Session:")
+        result = await think_bridge(
+            action="domain_connections",
+            domain="frontend",
+            domain_b="backend",
+            session_id=sid,
+        )
+        assert "## Shared entities: (none)" in result
+
+    @pytest.mark.anyio
+    async def test_whitespace_only_domain_raises(self):
+        from aismartbuddy.tools.think import think_bridge
+
+        r1 = await think_graph(thought="anchor")
+        sid = _extract_field(r1, "Session:")
+        with pytest.raises(ValueError, match="domain_connections requires"):
+            await think_bridge(
+                action="domain_connections",
+                domain="   ",
+                domain_b="backend",
+                session_id=sid,
+            )
+
+    @pytest.mark.anyio
+    async def test_graph_mode_shows_cross_domain_edges(self):
+        from aismartbuddy.tools.graph import graph_knowledge_add, graph_knowledge_relate
+        from aismartbuddy.tools.infra import session_create
+        from aismartbuddy.tools.think import think_bridge
+
+        r1 = await session_create(backends=["think", "graph"])
+        sid = ""
+        for line in r1.split("\n"):
+            line = line.strip()
+            if line.startswith("session_id:"):
+                sid = line[len("session_id:"):].strip()
+                break
+        assert sid
+
+        # Create two graph nodes in different domains, then link them.
+        await graph_knowledge_add(
+            session_id=sid,
+            entity="CPT1A",
+            entity_type="gene",
+            domain="metabolism",
+        )
+        await graph_knowledge_add(
+            session_id=sid,
+            entity="IL6",
+            entity_type="cytokine",
+            domain="inflammation",
+        )
+        await graph_knowledge_relate(
+            session_id=sid,
+            from_name="CPT1A",
+            to_name="IL6",
+            relation="activates",
+        )
+
+        # domain_connections should surface the cross-domain edge.
+        result = await think_bridge(
+            action="domain_connections",
+            domain="metabolism",
+            domain_b="inflammation",
+            session_id=sid,
+        )
+        assert "## Graph connections" in result
+        assert "CPT1A" in result
+        assert "IL6" in result
+
+
+@pytest.mark.usefixtures("_init_session_manager")
+class TestThinkScienceRefs:
+    """think_science items[] refs population from connects_to."""
+
+    @pytest.mark.anyio
+    async def test_connects_to_populates_refs(self):
+        _hyp = lambda stmt: {  # noqa: E731
+            "statement": stmt,
+            "variables": [
+                {"name": "x", "role": "independent"},
+                {"name": "y", "role": "dependent"},
+            ],
+            "assumptions": ["baseline"],
+            "confidence": 0.5,
+            "falsifiability": "Specific predicted result that would refute it",
+        }
+        # Build anchor record first.
+        r1 = await think_science(
+            items=[
+                {
+                    "id": "inq_anchor",
+                    "observation": "obs",
+                    "question": "q",
+                    "hypothesis": _hyp("h"),
+                }
+            ],
+        )
+        sid = _extract_field(r1, "Session:")
+        # Second record connects_to the first.
+        await think_science(
+            items=[
+                {
+                    "id": "inq_dep",
+                    "observation": "obs2",
+                    "question": "q2",
+                    "hypothesis": _hyp("h2"),
+                    "connects_to": ["inq_anchor"],
+                }
+            ],
+            session_id=sid,
+        )
+        rows = await think_refs_query(entity_id="inq_anchor", session_id=sid)
+        # Expect at least one inquiry referencing inq_anchor.
+        assert "inq_dep" in rows or "inquiry" in rows

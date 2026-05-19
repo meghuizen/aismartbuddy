@@ -246,7 +246,8 @@ async def materialize_auto_graph(
                     "CREATE NODE TABLE IF NOT EXISTS KnowledgeNode ("
                     "id SERIAL PRIMARY KEY, name STRING, description STRING, "
                     "entity_type STRING, confidence DOUBLE, "
-                    "source STRING, created_at STRING, authority STRING);"
+                    "source STRING, created_at STRING, domain STRING, "
+                    "authority STRING);"
                 )
             except Exception as e:
                 # Typically "already exists" from LadybugDB's idempotent
@@ -270,11 +271,13 @@ async def materialize_auto_graph(
                 desc = escape_cypher_string(desc_raw)
                 et = escape_cypher_string(entity_type)
                 src = escape_cypher_string(source_tag)
+                domain_val = escape_cypher_string(str(item.get("domain", "")))
                 graph_info.engine.execute(
                     f"CREATE (k:KnowledgeNode {{name: '{eid}', "
                     f"description: '{desc}', entity_type: '{et}', "
                     f"confidence: 1.0, source: '{src}', "
-                    f"created_at: '{ts}', authority: 'inferred'}});"
+                    f"created_at: '{ts}', domain: '{domain_val}', "
+                    f"authority: 'inferred'}});"
                 )
                 n += 1
 

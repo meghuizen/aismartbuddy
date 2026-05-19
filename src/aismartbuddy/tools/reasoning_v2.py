@@ -301,7 +301,8 @@ async def _auto_graph_if_enabled(parent, items: list[dict], *, source_tag: str) 
                 graph_info.engine.execute(
                     "CREATE NODE TABLE IF NOT EXISTS KnowledgeNode ("
                     "id SERIAL PRIMARY KEY, name STRING, description STRING, "
-                    "entity_type STRING, confidence DOUBLE, source STRING, created_at STRING);"
+                    "entity_type STRING, confidence DOUBLE, source STRING, "
+                    "created_at STRING, domain STRING, authority STRING);"
                 )
             except Exception:
                 pass
@@ -323,6 +324,7 @@ async def _auto_graph_if_enabled(parent, items: list[dict], *, source_tag: str) 
                 name = escape_cypher_string(item["id"])
                 etype = escape_cypher_string(str(item.get("_graph_kind", source_tag)))
                 created_at = escape_cypher_string(str(item.get("_created_at")))
+                domain_val = escape_cypher_string(str(item.get("domain", "")))
                 node_statements.append(
                     "CREATE (k:KnowledgeNode {"
                     f"name: '{name}', "
@@ -330,7 +332,9 @@ async def _auto_graph_if_enabled(parent, items: list[dict], *, source_tag: str) 
                     f"entity_type: '{etype}', "
                     "confidence: 1.0, "
                     f"source: '{edge_source}', "
-                    f"created_at: '{created_at}'"
+                    f"created_at: '{created_at}', "
+                    f"domain: '{domain_val}', "
+                    "authority: 'inferred'"
                     "})"
                 )
                 for ref in item.get("connects_to") or []:

@@ -130,3 +130,5 @@ NOTES.local.md
 # .agents/
 # .claude/
 # .meridian/
+# Ephemeral worktree directories created by implementation agents.
+.claude/worktrees/

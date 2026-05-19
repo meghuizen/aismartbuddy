@@ -7,9 +7,10 @@ auto-session creation, and token-optimized compact text output.
 
 from __future__ import annotations
 
+import logging
 import re
 import uuid
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import anyio
 
@@ -43,11 +44,14 @@ from aismartbuddy.identity import resolve_identity
 from aismartbuddy.tools import (
     get_session_manager,
     resolve_active_or_provided_session_id,
+    run_with_lock,
     size_guarded,
 )
 
 if TYPE_CHECKING:
     from aismartbuddy.session import SessionInfo, SessionManager
+
+logger = logging.getLogger("aismartbuddy.tools.think")
 
 # ── Valid enum values ────────────────────────────────────────
 
@@ -219,6 +223,8 @@ _BRIDGE_ACTIONS = frozenset(
         "full_context",
         "bundle",
         "authoritative_source",
+        "domain_context",
+        "domain_connections",
     }
 )
 
@@ -395,6 +401,21 @@ def _short(text: str, limit: int = 80) -> str:
     if len(cleaned) <= limit:
         return cleaned
     return cleaned[:limit] + "..."
+
+
+def _emit_domain_section(
+    lines: list[str],
+    title: str,
+    records: list,
+    id_fn: Callable[[object], str],
+    text_fn: Callable[[object], str],
+    cap: int = 30,
+) -> None:
+    if not records:
+        return
+    lines.append(f"## {title}")
+    for rec in records[:cap]:
+        lines.append(f"  {id_fn(rec)}: {_short(text_fn(rec), 80)}")
 
 
 def _node_to_export_dict(node: ThoughtNode) -> dict:
@@ -819,13 +840,19 @@ async def think_graph(
 
     Args:
         thoughts: PREFERRED. Batch mode — each item is one atomic thought unit:
-            {thought, action?, parent_ref?, metadata?, refs?, depends_on?}.
+            {thought, action?, parent_ref?, metadata?, refs?, depends_on?,
+             entity_refs?, domain?}.
             parent_ref may be an existing node_id string OR an integer index
             pointing at another item earlier in this same batch (0 = the first
             item, which becomes a new tree root). Batch mode collapses N
             round-trips to 1 and is the default for new chains or trees. It is
             not a place to hide one large mixed-meaning essay inside a single
             array entry — one item, one thought unit.
+            entity_refs: list[str] — external entity names auto-registered into
+              metadata["knowledge_refs"] so think_bridge(thoughts_for_entity)
+              finds this node. BATCH-ONLY — not available on the single-call path.
+            domain: str — free-text domain tag written to metadata["domain"].
+              Enables think_bridge(domain_context/domain_connections). BATCH-ONLY.
         thought: The thinking content (single-call / incremental mode).
         action: What kind of thought: think, branch, revise, synthesize.
         session_id: Thinking session ID. Omit to auto-create.
@@ -939,6 +966,16 @@ async def think_graph(
                 raise ValueError(
                     f"thoughts[{index}] targets existing tree '{item_tree_id}' without parent_ref"
                 )
+            item_metadata: dict = dict(item.get("metadata") or {})
+            entity_refs_val = [str(x) for x in (item.get("entity_refs") or []) if x]
+            if entity_refs_val:
+                existing_refs = [str(x) for x in (item_metadata.get("knowledge_refs") or [])]
+                item_metadata["knowledge_refs"] = list(
+                    dict.fromkeys(existing_refs + entity_refs_val)
+                )
+            domain_val = str(item.get("domain", "")).strip()
+            if domain_val:
+                item_metadata["domain"] = domain_val
             specs.append(
                 {
                     "id": uuid.uuid4().hex[:10],
@@ -950,7 +987,7 @@ async def think_graph(
                     "refs": list(item.get("refs") or []),
                     "rule_bindings": list(bindings),
                     "depth": item_depth,
-                    "metadata": dict(item.get("metadata") or {}),
+                    "metadata": item_metadata,
                 }
             )
 
@@ -983,6 +1020,7 @@ async def think_graph(
                 {
                     "id": thought_ids[i],
                     "thought": specs[i]["content"],
+                    "domain": thoughts[i].get("domain", ""),
                     "parent_ref": (
                         [thoughts[i]["parent_ref"]]
                         if thoughts[i].get("parent_ref") is not None
@@ -1314,6 +1352,7 @@ async def think_decide(
         bindings = _rule_bindings_from_profile_ids(engine, rule_profile_ids)
         with engine.state_lock:
             for it in items:
+                domain_val = str(it.get("domain", "")).strip()
                 rec = DecisionRecord(
                     decision_id=it["id"],
                     statement=it["decision_statement"],
@@ -1324,6 +1363,7 @@ async def think_decide(
                     criteria=list(it["criteria"]),
                     evaluations=list(it.get("evaluations") or []),
                     recommendation=it["recommendation"],
+                    domain=domain_val,
                     rule_bindings=list(bindings),
                 )
                 engine.upsert_decision(rec)
@@ -1623,6 +1663,7 @@ async def think_model(
         bindings = _rule_bindings_from_profile_ids(engine, rule_profile_ids)
         with engine.state_lock:
             for it in items:
+                domain_val = str(it.get("domain", "")).strip()
                 rec = ModelRecord(
                     model_name=model_name,
                     problem=it["problem"],
@@ -1631,6 +1672,7 @@ async def think_model(
                     conclusion=it["conclusion"],
                     record_id=it["id"],
                     refs=collect_item_refs(it),
+                    domain=domain_val,
                     rule_bindings=list(bindings),
                 )
                 engine.add_model(rec)
@@ -1671,6 +1713,11 @@ async def think_model(
         hint = _compose_next_hint("score_evaluate", "analysis_refs", item_ids)
         if hint:
             out.append(hint)
+        if model_name == "systems_dynamics":
+            out.append(
+                "Also consider: think_model(model_name=\"inversion\") — "
+                "maps guaranteed-failure conditions from the loops you just identified."
+            )
         return "\n".join(out)
 
     # ── Single-item backward-compat path ─────────────────────
@@ -2141,9 +2188,12 @@ async def think_science(
             item_validators={"hypothesis": _validate_hypothesis_dict},
         )
 
+        from aismartbuddy.tools import collect_item_refs
+
         ids: list[str] = []
         with engine.state_lock:
             for it in items:
+                domain_val = str(it.get("domain", "")).strip()
                 rec = InquiryRecord(
                     inquiry_id=it["id"],
                     stage="hypothesis",
@@ -2151,6 +2201,8 @@ async def think_science(
                     observation=it["observation"],
                     question=it["question"],
                     hypothesis=it["hypothesis"],
+                    refs=collect_item_refs(it),
+                    domain=domain_val,
                 )
                 engine.upsert_inquiry(rec)
                 ids.append(it["id"])
@@ -2178,10 +2230,20 @@ async def think_science(
         ]
         if auto_graph:
             out.append(f"Graph nodes created: {graph_count}")
+        if len(ids) == 1 and len(engine.inquiries) == 1:
+            out.append(
+                "Note: single hypothesis registered — consider adding competing "
+                "alternatives. Single-hypothesis analysis is harder to falsify."
+            )
         out.append("Status: hypothesized")
         hint = _compose_next_hint("think_evidence", "refs", ids)
         if hint:
             out.append(hint)
+        out.append(
+            "Also consider: think_argue(chain=[...]) to dialectically stress-test "
+            "these hypotheses — forced antithesis surfaces assumptions that forward "
+            "reasoning misses."
+        )
         return "\n".join(out)
 
     # ── Single-stage backward-compat path ─────────────────────
@@ -2379,6 +2441,7 @@ async def think_monitor(
                 weighted = sum(float(c["confidence"]) * _STATUS_WEIGHT[c["status"]] for c in cl)
                 weight_sum = sum(_STATUS_WEIGHT[c["status"]] for c in cl)
                 overall = weighted / weight_sum if weight_sum > 0 else 0.0
+                domain_val = str(it.get("domain", "")).strip()
                 rec = MonitorRecord(
                     monitoring_id=it["id"],
                     task=it["task"],
@@ -2392,6 +2455,7 @@ async def think_monitor(
                         "limitations": list(k["limitations"]),
                     },
                     claims=list(cl),
+                    domain=domain_val,
                 )
                 engine.upsert_monitor(rec)
                 ids.append(it["id"])
@@ -2732,6 +2796,21 @@ async def think_validate(
     round-trip. Validates edges require the subject_id to already be a
     KnowledgeNode (e.g., chain auto_graph from your scaffold/decision tools
     earlier in the session). Otherwise the edge is silently skipped.
+
+    items[]: each item requires:
+        subject_id (str, required): ID of the thing being validated.
+        assessments (list, required): list of assessment dicts, each requiring:
+            rule_id (str, required): identifier for the rule being assessed.
+            status (str, required): one of satisfies | violates | uncertain |
+                not_applicable.
+            note (str, optional): explanation.
+            refs (list[str], optional): supporting reference IDs.
+        subject_kind (str, optional): label for the subject type.
+        rule_profile_ids (list[str], optional): rule profiles to check against.
+        use_bound_profiles (bool, optional): include session-bound profiles.
+        validation_id (str, optional): stable ID; auto-generated if omitted.
+        refs (list[str], optional): cross-record references.
+        nuance_notes (list[str], optional): caveats that do not affect scoring.
     """
     _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
     engine = _engine(info)
@@ -2753,9 +2832,16 @@ async def think_validate(
                     _VALIDATION_STATUSES,
                     f"items[{i}].assessments[{j}].status",
                 )
+                rule_id = assessment.get("rule_id") or ""
+                if not rule_id:
+                    raise ValueError(
+                        f"think_validate items[{i}].assessments[{j}]: "
+                        "rule_id is required. Provide a rule identifier string "
+                        "(e.g. \"must_cover_auth\", \"R1\")."
+                    )
                 parsed_assessments.append(
                     ValidationAssessment(
-                        rule_id=assessment["rule_id"],
+                        rule_id=rule_id,
                         status=assessment["status"],
                         note=assessment.get("note", "") or "",
                         refs=list(assessment.get("refs") or []),
@@ -2826,9 +2912,16 @@ async def think_validate(
     parsed_assessments = []
     for i, assessment in enumerate(assessments or []):
         _validate_enum(assessment["status"], _VALIDATION_STATUSES, f"assessments[{i}].status")
+        rule_id = assessment.get("rule_id") or ""
+        if not rule_id:
+            raise ValueError(
+                f"think_validate assessments[{i}]: "
+                "rule_id is required. Provide a rule identifier string "
+                "(e.g. \"must_cover_auth\", \"R1\")."
+            )
         parsed_assessments.append(
             ValidationAssessment(
-                rule_id=assessment["rule_id"],
+                rule_id=rule_id,
                 status=assessment["status"],
                 note=assessment.get("note", "") or "",
                 refs=list(assessment.get("refs") or []),
@@ -3811,7 +3904,21 @@ async def think_evidence(
     PREFER items=[...] (or *_ids=[...] for invalidate/remove) on every action
     when handling one-or-more records — list-form scales without added
     round-trips. Single-record args remain supported for backward-compat.
+
+    action: one of register | chain | trace | strength | list
+        add: accepted as an alias for register.
+        register: store an evidence node. Required: content, source_type.
+            source_type must be one of: analogy, expert_opinion, inference,
+            literature, measurement, observation, simulation.
+        chain: link two evidence nodes. Required: from_id, to_id, inference_type.
+            inference_type must be one of: abductive, analogical, deductive,
+            inductive.
+        trace: walk provenance paths to a claim. Required: claim_id.
+        strength: compute aggregate evidence strength for a claim. Required: claim_id.
+        list: return all registered evidence nodes.
     """
+    if action == "add":
+        action = "register"
     _validate_enum(action, _EVIDENCE_ACTIONS, "action")
     _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
     engine = _engine(info)
@@ -3979,12 +4086,17 @@ async def think_bridge(
     entity_ids: list[str] | None = None,
     confidence_min: float | None = None,
     include_sql_tables: list[str] | None = None,
+    domain: str | None = None,
+    domain_b: str | None = None,
     ctx: _MCPContext | None = None,
 ) -> str:
     """[ELABORATE] Query thought graph, hypotheses, constraints, evidence, topology state.
 
-    Eight actions:
+    Ten actions:
       thoughts_for_entity(entity_name) -- thoughts mentioning the entity.
+          Matches ThoughtNode metadata['knowledge_refs'] first; if empty,
+          falls back to case-insensitive substring search on node content
+          (rows prefixed with "(text match) ").
       entities_for_thought(node_id) -- entities referenced by a thought.
       hypotheses_for_entity(entity_name) -- hypotheses mentioning the entity.
       evidence_for_hypothesis(hypothesis_id) -- direct + chained evidence.
@@ -3995,6 +4107,26 @@ async def think_bridge(
       authoritative_source(entity_name)
           -- ranked knowledge nodes by authority tier
              (ground_truth > primary > external > inferred)
+      domain_context(domain)
+          -- list all think records (thoughts, hypotheses, models, decisions,
+             inquiries, monitors) AND graph KnowledgeNodes tagged with a given
+             domain. Use for cross-record domain rollups.
+      domain_connections(domain, domain_b)
+          -- find graph edges and shared entities linking two domains. Useful
+             for cross-domain bridge analysis.
+
+    Args:
+      action: one of the ten action names above.
+      entity_name / node_id / hypothesis_id / target_id / target_type /
+        entity_ids / confidence_min / include_sql_tables: per-action inputs.
+      domain: domain tag for domain_context / domain_connections.
+      domain_b: second domain tag for domain_connections.
+
+    Note: ThoughtNodes produced via `think_graph(thoughts=[...])` accept
+    `entity_refs: list[str]` (registers to metadata.knowledge_refs) and
+    `domain: str` (registers to metadata.domain). Items[] forms of
+    think_model / think_decide / think_science / think_monitor accept
+    `domain: str` and write it to the record's `domain` field.
 
     When the current think session belongs to a unified think+graph workspace,
     the tool also attempts graph-backed context lookups. Those lookups are
@@ -4013,6 +4145,13 @@ async def think_bridge(
             for node in engine.thought_nodes.values()
             if entity_name in node.metadata.get("knowledge_refs", [])
         ]
+        if not matches:
+            pattern = re.compile(rf"\b{re.escape(entity_name)}\b", re.IGNORECASE)
+            for node in engine.thought_nodes.values():
+                if pattern.search(node.content or ""):
+                    matches.append(f"(text match) {node.id}:{_short(node.content, 70)}")
+                    if len(matches) >= 50:
+                        break
         lines = [f"Session: {info.session_id}", f"Thought matches: {len(matches)}"]
         lines.extend(f"- {item}" for item in matches[:20])
         graph_lines = await _safe_graph_context_lines(
@@ -4129,9 +4268,6 @@ async def think_bridge(
                     f"(posterior={h.posterior_weight:.3f})"
                 )
         # graph-side: knowledge nodes ranked by authority
-        graph_lines = await _safe_graph_context_lines(
-            think_session_id, entity_names=[entity_name]
-        )
         companion_id = _companion_graph_session_id(think_session_id)
         if companion_id:
             mgr2 = get_session_manager()
@@ -4142,8 +4278,8 @@ async def think_bridge(
                 f"RETURN n.name, n.authority, n.source, n.confidence"
             )
             try:
-                cols, rows = await anyio.to_thread.run_sync(
-                    lambda: g_info.engine.execute(q)
+                _, rows = await run_with_lock(
+                    g_info, lambda: g_info.engine.execute(q)
                 )
                 if rows:
                     rank = {
@@ -4159,11 +4295,196 @@ async def think_bridge(
                             f"  name={row[0]} authority={row[1] or 'unset'} "
                             f"source={row[2]} confidence={row[3]}"
                         )
-            except Exception:
-                pass
-        elif graph_lines:
-            lines.append("## Graph context")
-            lines.extend(graph_lines)
+            except Exception as exc:
+                logger.debug("graph authority query failed for %s: %s", entity_name, exc)
+        else:
+            graph_lines = await _safe_graph_context_lines(
+                think_session_id, entity_names=[entity_name]
+            )
+            if graph_lines:
+                lines.append("## Graph context")
+                lines.extend(graph_lines)
+        return "\n".join(lines)
+
+    if action == "domain_context":
+        if not domain or not domain.strip():
+            raise ValueError("domain is required for domain_context")
+        from aismartbuddy.tools.graph import _escape_cypher_string
+
+        d = domain.strip()
+        think_session_id = info.session_id
+
+        matching_thoughts = [
+            n for n in engine.thought_nodes.values() if n.metadata.get("domain") == d
+        ]
+        matching_hyps = [h for h in engine.hypotheses.values() if h.domain == d]
+        matching_models = [m for m in engine.models if m.domain == d]
+        matching_decisions = [
+            dec for dec in engine.decisions.values() if dec.domain == d
+        ]
+        matching_inquiries = [
+            i for i in engine.inquiries.values() if i.domain == d
+        ]
+        matching_monitors = [
+            mo for mo in engine.monitors.values() if mo.domain == d
+        ]
+
+        graph_rows: list[tuple] = []
+        companion_id = _companion_graph_session_id(think_session_id)
+        if companion_id:
+            mgr2 = get_session_manager()
+            g_info = mgr2.resolve_backend_session(companion_id, "graph")
+            q = (
+                f"MATCH (n:KnowledgeNode) "
+                f"WHERE n.domain = '{_escape_cypher_string(d)}' "
+                f"RETURN n.name, n.entity_type, n.confidence, n.authority LIMIT 30"
+            )
+            try:
+                _, rows = await run_with_lock(
+                    g_info, lambda: g_info.engine.execute(q)
+                )
+                graph_rows = list(rows)
+            except Exception as exc:
+                logger.debug("domain_context graph query failed for %s: %s", d, exc)
+
+        header_parts = [
+            f"thoughts: {len(matching_thoughts)}",
+            f"hypotheses: {len(matching_hyps)}",
+            f"models: {len(matching_models)}",
+            f"decisions: {len(matching_decisions)}",
+            f"inquiries: {len(matching_inquiries)}",
+            f"monitors: {len(matching_monitors)}",
+        ]
+        if companion_id:
+            header_parts.append(f"graph_nodes: {len(graph_rows)}")
+        lines = [
+            f"Session: {think_session_id}",
+            f"domain: {d} | " + ", ".join(header_parts),
+        ]
+
+        total = (
+            len(matching_thoughts)
+            + len(matching_hyps)
+            + len(matching_models)
+            + len(matching_decisions)
+            + len(matching_inquiries)
+            + len(matching_monitors)
+            + len(graph_rows)
+        )
+        if total == 0:
+            lines.append(f"(no records found for domain '{d}')")
+            return "\n".join(lines)
+
+        _emit_domain_section(
+            lines, "Thoughts", matching_thoughts, lambda n: n.id, lambda n: n.content
+        )
+        _emit_domain_section(
+            lines, "Hypotheses", matching_hyps, lambda h: h.id, lambda h: h.statement
+        )
+        _emit_domain_section(
+            lines,
+            "Models",
+            matching_models,
+            lambda m: f"{m.record_id or m.model_name} [{m.model_name}]",
+            lambda m: m.problem,
+        )
+        _emit_domain_section(
+            lines, "Decisions", matching_decisions,
+            lambda d: d.decision_id, lambda d: d.statement,
+        )
+        _emit_domain_section(
+            lines, "Inquiries", matching_inquiries,
+            lambda i: i.inquiry_id, lambda i: i.question,
+        )
+        _emit_domain_section(
+            lines, "Monitors", matching_monitors,
+            lambda mo: mo.monitoring_id, lambda mo: mo.task,
+        )
+        if graph_rows:
+            lines.append("## Graph KnowledgeNodes")
+            for row in graph_rows[:30]:
+                name = row[0] if len(row) > 0 else ""
+                etype = row[1] if len(row) > 1 else ""
+                conf = row[2] if len(row) > 2 else ""
+                auth = row[3] if len(row) > 3 else ""
+                lines.append(
+                    f"  name={name} type={etype} conf={conf} auth={auth or 'unset'}"
+                )
+        return "\n".join(lines)
+
+    if action == "domain_connections":
+        if not domain or not domain.strip() or not domain_b or not domain_b.strip():
+            raise ValueError("domain_connections requires both domain and domain_b")
+        from aismartbuddy.tools.graph import _escape_cypher_string
+
+        d_a = domain.strip()
+        d_b = domain_b.strip()
+        think_session_id = info.session_id
+        if d_a == d_b:
+            return (
+                f"Session: {think_session_id}\n"
+                f"domain_connections({d_a}, {d_b}): same domain — "
+                "use domain_context instead\n"
+            )
+
+        lines = [
+            f"Session: {think_session_id}",
+            f"domain_connections: '{d_a}' <-> '{d_b}'",
+        ]
+
+        # Graph mode (if companion exists)
+        companion_id = _companion_graph_session_id(think_session_id)
+        if companion_id:
+            mgr2 = get_session_manager()
+            g_info = mgr2.resolve_backend_session(companion_id, "graph")
+            q = (
+                f"MATCH (a:KnowledgeNode)-[r]-(b:KnowledgeNode) "
+                f"WHERE a.domain = '{_escape_cypher_string(d_a)}' "
+                f"AND b.domain = '{_escape_cypher_string(d_b)}' "
+                f"RETURN a.name, label(r), b.name, r.weight LIMIT 20"
+            )
+            try:
+                _, rows = await run_with_lock(
+                    g_info, lambda: g_info.engine.execute(q)
+                )
+                if rows:
+                    lines.append("## Graph connections")
+                    for row in rows:
+                        a_name = row[0] if len(row) > 0 else ""
+                        rel = row[1] if len(row) > 1 else ""
+                        b_name = row[2] if len(row) > 2 else ""
+                        weight = row[3] if len(row) > 3 else ""
+                        lines.append(
+                            f"  {a_name} -[{rel} w={weight}]- {b_name}"
+                        )
+                else:
+                    lines.append("## Graph connections: (none)")
+            except Exception as exc:
+                logger.debug(
+                    "domain_connections graph query failed for %s/%s: %s",
+                    d_a,
+                    d_b,
+                    exc,
+                )
+                lines.append("## Graph connections: (error — see logs)")
+
+        # Think-side mode (always)
+        set_a: set[str] = set()
+        set_b: set[str] = set()
+        for n in engine.thought_nodes.values():
+            dom = n.metadata.get("domain")
+            refs = n.metadata.get("knowledge_refs", []) or []
+            if dom == d_a:
+                set_a.update(str(r) for r in refs)
+            elif dom == d_b:
+                set_b.update(str(r) for r in refs)
+        shared = sorted(set_a & set_b)
+        if shared:
+            lines.append("## Shared entities")
+            for entity in shared:
+                lines.append(f"  {entity}")
+        else:
+            lines.append("## Shared entities: (none)")
         return "\n".join(lines)
 
     if action == "bundle":
@@ -4191,38 +4512,45 @@ async def think_bridge(
             lines.append("## Think")
             lines.extend(think_lines)
         # graph section
-        for eid in entity_ids:
-            if confidence_min is not None:
-                companion_id = _companion_graph_session_id(think_session_id)
-                if companion_id:
-                    mgr2 = get_session_manager()
-                    g_info = mgr2.resolve_backend_session(companion_id, "graph")
+        companion_id = _companion_graph_session_id(think_session_id)
+        g_info = None
+        if companion_id:
+            mgr2 = get_session_manager()
+            g_info = mgr2.resolve_backend_session(companion_id, "graph")
+        if confidence_min is not None:
+            conf_val = float(confidence_min)
+            if g_info is not None:
+                graph_conf_lines: list[str] = []
+                for eid in entity_ids:
                     q = (
                         f"MATCH (n:KnowledgeNode) "
                         f"WHERE n.name = '{_escape_cypher_string(eid)}' "
-                        f"AND n.confidence >= {confidence_min} "
+                        f"AND n.confidence >= {conf_val} "
                         f"RETURN n.name, n.confidence, n.source, n.authority LIMIT 10"
                     )
                     try:
-                        cols, rows = await anyio.to_thread.run_sync(
-                            lambda q=q, g_info=g_info: g_info.engine.execute(q)
+                        _, rows = await run_with_lock(
+                            g_info, lambda q=q: g_info.engine.execute(q)
                         )
-                        if rows:
-                            lines.append(f"## Graph (confidence>={confidence_min})")
-                            for row in rows:
-                                lines.append(
-                                    f"  name={row[0]} conf={row[1]} src={row[2]} "
-                                    f"auth={row[3] or 'unset'}"
-                                )
-                    except Exception:
-                        pass
+                        for row in rows:
+                            graph_conf_lines.append(
+                                f"  name={row[0]} conf={row[1]} src={row[2]} "
+                                f"auth={row[3] or 'unset'}"
+                            )
+                    except Exception as exc:
+                        logger.debug("graph confidence query failed for %s: %s", eid, exc)
+                if graph_conf_lines:
+                    lines.append(f"## Graph (confidence>={conf_val})")
+                    lines.extend(graph_conf_lines)
             else:
-                graph_ctx = await _safe_graph_context_lines(
-                    think_session_id, entity_names=[eid]
-                )
-                if graph_ctx:
-                    lines.append(f"## Graph [{eid}]")
-                    lines.extend(graph_ctx)
+                lines.append("## Graph — confidence_min ignored (no graph backend in session)")
+        else:
+            graph_ctx = await _safe_graph_context_lines(
+                think_session_id, entity_names=entity_ids
+            )
+            if graph_ctx:
+                lines.append("## Graph")
+                lines.extend(graph_ctx)
         # SQL section
         if include_sql_tables:
             mgr3 = get_session_manager()

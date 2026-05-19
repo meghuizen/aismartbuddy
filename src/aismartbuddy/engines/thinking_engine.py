@@ -100,6 +100,7 @@ class ModelRecord:
     conclusion: str = ""
     record_id: str = ""
     refs: list[str] = field(default_factory=list)
+    domain: str = ""
     rule_bindings: list[dict] = field(default_factory=list)
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -121,6 +122,7 @@ class DecisionRecord:
     evaluations: list[dict] = field(default_factory=list)
     recommendation: str = ""
     refs: list[str] = field(default_factory=list)
+    domain: str = ""
     rule_bindings: list[dict] = field(default_factory=list)
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -179,6 +181,7 @@ class InquiryRecord:
     analysis: str = ""
     conclusion: str = ""
     refs: list[str] = field(default_factory=list)
+    domain: str = ""
     rule_bindings: list[dict] = field(default_factory=list)
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -202,6 +205,7 @@ class MonitorRecord:
     recommended_approach: str = ""
     suggested_assessments: list[str] = field(default_factory=list)
     refs: list[str] = field(default_factory=list)
+    domain: str = ""
     rule_bindings: list[dict] = field(default_factory=list)
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -855,6 +859,7 @@ class ThinkingEngine:
     def get_node_count(self) -> int:
         return len(self.thought_nodes)
 
+    @_synchronized
     def get_session_stats(self) -> dict:
         nodes = list(self.thought_nodes.values())
         all_refs = {r for n in nodes for r in n.refs}

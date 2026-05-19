@@ -107,6 +107,10 @@ async def score_rubric(
         severity_deductions: Score deduction per severity.
             Default: {critical: 3.0, high: 2.0, moderate: 1.0, low: 0.5}.
         pass_threshold: Score needed to pass. Default: 9.0.
+            Recommended values:
+            - 9.0 — production / clinical / high-stakes decisions
+            - 7.0 — exploratory / research / hypothesis-grade work
+            - 5.0 — rough draft / early ideation
         scale_min: Minimum score. Default: 1.
         scale_max: Maximum score. Default: 10.
         scoring_strategy: weighted_deduction (start at max, deduct

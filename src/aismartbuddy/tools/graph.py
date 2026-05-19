@@ -942,6 +942,7 @@ async def graph_knowledge_add(
     confidence: float = 1.0,
     source: str = "ai",
     authority: str | None = None,
+    domain: str | None = None,
     items: list[dict] | None = None,
     idempotency_key: str | None = None,
 ) -> str:
@@ -967,6 +968,9 @@ async def graph_knowledge_add(
         authority: Optional authority tier — one of
             ``ground_truth | primary | inferred | external``. Stored on the
             node so downstream tools can rank knowledge by trust level.
+        domain: Optional free-form domain tag (e.g. "metabolism",
+            "frontend"). Stored on the node and queryable via
+            ``think_bridge(action='domain_context', domain=...)``.
 
     Returns:
         Confirmation with node details.
@@ -1001,11 +1005,13 @@ async def graph_knowledge_add(
             f"got {authority!r}"
         )
     authority_val = authority or ""
+    domain_val = domain or ""
 
     safe_name = _escape_cypher_string(entity)
     safe_source = _escape_cypher_string(source)
     safe_type = _escape_cypher_string(entity_type)
     safe_authority = _escape_cypher_string(authority_val)
+    safe_domain = _escape_cypher_string(domain_val)
     desc = _escape_cypher_string(str(properties) if properties else "")
 
     from datetime import datetime, timezone
@@ -1020,7 +1026,8 @@ async def graph_knowledge_add(
                 "CREATE NODE TABLE IF NOT EXISTS KnowledgeNode ("
                 "id SERIAL PRIMARY KEY, name STRING, description STRING, "
                 "entity_type STRING, confidence DOUBLE, "
-                "source STRING, created_at STRING, authority STRING);"
+                "source STRING, created_at STRING, domain STRING, "
+                "authority STRING);"
             ),
         )
     except Exception:
@@ -1036,6 +1043,7 @@ async def graph_knowledge_add(
             f"confidence: {confidence}, "
             f"source: '{safe_source}', "
             f"created_at: '{ts}', "
+            f"domain: '{safe_domain}', "
             f"authority: '{safe_authority}'"
             f"}});"
         ),
@@ -1179,11 +1187,13 @@ async def knowledge_batch(
     Args:
         session_id: Session token from graph_create_session.
         nodes: List of node dicts. Each: {entity, entity_type?, confidence?,
-            properties?, source?, authority?}. entity is required;
+            properties?, source?, authority?, domain?}. entity is required;
             entity_type defaults to "concept", confidence to 1.0, source to "ai".
             Alias accepted: hypothesis -> question. entity_type is open-ended.
             authority (optional) must be one of
             ``ground_truth | primary | inferred | external`` when supplied.
+            domain (optional) is a free-form string tag used by
+            ``think_bridge(action='domain_context', ...)``.
         relations: List of relation dicts. Each: {from_name, to_name, relation,
             weight?, justification?, source?, domain?, directionality?,
             confidence_basis?}. relation is open-ended; documented defaults are
@@ -1239,7 +1249,8 @@ async def knowledge_batch(
                 "CREATE NODE TABLE IF NOT EXISTS KnowledgeNode ("
                 "id SERIAL PRIMARY KEY, name STRING, description STRING, "
                 "entity_type STRING, confidence DOUBLE, "
-                "source STRING, created_at STRING, authority STRING);"
+                "source STRING, created_at STRING, domain STRING, "
+                "authority STRING);"
             )
         except Exception:
             pass
@@ -1251,11 +1262,13 @@ async def knowledge_batch(
             src = _escape_cypher_string(n.get("source", "ai"))
             props = _escape_cypher_string(str(n["properties"]) if n.get("properties") else "")
             authority_val = _escape_cypher_string(n.get("authority") or "")
+            domain_val = _escape_cypher_string(str(n.get("domain", "")))
             info.engine.execute(
                 f"CREATE (n:KnowledgeNode {{"
                 f"name: '{entity}', description: '{props}', "
                 f"entity_type: '{etype}', confidence: {conf}, "
                 f"source: '{src}', created_at: '{ts}', "
+                f"domain: '{domain_val}', "
                 f"authority: '{authority_val}'"
                 f"}});"
             )

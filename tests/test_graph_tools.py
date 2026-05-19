@@ -251,3 +251,124 @@ class TestKnowledgeNodeAuthority:
                     {"entity": "X", "entity_type": "concept", "authority": "nope"},
                 ],
             )
+
+
+@pytest.mark.usefixtures("_init_session_manager")
+class TestKnowledgeNodeDomain:
+    """domain tag on KnowledgeNode persists via graph_knowledge_add/knowledge_batch."""
+
+    @pytest.mark.anyio
+    async def test_graph_knowledge_add_domain(self):
+        sid = await _create_graph_session()
+        await graph_knowledge_add(
+            session_id=sid,
+            entity="MetabolismNode",
+            entity_type="concept",
+            domain="metabolism",
+        )
+        result = await graph_query(
+            session_id=sid,
+            query=(
+                "MATCH (n:KnowledgeNode) WHERE n.name = 'MetabolismNode' "
+                "RETURN n.name, n.domain;"
+            ),
+        )
+        assert "metabolism" in result
+        assert "MetabolismNode" in result
+
+    @pytest.mark.anyio
+    async def test_knowledge_batch_domain_per_node(self):
+        sid = await _create_graph_session()
+        result = await knowledge_batch(
+            session_id=sid,
+            nodes=[
+                {"entity": "X_front", "entity_type": "concept", "domain": "frontend"},
+                {"entity": "Y_none", "entity_type": "concept"},
+            ],
+        )
+        assert "Nodes added: 2" in result
+        front = await graph_query(
+            session_id=sid,
+            query=(
+                "MATCH (n:KnowledgeNode) WHERE n.name = 'X_front' "
+                "RETURN n.domain;"
+            ),
+        )
+        assert "frontend" in front
+        none_dom = await graph_query(
+            session_id=sid,
+            query=(
+                "MATCH (n:KnowledgeNode) WHERE n.name = 'Y_none' "
+                "RETURN n.domain;"
+            ),
+        )
+        # Y_none has no domain → empty string, not "frontend"
+        assert "frontend" not in none_dom
+
+    @pytest.mark.anyio
+    async def test_domain_filter_returns_only_tagged(self):
+        sid = await _create_graph_session()
+        await knowledge_batch(
+            session_id=sid,
+            nodes=[
+                {"entity": "A_m", "entity_type": "concept", "domain": "metabolism"},
+                {"entity": "B_m", "entity_type": "concept", "domain": "metabolism"},
+                {"entity": "C_i", "entity_type": "concept", "domain": "inflammation"},
+                {"entity": "D_u", "entity_type": "concept"},
+            ],
+        )
+        result = await graph_query(
+            session_id=sid,
+            query=(
+                "MATCH (n:KnowledgeNode) WHERE n.domain = 'metabolism' "
+                "RETURN n.name ORDER BY n.name;"
+            ),
+        )
+        assert "A_m" in result
+        assert "B_m" in result
+        assert "C_i" not in result
+        assert "D_u" not in result
+
+    @pytest.mark.anyio
+    async def test_materialize_auto_graph_propagates_domain(self):
+        from aismartbuddy.tools.infra import session_create
+        from aismartbuddy.tools.think import think_model
+
+        r1 = await session_create(backends=["think", "graph"])
+        parent_sid = ""
+        for line in r1.split("\n"):
+            line = line.strip()
+            if line.startswith("session_id:"):
+                parent_sid = line[len("session_id:"):].strip()
+                break
+        assert parent_sid
+
+        await think_model(
+            model_name="first_principles",
+            session_id=parent_sid,
+            auto_graph=True,
+            items=[
+                {
+                    "id": "concept_metab_x",
+                    "problem": "P",
+                    "steps": ["s1"],
+                    "reasoning": "r",
+                    "conclusion": "c",
+                    "domain": "metabolism",
+                }
+            ],
+        )
+        # Now query the graph backend within the parent session.
+        from aismartbuddy.tools import get_session_manager
+
+        mgr = get_session_manager()
+        graph_info = mgr.resolve_backend_session(parent_sid, "graph")
+        result = await graph_query(
+            session_id=graph_info.session_id,
+            query=(
+                "MATCH (n:KnowledgeNode) WHERE n.name = 'concept_metab_x' "
+                "RETURN n.name, n.domain;"
+            ),
+        )
+        assert "metabolism" in result
+        assert "concept_metab_x" in result
