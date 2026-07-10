@@ -9,11 +9,11 @@ AISmartBuddy is a Python MCP server providing AI assistants with temporary SQL (
 ## Tech Stack
 
 - **Language:** Python 3.12+
-- **MCP SDK:** `mcp` (FastMCP) — official Python SDK
+- **MCP SDK:** `mcp==2.0.0b1` (`MCPServer`) — official Python SDK v2 beta
 - **SQL Engine:** DuckDB via `duckdb` package
-- **Graph Engine:** LadybugDB via `real-ladybug` package
+- **Graph Engine:** LadybugDB via the maintained `ladybug` package
 - **Data Pipeline:** Arrow (`pyarrow`) → Polars (`polars`) for query results. 10-100x faster than csv.writer.
-- **Transport:** stdio (default), SSE for remote
+- **Transport:** stdio (default), Streamable HTTP for remote, legacy SSE
 - **Package manager:** `uv` (preferred)
 - **Build backend:** hatchling
 
@@ -22,7 +22,7 @@ AISmartBuddy is a Python MCP server providing AI assistants with temporary SQL (
 ```bash
 uv sync                                  # Install dependencies
 uv run python -m aismartbuddy            # Run server (stdio)
-uv run python -m aismartbuddy --transport sse --port 8000  # Run server (SSE)
+uv run python -m aismartbuddy --transport streamable-http --port 8000
 uv run pytest -v                         # Run all tests
 uv run pytest tests/test_sql_tools.py::test_name -v  # Single test
 uv run pyright                           # Type check
@@ -33,7 +33,7 @@ uv run ruff format src/ tests/           # Format
 ## Architecture
 
 ```
-__main__.py (Click CLI) → server.py (FastMCP + lifespan + optional Entra auth)
+__main__.py (Click CLI) → server.py (MCPServer + lifespan + optional Entra auth)
   ├── identity.py (resolve_identity from ctx/params/env)
   ├── auth.py (optional EntraTokenVerifier — activated via env vars)
   ├── youtube_client.py (shared YoutubeDL + http session)
@@ -52,11 +52,11 @@ __main__.py (Click CLI) → server.py (FastMCP + lifespan + optional Entra auth)
       formatting.py (Arrow/Polars CSV + legacy csv.writer) ─┘
 ```
 
-- **server.py** — FastMCP instance with ~55 tools, 5 prompts, 2 resources. Lifespan manages SessionManager + YouTubeClient init/cleanup.
-- **identity.py** — Multi-tenant identity resolution. `resolve_identity(ctx, user_id, project_id)` returns validated `(user_id, project_id)` tuple using priority: ctx.client_id (Bearer auth) → tool parameter → RuntimeConfig default → literal "default". Path-component validation prevents filesystem traversal.
+- **server.py** — MCPServer v2 instance with 74 tools, prompts, and resources. Lifespan manages shared services and cleanup.
+- **identity.py** — Multi-tenant identity resolution. Verified MCP v2 bearer identity from `get_access_token()` wins over request metadata, tool parameters, and defaults. Path-component validation prevents filesystem traversal.
 - **youtube_client.py** — Shared `YouTubeClient` dataclass (requests.Session + YoutubeDL) plus `parse_video_id()` helper that accepts raw 11-char IDs, `watch?v=`, `youtu.be/`, `embed/`, and `shorts/` URLs. Module-level singleton initialized in `app_lifespan` (best-effort — failure does not block server startup; the tool checks for `None` at call time). YoutubeDL uses a no-op logger (to bypass `no_warnings` being overridden by custom loggers) and skips dash/hls format manifests for 2-3× faster metadata-only extraction.
 - **session.py** — Thread-safe SessionManager singleton (uses `threading.Lock`). Maps session_id → engine. Supports "sql", "graph", and "think" session types. Auto-cleans expired sessions and stale pagination cursors.
-- **tools/** — Async tool functions. Access SessionManager via `tools.get_session_manager()`. Wrap blocking engine calls with `anyio.to_thread.run_sync()`.
+- **tools/** — Async tool functions. Access SessionManager via `tools.get_session_manager()`. Wrap blocking engine calls with `concurrency.run_sync()` (a typed wrapper over `anyio.to_thread.run_sync`).
 - **engines/** — `BaseEngine` ABC with shared temp file handling, Arrow query path (`execute_arrow`), and cursor-based pagination (`execute_paged`, `fetch_next_page`). DuckDB and LadybugDB subclasses use `_require_conn()`. ThinkingEngine is in-memory (does not extend BaseEngine).
 - **formatting.py** — Token-optimized output. Primary path: Arrow Table → Polars DataFrame → `write_csv()`. Legacy path: tuple-based csv.writer (fallback for thinking tools). CSV default for SQL/graph (2-3x fewer tokens than JSON).
 
@@ -91,6 +91,8 @@ When a SCAFFOLD/ASSESS items[] call sets `auto_graph=True` AND the session has a
 2. **`session_create(backends=["think","graph"])`** — explicit unified session. Pass the returned `session_id` to all tools.
 3. **`session_create(auto_graph=True)`** — session-level policy: every items[] call in this session materialises to the graph automatically without per-call `auto_graph=True`.
 
+**Unified-session ID transparency.** When a parent session has multiple backends, ANY backend's child session_id is interchangeable when calling tools on a sibling backend. Example: `think_science(items=[...], auto_graph=True)` returns the think child's id; passing that same id to `knowledge_batch` or `graph_knowledge_infer` transparently routes to the graph sibling. `resolve_backend_session` walks up from a child to the parent and dispatches when the type doesn't match. Standalone (non-unified) sessions still raise the original "wrong backend" error — there is no silent misrouting when no parent exists. `think_get_session_links` surfaces the parent-child sibling relationship in addition to explicit cross-session links.
+
 **auto_graph-capable batch tools and their edge labels:**
 
 - `think_model(items=[...], auto_graph=True)` — `connects_to` → `DerivedFrom` edge
@@ -106,6 +108,32 @@ When a SCAFFOLD/ASSESS items[] call sets `auto_graph=True` AND the session has a
 
 The 4 single-record-action tools (`think_hypothesis`, `think_constraint`, `think_evidence`, `think_topology`) now accept `items=[...]` (or `*_ids=[...]` for invalidate/remove actions) on their existing actions — no new action names. Single-record args remain supported for backward-compat. Passing BOTH `items=[...]` AND single-record args in the same call raises a mutual-exclusion `ValueError`. PREFER items[] even for N=1 — it scales without added round-trips.
 
+### think_constraint: hard constraints require operationalization
+
+`think_constraint(action="register", items=[...])` now REJECTS `type="hard"` items that lack `operationalization: {method: str, ...}`. Soft constraints remain unconstrained. Include `operationalization.method` on every hard constraint — it forces the analyst to specify how the constraint is testable, not just that it exists.
+
+```python
+{"id": "CON_limit", "domain": "methodology", "type": "hard", "statement": "...",
+ "operationalization": {"method": "run CIBERSORT-absolute on count matrix", "priority": 1}}
+```
+
+### think_evidence: auto-chain on claim_id
+
+`think_evidence(action="register", items=[...])` now auto-creates an inductive `EvidenceChainRecord` (evidence → claim) when an item includes `claim_id`. Orphan evidence is structurally impossible if you supply `claim_id`. Return message reports `Auto-chained to claim: N items`. When `claim_id` is absent, the response prints a reminder tip.
+
+### think_science: structured falsifiability
+
+`hypothesis.falsifiability` now accepts a structured dict `{method: str, expected_if_false: str}` in addition to the legacy string (≥20 chars). The dict form is preferred — it forces an operationalized test protocol. Both fields are required in dict form.
+
+```python
+"falsifiability": {"method": "NLRX1 protein quantification in PBMCs",
+                   "expected_if_false": "Normal NLRX1 despite ISG suppression"}
+```
+
+### knowledge_batch: inference suggestion
+
+`knowledge_batch` return message now includes `Suggested next: graph_knowledge_infer(session_id=...)` when nodes > 0, prompting graph traversal for contradiction chains and indirect connections after bulk population.
+
 ### score_evaluate auto_finalize
 
 `score_evaluate(action="batch_findings", auto_finalize=True, summary=..., dimensions_reviewed=...)` collapses the 3-call `start_with_rubric → batch_findings → finalize` sequence into a single round-trip. Requires `summary` to be non-empty when `auto_finalize=True`.
@@ -120,18 +148,18 @@ The 4 single-record-action tools (`think_hypothesis`, `think_constraint`, `think
 - **`get_youtube_information(url_or_id, language="en", include_transcript=True, include_timestamps=True)`** — single-call tool returning title, description, available transcript languages, and the full timed transcript as Markdown. Accepts full URLs or raw 11-char video IDs. Results cached as lxml-built XML at `{OS_temp}/yt_{video_id}_{langcode}.xml` (OS handles cleanup). Cache version-stamped (`<video version="1">`); corrupt, vanished (TOCTOU), or older-version caches trigger silent refetch. `include_transcript=False` returns metadata only; `include_timestamps=False` strips `[MM:SS]` prefixes. Timestamps use `[MM:SS]` under 1 hour, `[H:MM:SS]` for longer videos.
 - **YouTube graceful degradation**: when transcript fetch fails (transcripts disabled, language not available, video still processing, rate limit, network blip) the tool returns a degraded response — full metadata + a structured `## Transcript` block containing a stable category code (`TRANSCRIPTS_DISABLED`, `TRANSCRIPT_LANGUAGE_NOT_AVAILABLE`, `TRANSCRIPT_TEMPORARILY_UNAVAILABLE`, `TRANSCRIPT_RATE_LIMITED`, `TRANSCRIPT_NETWORK_ERROR`, `TRANSCRIPT_UNKNOWN_ERROR`), the upstream reason, and an actionable hint. Header reads `cache=miss-degraded`. **Caching policy: only fully successful fetches are persisted** — degraded responses are never cached, so a subsequent call always re-attempts. Only metadata-fetch failure (yt-dlp itself failing) is terminal and raises `ValueError`.
 - **Annotation preset `_READONLY_OPEN`** (in `server.py`): for read-only tools that interact with EXTERNAL services (network calls). Sets `openWorldHint: True` per MCP spec so hosts know not to silently auto-approve. Used for `get_youtube_information`. The four presets are: `_DEFAULT` (closed-world, mutating), `_READONLY` (closed-world, idempotent), `_READONLY_OPEN` (open-world, idempotent — net calls), `_DESTRUCTIVE` (closed-world, destructive).
+- `sequentialthinking` is the **low-friction entry point** — a deliberately loose mirror of clear-thought's tool so an AI reaches for it by reflex. Single `thought` string, or `thoughts=[...]` (each entry = one separate node, chained in order); no required structure, auto-creates a unified think+graph session. It delegates to `think_graph` underneath (so everything logged stays queryable by `think_graph`/`think_bridge`/`think_refs_query`) and acts as a **gateway**: once the session crosses ~5 nodes or the caller sets `next_thought_needed=False`, the response nudges toward `think_model` (scaffold) / `think_monitor` (assess). The forcing functions are deferred, not gated — win the first call without losing structure.
 - `think_graph` is the primary ELABORATE tool — sequential chains, hierarchical decomposition (with `children=[...]` batch + optional `min_children`), revision, synthesis, delegation. Encourage SHORT thoughts (1-3 sentences) — branch instead of writing essays. Description says: "If a thought is becoming an essay, use action='branch' and split into children. Long stories collapse to noise."
 - `think_model` is the primary SCAFFOLD tool. 16 models: first_principles, opportunity_cost, error_propagation, rubber_duck, pareto_principle, assumptions_xray, fishbone, value_of_info, swot, pre_mortem, design_review, complexity, root_cause, **kuba** (Know/Understand/Believe/Act progression — find the bottleneck stage), **systems_dynamics** (reinforcing/balancing loops, delays, leverage points), **inversion** (guaranteed-failure analysis first — work backward from disaster). Use pre_mortem before implementing, design_review before finalizing, root_cause for debugging, inversion when stuck in consensus thinking, systems_dynamics for feedback-heavy domains. **Strongly prefer the `items=[...]` form at analysis start** — it forces per-item structure (id/problem/steps/reasoning/conclusion) and unlocks `auto_graph`.
 - All record types (ThoughtNode, HolonNode, EvaluationRecord) support `refs: list[str]`. The `think_refs_query(entity_id)` tool finds records that reference an id — use to compose across tool calls structurally rather than via text search.
 - `holon_*` tools model domains holonically — entities that are simultaneously wholes and parts. Multi-membership: holons participate in multiple holarchies. Bridge finds paths between distant holons across holarchies. Propagation leaves structural traces (stale projections).
 - Thinking tools (`think_*`) auto-create sessions on first call when `session_id` is omitted. Auto-created sessions are parent sessions with **both `think` and `graph` backends**, so `auto_graph=True` works without any prior `session_create` call. Return compact text (not JSON) for token efficiency.
 - SQL import supports 6 formats: csv, tsv, txt (custom delimiter), json, jsonl, parquet (base64). Plus batch import via `sql_import_batch`.
-- Knowledge graph tools (`graph_knowledge_*`) layer semantic patterns: confidence scores, provenance, typed relations (supports/contradicts/etc.), inference (contradictions, gaps, chains, clusters). `graph_knowledge_add` and `knowledge_batch` accept `authority: "ground_truth" | "primary" | "inferred" | "external"` AND `domain: str` (free-form tag) on each node — omit either for `""` (unset). Use `think_bridge(action="authoritative_source", entity_name=...)` to rank nodes by authority, and `think_bridge(action="domain_context", domain=...)` to roll up everything tagged with a domain.
-- `think_bridge` has **10 actions**: `thoughts_for_entity`, `entities_for_thought`, `hypotheses_for_entity`, `evidence_for_hypothesis`, `constraints_for_hypothesis`, `full_context`, `bundle`, `authoritative_source`, `domain_context(domain)`, `domain_connections(domain, domain_b)`. `thoughts_for_entity` falls back to substring search on ThoughtNode content (prefix `(text match) `) when no metadata.knowledge_refs match.
+- Knowledge graph tools (`graph_knowledge_*`) layer semantic patterns: confidence scores, provenance, typed relations (supports/contradicts/etc.), inference (contradictions, gaps, chains, clusters). `graph_knowledge_add` and `knowledge_batch` accept `authority: "ground_truth" | "primary" | "inferred" | "external"` AND `domain: str` (free-form tag) on each node — omit either for `""` (unset). Use `think_bridge(action="authoritative_source", entity_name=...)` to rank nodes by authority, and `think_bridge(action="domain_context", domain=...)` to roll up everything tagged with a domain.- `think_bridge` has **10 actions**: `thoughts_for_entity`, `entities_for_thought`, `hypotheses_for_entity`, `evidence_for_hypothesis`, `constraints_for_hypothesis`, `full_context`, `bundle`, `authoritative_source`, `domain_context(domain)`, `domain_connections(domain, domain_b)`. `thoughts_for_entity` falls back to substring search on ThoughtNode content (prefix `(text match) `) when no metadata.knowledge_refs match.
 - **Domain grouping & entity registration on think records**: `think_graph(thoughts=[...])` items accept `entity_refs: list[str]` (merged into `metadata.knowledge_refs` so `thoughts_for_entity` finds them) and `domain: str` (written to `metadata.domain`). items[] forms of `think_model`, `think_decide`, `think_science`, `think_monitor` accept `domain: str` and write it to the record's `domain` field. When `auto_graph=True`, the materialised KnowledgeNode carries the item's `domain` automatically.
 - **Data flow (SQL/graph):** `engine.execute_arrow(query)` → `pyarrow.Table` → `polars.from_arrow()` → `df.write_csv()` → str. Falls back to tuple-based `execute()` + `csv.writer` if Arrow unavailable.
 - **Pagination:** `sql_query`/`graph_query` accept `offset`/`limit` (random access) and `paginate=True` (cursor-based). Cursor paging uses DuckDB's `to_arrow_reader()` for streaming without full materialization. Use `sql_query_next`/`graph_query_next` for subsequent pages.
-- All database operations are blocking C calls wrapped in `anyio.to_thread.run_sync()` for async safety.
+- All database operations are blocking C calls dispatched to a worker thread via `concurrency.run_sync()` (a typed wrapper over `anyio.to_thread.run_sync`) for async safety.
 - Sessions use UUID-keyed temp directories cleaned up on destroy, timeout, or server shutdown. Orphaned dirs from failed `connect()` are auto-cleaned.
 - SessionManager is thread-safe (`threading.Lock` guards all `_sessions` mutations). Periodic cleanup runs on worker thread (with error handling to prevent silent death).
 - **Engine tuning:** DuckDB accepts `threads` and `memory_limit` config. LadybugDB accepts `buffer_pool_size` and `max_num_threads`. Configurable via CLI flags or `AISMARTBUDDY_*` environment variables.
@@ -141,8 +169,8 @@ The 4 single-record-action tools (`think_hypothesis`, `think_constraint`, `think
 
 Sessions are bound to **(user_id, project_id)** at creation. This supports multiple users, multiple projects per user, and multiple sessions/agents per (user, project) — all isolated from each other on the backend:
 
-- **Identity resolution** (in `identity.py`): `user_id` comes from `ctx.client_id` when MCP Bearer auth is configured (priority 1), otherwise from explicit tool parameter (priority 2), otherwise from `--default-user-id` / `AISMARTBUDDY_DEFAULT_USER_ID` config (priority 3), otherwise literal `"default"`. `project_id` follows the same fallback chain without the Bearer-token path.
-- **Session ID entropy:** 128 bits (`uuid.uuid4().hex`, 32 hex chars) — session_id acts as a capability token. Possession equals authorization in the default case; under Bearer auth the ownership check also validates `session.user_id == ctx.client_id`.
+- **Identity resolution** (in `identity.py`): verified MCP v2 bearer identity from `get_access_token()` wins, followed by request metadata, explicit tool parameter, configured default, then `"default"`.
+- **Session ID entropy:** 128 bits (`uuid.uuid4().hex`, 32 hex chars) — session_id acts as a capability token. Under Bearer auth ownership is validated against the verified access-token principal.
 - **Temp layout:** `{temp_dir}/aismartbuddy/{user_id}/{project_id}/{session_id}/` — disk hierarchy mirrors logical hierarchy.
 - **Per-session lock:** each `SessionInfo` carries a `threading.Lock`. SQL/graph tools acquire it via `run_with_lock(info, fn)` (in `tools/__init__.py`) so two agents sharing a session serialize rather than corrupt engine state.
 - **ThinkingEngine thread safety (three layered patterns):**
@@ -170,16 +198,16 @@ export AISMARTBUDDY_ENTRA_AUDIENCE="api://<app-id-uri>"
 # Optional:
 export AISMARTBUDDY_ENTRA_REQUIRED_SCOPE="mcp.invoke"
 export AISMARTBUDDY_ENTRA_RESOURCE_SERVER_URL="https://your-host/"
-uvx --from git+https://github.com/meghuizen/aismartbuddy aismartbuddy --transport sse
+uvx --from git+https://github.com/meghuizen/aismartbuddy aismartbuddy --transport streamable-http
 ```
 
-When activated, `server.py:_maybe_build_entra_auth` constructs the verifier + `AuthSettings` and passes them to `FastMCP(...)`. `ctx.client_id` in tool calls becomes the Entra `oid` claim — automatically picked up by `identity.py:resolve_identity` so every session is bound to the authenticated principal. Without these env vars, the server starts unauthenticated (current default behaviour).
+When activated, `server.py:_maybe_build_entra_auth` constructs the verifier + `AuthSettings` and passes them to `MCPServer(...)`. `identity.py` reads the verified Entra `oid` from MCP v2's bearer auth context, so every session is bound to the authenticated principal. Without these env vars, the server starts unauthenticated.
 
 If only one of the two required env vars is set, the server logs a warning and runs without auth (fail-open by design — partial config is treated as "not configured"). If `[entra]` extras aren't installed but the env vars are set, the server exits with a clear "install aismartbuddy[entra]" message (fail-closed for security).
 
 ### 2. Generic Bearer token (write your own verifier)
 
-For non-Entra OAuth issuers, implement your own `TokenVerifier` subclass and pass it to `FastMCP(...)` like the Entra path does. The pattern in `auth.py` (JWKS fetch + cache + RS256 verify) is reusable.
+For non-Entra OAuth issuers, implement your own `TokenVerifier` subclass and pass it to `MCPServer(...)` like the Entra path does. The pattern in `auth.py` is reusable.
 
 ```python
 from mcp.server.auth.provider import TokenVerifier
@@ -194,7 +222,7 @@ class MyVerifier(TokenVerifier):
 
 `server.py:_maybe_build_entra_auth` shows the wiring pattern for any custom verifier (read RuntimeConfig, lazy-import the verifier class, return `(verifier, AuthSettings)` tuple). Replace `EntraTokenVerifier` with your own.
 
-When configured, `ctx.client_id` becomes the authoritative `user_id` — tool-level `user_id` parameters are ignored to prevent claim spoofing. Without configuration, `user_id` is taken from the tool parameter or the configured default, which is appropriate for single-tenant stdio use.
+When configured, `get_access_token().client_id` becomes the authoritative `user_id` — tool-level parameters and request metadata cannot spoof it. Without configuration, `user_id` comes from request metadata, the tool parameter, or the configured default.
 
 ## MCP Integration
 

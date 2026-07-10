@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from aismartbuddy.engines.thinking_engine import ReasoningProgress, ThinkingEngine
+from aismartbuddy.framework_catalog import framework_catalog
+from aismartbuddy.tools import get_session_manager
+
 # Weighted keyword sets for database recommendation
 _GRAPH_INDICATORS = {
     "relationship": 3,
@@ -160,6 +164,67 @@ async def suggest_database(use_case: str) -> str:
             "- Relationships between entities, paths, networks, hierarchies\n\n"
             "You can also create both and use each for what it does best."
         )
+
+
+async def suggest_reasoning(
+    task: str,
+    session_id: str | None = None,
+    intent: str = "auto",
+    depth: str = "standard",
+    constraints: list[str] | None = None,
+    available_sources: list[str] | None = None,
+) -> str:
+    """Select and optionally store an ordered route through existing reasoning tools."""
+
+    clean_constraints = [str(value).strip() for value in constraints or [] if str(value).strip()]
+    clean_sources = [str(value).strip() for value in available_sources or [] if str(value).strip()]
+    route = framework_catalog.recommend(task, intent=intent, depth=depth)
+
+    stored_session = ""
+    if session_id:
+        info = get_session_manager().resolve_backend_session(session_id, "think")
+        engine = info.engine
+        if not isinstance(engine, ThinkingEngine):
+            raise ValueError(f"Session '{session_id}' has no thinking backend")
+        progress = ReasoningProgress(
+            task=task.strip(),
+            intent=route.intent,
+            depth=route.depth,
+            frameworks=list(route.frameworks),
+            steps=[
+                {"phase": step.phase, "tool": step.tool, "purpose": step.purpose}
+                for step in route.steps
+            ],
+            constraints=clean_constraints,
+            available_sources=clean_sources,
+        )
+        engine.set_reasoning_progress(progress)
+        stored_session = session_id
+
+    lines = [
+        f"Intent: {route.intent} | Depth: {route.depth} | Confidence: {route.confidence:.2f}",
+        f"Entry tool: {route.steps[0].tool}",
+        f"Expected calls: {len(route.steps)}",
+        f"Frameworks: {', '.join(route.frameworks) or '(none)'}",
+        f"Why: {route.rationale}",
+        "",
+        "Route:",
+    ]
+    for index, step in enumerate(route.steps, start=1):
+        lines.append(f"{index}. [{step.phase}] {step.tool} — {step.purpose}")
+    lines.extend(["", "Completion gates:"])
+    lines.extend(f"- {criterion}" for criterion in route.completion_criteria)
+    if route.alternatives:
+        lines.extend(["", f"Alternatives: {', '.join(route.alternatives)}"])
+    if clean_constraints:
+        lines.append(f"Constraints retained: {len(clean_constraints)}")
+    if clean_sources:
+        lines.append(f"Available sources retained: {len(clean_sources)}")
+    if stored_session:
+        lines.append(
+            f"Stored in session: {stored_session} | next_tool: {route.steps[0].tool}"
+        )
+    return "\n".join(lines)
 
 
 def _top_matches(text: str, indicators: dict[str, int]) -> str:

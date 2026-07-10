@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import logging
 
+import ladybug as lb
 import pyarrow as pa
-import real_ladybug as lb
 
 from aismartbuddy.engines import BaseEngine, tuples_to_arrow
 
@@ -40,7 +40,7 @@ class LadybugEngine(BaseEngine):
         try:
             self._db = lb.Database(**db_kwargs)
         except TypeError:
-            # Fallback if real-ladybug version doesn't accept these kwargs
+            # Compatibility fallback for LadybugDB builds without tuning kwargs.
             self._db = lb.Database(self._db_path)
             logger.debug("LadybugDB Database() does not accept buffer/thread config")
 
@@ -64,19 +64,31 @@ class LadybugEngine(BaseEngine):
             raise RuntimeError("Not connected")
         return self._conn
 
-    def _extract_result(self, result: object) -> object | None:
+    def _extract_result(
+        self,
+        result: lb.QueryResult | list[lb.QueryResult],
+    ) -> lb.QueryResult | None:
         """Normalize LadybugDB result (handles list for multi-statement queries)."""
         if isinstance(result, list):
             return result[-1] if result else None
         return result
 
-    def execute(self, cypher: str) -> tuple[list[str], list[tuple]]:
+    @staticmethod
+    def _next_row(result: lb.QueryResult, columns: list[str] | None = None) -> tuple:
+        """Normalize LadybugDB's list/dict row representations to a tuple."""
+        row = result.get_next()
+        if isinstance(row, dict):
+            names = columns or result.get_column_names()
+            return tuple(row.get(name) for name in names)
+        return tuple(row)
+
+    def execute(self, query: str) -> tuple[list[str], list[tuple]]:
         """Execute a Cypher query and return (columns, rows).
 
         For mutations without result sets, returns ([], []).
         """
         conn = self._require_conn()
-        raw = conn.execute(cypher)
+        raw = conn.execute(query)
         result = self._extract_result(raw)
         if result is None:
             return [], []
@@ -90,26 +102,28 @@ class LadybugEngine(BaseEngine):
         rows: list[tuple] = []
         count = 0
         while result.has_next() and count < self._max_rows:
-            rows.append(tuple(result.get_next()))
+            rows.append(self._next_row(result, columns))
             count += 1
 
         return columns, rows
 
-    def execute_arrow(self, cypher: str) -> pa.Table | None:
+    def execute_arrow(self, query: str) -> pa.Table | None:
         """Execute a Cypher query and return results as an Arrow Table.
 
         Returns None for DDL/DML that produces no result set.
         Uses LadybugDB's native get_as_arrow(), sliced to max_rows to prevent OOM.
         """
         conn = self._require_conn()
-        raw = conn.execute(cypher)
+        raw = conn.execute(query)
         result = self._extract_result(raw)
         if result is None:
             return None
 
         try:
+            if not result.get_column_names():
+                return None
             table = result.get_as_arrow()
-        except (AttributeError, RuntimeError):
+        except (AttributeError, RuntimeError, ZeroDivisionError):
             return None
         if table.num_rows > self._max_rows:
             table = table.slice(0, self._max_rows)
@@ -151,7 +165,7 @@ class LadybugEngine(BaseEngine):
 
         rows: list[tuple] = []
         while result.has_next() and len(rows) < remaining_limit:
-            rows.append(tuple(result.get_next()))
+            rows.append(self._next_row(result, columns))
 
         has_more = result.has_next()
         return tuples_to_arrow(columns, rows), has_more
@@ -214,7 +228,7 @@ class LadybugEngine(BaseEngine):
             if isinstance(result, list):
                 result = result[-1] if result else None
             if result and result.has_next():
-                return result.get_next()[0]
+                return self._next_row(result)[0]
             return 0
         finally:
             self._safe_unlink(tmp_path)
@@ -235,7 +249,7 @@ class LadybugEngine(BaseEngine):
 
         rows: list[tuple] = []
         while result.has_next():
-            rows.append(tuple(result.get_next()))
+            rows.append(self._next_row(result, columns))
 
         return columns, rows
 
@@ -273,7 +287,7 @@ class LadybugEngine(BaseEngine):
                     if isinstance(count_result, list):
                         count_result = count_result[-1] if count_result else None
                     if count_result and count_result.has_next():
-                        node_tables[table_name] = count_result.get_next()[0]
+                        node_tables[table_name] = self._next_row(count_result)[0]
                 elif "REL" in table_type.upper() or "rel" in table_type.lower():
                     count_result = conn.execute(
                         f"MATCH ()-[r:{table_name}]->() RETURN count(r);"
@@ -281,7 +295,7 @@ class LadybugEngine(BaseEngine):
                     if isinstance(count_result, list):
                         count_result = count_result[-1] if count_result else None
                     if count_result and count_result.has_next():
-                        rel_tables[table_name] = count_result.get_next()[0]
+                        rel_tables[table_name] = self._next_row(count_result)[0]
             except Exception:
                 logger.warning("Could not count table %s", table_name, exc_info=True)
 

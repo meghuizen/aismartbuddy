@@ -1,7 +1,7 @@
 """AISmartBuddy tool modules.
 
 Helpers here implement the multi-tenant execution contract:
-- Every engine call is dispatched via anyio.to_thread.run_sync (async safety).
+- Every engine call is dispatched via run_sync (async safety).
 - Inside that thread, we acquire info.lock to serialize concurrent tool calls
   that share the same session (multi-agent safety).
 - Two-session tools (graph_compare, graph_cross_reference) make sequential
@@ -17,10 +17,13 @@ from __future__ import annotations
 
 import functools
 import logging
+import re
 from typing import TYPE_CHECKING, Any, Callable, TypeVar
 
 import anyio
 
+from aismartbuddy.concurrency import run_sync
+from aismartbuddy.engines.thinking_engine import ThinkingEngine
 from aismartbuddy.formatting import format_arrow_result, format_result
 
 if TYPE_CHECKING:
@@ -55,6 +58,14 @@ def size_guarded(fn: Callable[..., Any]) -> Callable[..., Any]:
         result = await fn(*args, **kwargs)
         if not isinstance(result, str):
             return result
+        requested_chars = kwargs.get("max_chars")
+        if (
+            isinstance(requested_chars, int)
+            and requested_chars > 0
+            and len(result) > requested_chars
+        ):
+            suffix = "\n\n[Output truncated. Narrow the query or request another page.]"
+            return result[: max(0, requested_chars - len(suffix))] + suffix
         size_bytes = len(result.encode("utf-8"))
         tool_name = getattr(fn, "__name__", "?")
         if size_bytes > _SIZE_TRUNCATE_BYTES:
@@ -100,6 +111,35 @@ def get_session_manager() -> SessionManager:
     return session_manager
 
 
+def track_reasoning_progress(tool_name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Mark a successful reasoning tool call on the session's selected route."""
+
+    def decorate(fn: Callable[..., Any]) -> Callable[..., Any]:
+        @functools.wraps(fn)
+        async def wrapper(*args: Any, **kwargs: Any) -> Any:
+            result = await fn(*args, **kwargs)
+            if not isinstance(result, str):
+                return result
+            match = re.search(r"(?:Session|session_id):\s*([A-Za-z0-9_-]+)", result)
+            candidate = match.group(1) if match else kwargs.get("session_id")
+            if not candidate:
+                return result
+            try:
+                info = get_session_manager().resolve_backend_session(str(candidate), "think")
+                engine = info.engine
+                if isinstance(engine, ThinkingEngine):
+                    engine.record_reasoning_tool(tool_name)
+            except (RuntimeError, ValueError):
+                # Tracking is advisory and must never turn a successful tool
+                # operation into a failure.
+                _logger.debug("Could not record reasoning progress for %s", tool_name)
+            return result
+
+        return wrapper
+
+    return decorate
+
+
 def resolve_backend_session(session_id: str, backend: str):  # SessionInfo
     """Resolve session_id (parent OR direct child) to backend SessionInfo.
 
@@ -120,18 +160,20 @@ def resolve_active_or_provided_session_id(session_id: str | None) -> str | None:
 def effective_session_id(session_id: str | None, info: SessionInfo) -> str | None:
     """Return the effective parent_id for auto_graph materialisation.
 
-    When session_id was explicit, return it (parent_id or child — both work
-    with resolve_backend_session). When omitted (auto-create path), walk up to
-    the parent so materialize_auto_graph can find the graph backend sibling.
+    Always walks up from info.session_id to the parent when one exists, so
+    materialize_auto_graph can resolve the graph backend sibling regardless of
+    whether the caller passed the parent_id, a child id, or omitted session_id.
+    If info.session_id has no parent, returns the explicit session_id (which
+    must then already be a parent_id), or None.
     """
-    if session_id:
-        return session_id
     mgr = get_session_manager()
     parent = mgr.find_parent_for_child(info.session_id)
-    return parent.parent_id if parent is not None else None
+    if parent is not None:
+        return parent.parent_id
+    return session_id
 
 
-def resolve_auto_graph(per_call: bool, info: SessionInfo, session_id: str | None) -> bool:
+def resolve_auto_graph(per_call: bool, info: SessionInfo) -> bool:
     """Determine whether auto_graph materialisation should run.
 
     Per-call flag takes priority. When False, checks the ParentSession.auto_graph
@@ -142,11 +184,6 @@ def resolve_auto_graph(per_call: bool, info: SessionInfo, session_id: str | None
         return True
     mgr = get_session_manager()
     parent = mgr.find_parent_for_child(info.session_id)
-    if parent is None and session_id:
-        try:
-            parent = mgr.get_parent_session(session_id)
-        except ValueError:
-            pass
     return parent.auto_graph if parent is not None else False
 
 
@@ -221,6 +258,25 @@ def collect_item_refs(item: dict) -> list[str]:
     return list(seen.keys())
 
 
+class AutoGraphResult(int):
+    """Node count with truthful edge creation and skip metadata."""
+
+    edges_created: int
+    edges_skipped: int
+
+    def __new__(cls, nodes_created: int, edges_created: int, edges_skipped: int):
+        value = int.__new__(cls, nodes_created)
+        value.edges_created = edges_created
+        value.edges_skipped = edges_skipped
+        return value
+
+    def __str__(self) -> str:
+        return (
+            f"{int(self)} | graph edges created: {self.edges_created} "
+            f"| skipped refs: {self.edges_skipped}"
+        )
+
+
 async def materialize_auto_graph(
     parent_session_id: str,
     items: list[dict],
@@ -231,7 +287,7 @@ async def materialize_auto_graph(
     edge_label: str = "DerivedFrom",
     ref_field: str = "connects_to",
     ref_resolver: Callable[[Any], str | None] | None = None,
-) -> int:
+) -> AutoGraphResult:
     """Materialise items[] outputs as KnowledgeNode rows + outgoing edges.
 
     Requires the parent session (resolved via resolve_backend_session) to
@@ -272,7 +328,7 @@ async def materialize_auto_graph(
 
     auto_graph_logger = logging.getLogger("aismartbuddy.auto_graph")
 
-    def _do() -> int:
+    def _do() -> AutoGraphResult:
         with graph_info.lock:
             try:
                 graph_info.engine.execute(
@@ -314,6 +370,8 @@ async def materialize_auto_graph(
                 )
                 n += 1
 
+            edges_created = 0
+            edges_skipped = 0
             for item in items:
                 src_id = escape_cypher_string(item["id"])
                 for ref in item.get(ref_field) or []:
@@ -323,9 +381,21 @@ async def materialize_auto_graph(
                     else:
                         target_value = str(ref)
                     if not target_value:
+                        edges_skipped += 1
                         continue
                     tgt = escape_cypher_string(target_value)
                     try:
+                        _, source_rows = graph_info.engine.execute(
+                            f"MATCH (a:KnowledgeNode {{name: '{src_id}'}}) RETURN count(a);"
+                        )
+                        _, target_rows = graph_info.engine.execute(
+                            f"MATCH (b:KnowledgeNode {{name: '{tgt}'}}) RETURN count(b);"
+                        )
+                        source_count = int(source_rows[0][0]) if source_rows else 0
+                        target_count = int(target_rows[0][0]) if target_rows else 0
+                        if source_count == 0 or target_count == 0:
+                            edges_skipped += 1
+                            continue
                         graph_info.engine.execute(
                             f"MATCH (a:KnowledgeNode {{name: '{src_id}'}}), "
                             f"(b:KnowledgeNode {{name: '{tgt}'}}) "
@@ -334,14 +404,15 @@ async def materialize_auto_graph(
                             f"source: '{escape_cypher_string(source_tag)}', "
                             f"created_at: '{ts}'}}]->(b);"
                         )
-                    except Exception:
-                        # Edge target may not exist if the ref points to
-                        # an external entity — silently skip rather than fail
-                        # the whole materialisation.
-                        pass
-            return n
+                        edges_created += source_count * target_count
+                    except Exception as exc:
+                        edges_skipped += 1
+                        auto_graph_logger.debug(
+                            "Skipped auto_graph edge %s -> %s: %s", src_id, tgt, exc
+                        )
+            return AutoGraphResult(n, edges_created, edges_skipped)
 
-    return await anyio.to_thread.run_sync(_do)
+    return await run_sync(_do)
 
 
 async def run_with_lock(
@@ -364,7 +435,7 @@ async def run_with_lock(
         with info.lock:
             return sync_fn()
 
-    return await anyio.to_thread.run_sync(
+    return await run_sync(
         _locked,
         abandon_on_cancel=abandon_on_cancel,
     )
@@ -409,6 +480,7 @@ async def execute_and_format(
     if not abandon:
         return await _run()
 
+    assert timeout_ms is not None  # abandon is True only when timeout_ms > 0
     try:
         with anyio.fail_after(timeout_ms / 1000.0):
             return await _run()

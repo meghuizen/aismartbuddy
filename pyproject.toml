@@ -6,9 +6,10 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
 dependencies = [
-    "mcp>=1.9.4",
-    "duckdb>=1.5.1",
-    "real-ladybug>=0.15.3",
+    # MCP v2 is pre-release: pin exactly until the stable API ships.
+    "mcp==2.0.0b1",
+    "duckdb>=1.5.4",
+    "ladybug>=0.18.1",
     "polars>=1.0",
     "pyarrow>=17.0",
     "tabulate>=0.9.0",
@@ -20,6 +21,10 @@ dependencies = [
     "lxml>=6.0.4",
     "yt-dlp>=2026.3.17",
     "youtube-transcript-api>=1.2.4",
+    # Rust-backed HTTP/HTML-to-Markdown crawler with optional native browser fallback.
+    "crawlberg>=1.0.5,<2",
+    # Shared async HTTP/2 client for provider adapters and X oEmbed.
+    "httpx[http2]>=0.27",
     # Used directly in youtube_client.py for the shared requests.Session;
     # arrives transitively from youtube-transcript-api but we pin it
     # explicitly so a future upstream switch (e.g. to httpx) doesn't break us.
@@ -41,8 +46,6 @@ dev = [
 # vars cause a clear startup error pointing here.
 entra = [
     "pyjwt[crypto]>=2.9",
-    # httpx is already a transitive dep via mcp; pinned here for clarity.
-    "httpx>=0.27",
 ]
 
 [project.scripts]
@@ -54,6 +57,9 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/aismartbuddy"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"thinking-frameworks" = "aismartbuddy/thinking-frameworks"
 
 [tool.ruff]
 line-length = 100

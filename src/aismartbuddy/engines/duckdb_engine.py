@@ -37,7 +37,7 @@ class DuckDBEngine(BaseEngine):
 
     def connect(self) -> None:
         """Open a DuckDB connection to the database file."""
-        config: dict[str, str | int] = {}
+        config: dict[str, str | bool | int | float | list[str]] = {}
         if self._threads > 0:
             config["threads"] = self._threads
         if self._memory_limit:
@@ -58,13 +58,13 @@ class DuckDBEngine(BaseEngine):
             raise RuntimeError("Not connected")
         return self._conn
 
-    def execute(self, sql: str) -> tuple[list[str], list[tuple]]:
+    def execute(self, query: str) -> tuple[list[str], list[tuple]]:
         """Execute a SQL statement and return (columns, rows).
 
         For DDL/DML without result sets, returns ([], []).
         """
         conn = self._require_conn()
-        result = conn.execute(sql)
+        result = conn.execute(query)
 
         if result.description is None:
             return [], []
@@ -73,14 +73,14 @@ class DuckDBEngine(BaseEngine):
         rows = result.fetchmany(self._max_rows)
         return columns, [tuple(row) for row in rows]
 
-    def execute_arrow(self, sql: str) -> pa.Table | None:
+    def execute_arrow(self, query: str) -> pa.Table | None:
         """Execute a SQL statement and return results as an Arrow Table.
 
         Returns None for DDL/DML that produces no result set.
         Uses DuckDB's native to_arrow_table(), sliced to max_rows to prevent OOM.
         """
         conn = self._require_conn()
-        result = conn.execute(sql)
+        result = conn.execute(query)
 
         if result.description is None:
             return None
@@ -288,15 +288,13 @@ class DuckDBEngine(BaseEngine):
                     f"SELECT * FROM {read_func}"
                 )
             else:
-                before = conn.execute(
-                    f"SELECT count(*) FROM {table_name}"
-                ).fetchone()[0]
+                before_row = conn.execute(f"SELECT count(*) FROM {table_name}").fetchone()
+                before = before_row[0] if before_row else 0
                 conn.execute(
                     f"INSERT INTO {table_name} SELECT * FROM {read_func}"
                 )
-                after = conn.execute(
-                    f"SELECT count(*) FROM {table_name}"
-                ).fetchone()[0]
+                after_row = conn.execute(f"SELECT count(*) FROM {table_name}").fetchone()
+                after = after_row[0] if after_row else 0
                 return after - before
 
             row = conn.execute(

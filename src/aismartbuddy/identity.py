@@ -1,7 +1,7 @@
 """Multi-tenant identity resolution.
 
 Resolves (user_id, project_id) for each MCP tool call from:
-1. ctx.client_id from Bearer token (if MCP auth configured) — highest priority
+1. MCP v2 bearer-token auth context — highest priority
 2. Explicit tool parameter — used when no auth context
 3. RuntimeConfig defaults (which may come from env vars via CLI)
 4. Literal "default" fallback
@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 from aismartbuddy import config as cfg
 
 if TYPE_CHECKING:
-    from mcp.server.fastmcp import Context
+    from mcp.server.mcpserver import Context
 
 # Allow letters, digits, underscore, hyphen, dot. 1-64 chars.
 # Rejects: path separators, null bytes, empty, overly long names, "..", absolute paths.
@@ -52,10 +52,11 @@ def resolve_identity(
     """Resolve (user_id, project_id) from ctx + parameters + config defaults.
 
     Priority order for user_id:
-        1. ctx.client_id if present (Bearer token authentication)
-        2. explicit user_id parameter
-        3. cfg.runtime_config.default_user_id (from --default-user-id or env var)
-        4. Literal "default"
+        1. get_access_token().client_id if present (Bearer authentication)
+        2. ctx.client_id request metadata when supplied by an unauthenticated host
+        3. explicit user_id parameter
+        4. cfg.runtime_config.default_user_id (from --default-user-id or env var)
+        5. Literal "default"
 
     Priority order for project_id:
         1. explicit project_id parameter
@@ -70,12 +71,21 @@ def resolve_identity(
     Raises:
         ValueError: If any resolved value fails path-component validation.
     """
-    # Resolve user_id
+    # Resolve user_id. In MCP v2 bearer identity lives in the auth context;
+    # Context.client_id is request metadata and is not authoritative for auth.
     resolved_user: str | None = None
+    try:
+        from mcp.server.auth.middleware.auth_context import get_access_token
+
+        access_token = get_access_token()
+    except LookupError:
+        access_token = None
+    if access_token is not None and access_token.client_id:
+        resolved_user = access_token.client_id
     if ctx is not None:
-        # ctx.client_id is None unless Bearer auth is configured
+        # Retain request-metadata client_id as a non-authenticated fallback.
         client_id = getattr(ctx, "client_id", None)
-        if client_id:
+        if resolved_user is None and client_id:
             resolved_user = client_id
     if resolved_user is None and user_id:
         resolved_user = user_id

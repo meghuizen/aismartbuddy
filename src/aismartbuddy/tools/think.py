@@ -10,16 +10,15 @@ from __future__ import annotations
 import logging
 import re
 import uuid
-from typing import TYPE_CHECKING, Callable
-
-import anyio
+from typing import TYPE_CHECKING, Callable, Literal, TypeVar
 
 # Aliased to avoid colliding with this module's heavy use of "context" in
 # domain types (ThoughtNode metadata, holon contexts, etc.). holon.py uses
 # the same alias for the same reason; sql.py/graph.py/score.py use the
 # unaliased name where there's no conflict.
-from mcp.server.fastmcp import Context as _MCPContext
+from mcp.server.mcpserver import Context as _MCPContext
 
+from aismartbuddy.concurrency import run_sync
 from aismartbuddy.engines.thinking_engine import (
     ArgRecord,
     ConstraintRecord,
@@ -33,6 +32,7 @@ from aismartbuddy.engines.thinking_engine import (
     InterferenceRecord,
     ModelRecord,
     MonitorRecord,
+    ReasoningProgress,
     RuleItem,
     RuleProfile,
     ThinkingEngine,
@@ -40,6 +40,7 @@ from aismartbuddy.engines.thinking_engine import (
     TopologyRecord,
     ValidationAssessment,
 )
+from aismartbuddy.framework_catalog import framework_catalog
 from aismartbuddy.identity import resolve_identity
 from aismartbuddy.tools import (
     effective_session_id,
@@ -48,6 +49,7 @@ from aismartbuddy.tools import (
     resolve_auto_graph,
     run_with_lock,
     size_guarded,
+    track_reasoning_progress,
 )
 
 if TYPE_CHECKING:
@@ -227,6 +229,7 @@ _BRIDGE_ACTIONS = frozenset(
         "authoritative_source",
         "domain_context",
         "domain_connections",
+        "integrity",
     }
 )
 
@@ -245,9 +248,8 @@ def _get_or_create_think_session(
     caller is NOT re-checked (session_id acts as capability).
 
     If None/empty, resolves caller identity via `resolve_identity(ctx, ...)`
-    and creates a NEW standalone think session. Auto-creation does NOT happen
-    inside an existing parent — if you want a think backend in a parent,
-    pass backends=['think', ...] to session_create up front.
+    and creates a NEW parent session with think + graph backends so auto_graph
+    works without a prior session_create call.
     """
     mgr = get_session_manager()
     session_id = resolve_active_or_provided_session_id(session_id)
@@ -407,12 +409,15 @@ def _short(text: str, limit: int = 80) -> str:
     return cleaned[:limit] + "..."
 
 
+_DomainRecord = TypeVar("_DomainRecord")
+
+
 def _emit_domain_section(
     lines: list[str],
     title: str,
-    records: list,
-    id_fn: Callable[[object], str],
-    text_fn: Callable[[object], str],
+    records: list[_DomainRecord],
+    id_fn: Callable[[_DomainRecord], str],
+    text_fn: Callable[[_DomainRecord], str],
     cap: int = 30,
 ) -> None:
     if not records:
@@ -472,12 +477,17 @@ async def _materialize_rule_graph(
     rules: list[RuleItem] | None = None,
     validation=None,
 ) -> None:
-    """Best-effort graph materialization for rules and validations."""
+    """Best-effort graph materialization for rules and validations.
+
+    Accepts a parent_id OR a think child session_id — walks up to the parent
+    if needed. Silently no-ops if no parent with a graph backend exists.
+    """
     if not session_id:
         return
-    mgr = get_session_manager()
-    if session_id not in getattr(mgr, "_parent_sessions", {}):
+    parent = get_session_manager().resolve_to_parent(session_id)
+    if parent is None or "graph" not in parent.children:
         return
+    session_id = parent.parent_id
     try:
         from aismartbuddy.tools.graph import graph_knowledge_add, graph_knowledge_relate
 
@@ -578,13 +588,24 @@ async def _materialize_rule_graph(
 
 
 def _parent_graph_session_id(session_id: str | None) -> str | None:
-    """Return the parent session id only when it exposes graph backend state."""
+    """Return the parent session id only when it exposes graph backend state.
+
+    Accepts:
+      - a parent_id: returned as-is if it exposes a graph child;
+      - a think child session_id: walks up to the parent and returns parent_id
+        if the parent has a graph child;
+      - None / unrecognised id / parent without graph child: returns None.
+
+    This lets callers pass the raw `session_id` they received (which may be a
+    child id, especially on the auto-create path) without losing graph
+    materialisation when a graph backend exists on the parent.
+    """
     if not session_id:
         return None
-    mgr = get_session_manager()
-    if session_id in getattr(mgr, "_parent_sessions", {}):
-        return session_id
-    return None
+    parent = get_session_manager().resolve_to_parent(session_id)
+    if parent is None or "graph" not in parent.children:
+        return None
+    return parent.parent_id
 
 
 async def _materialize_subject_rule_bindings(
@@ -696,6 +717,11 @@ _DELEGATE_ACTIONS = frozenset(
 # Long thoughts defeat graph queryability — short nodes stay addressable.
 _LONG_THOUGHT_THRESHOLD = 1500
 
+# Node count at which sequentialthinking nudges toward the structured tools.
+# The gateway tip fires once when a session crosses this, plus whenever the
+# caller signals it is concluding (next_thought_needed=False).
+_SEQ_NUDGE_THRESHOLD = 5
+
 
 def _compose_next_hint(tool: str, key_arg: str, ids: list[str]) -> str:
     """Format a 'Suggested next:' line to nudge cross-tool composition.
@@ -709,7 +735,7 @@ def _compose_next_hint(tool: str, key_arg: str, ids: list[str]) -> str:
     shown = ids[:8]
     ids_repr = ", ".join(f'"{i}"' for i in shown)
     more = f", ...+{len(ids) - len(shown)} more" if len(ids) > len(shown) else ""
-    return f'Suggested next: {tool}({key_arg}=[{ids_repr}{more}])'
+    return f"Suggested next: {tool}({key_arg}=[{ids_repr}{more}])"
 
 
 def _long_thought_warnings(entries: list[tuple[str, str]]) -> str:
@@ -762,9 +788,10 @@ def _build_path_string(engine: ThinkingEngine, node_id: str) -> str:
     return " > ".join(parts)
 
 
+@track_reasoning_progress("think_graph")
 async def think_graph(
     thought: str = "",
-    action: str = "think",
+    action: Literal["think", "branch", "revise", "synthesize"] = "think",
     session_id: str | None = None,
     parent_id: str | None = None,
     node_id: str | None = None,
@@ -903,7 +930,7 @@ async def think_graph(
     """
     _validate_enum(action, _GRAPH_ACTIONS, "action")
 
-    _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
+    _, info = await run_sync(lambda: _get_or_create_think_session(session_id, ctx))
     engine = _engine(info)
     sid = info.session_id
     cached = _idempotent_result(sid, idempotency_key)
@@ -1000,7 +1027,7 @@ async def think_graph(
             created_refs.append(node.id)
             await _materialize_subject_rule_bindings(
                 engine,
-                session_id,
+                info.session_id,
                 subject_kind="thought",
                 subject_id=node.id,
                 subject_label=node.content,
@@ -1008,7 +1035,7 @@ async def think_graph(
                 source="think_graph",
             )
 
-        eff_auto_graph = resolve_auto_graph(auto_graph, info, session_id)
+        eff_auto_graph = resolve_auto_graph(auto_graph, info)
         eff_sid = effective_session_id(session_id, info)
         graph_count = 0
         if eff_auto_graph:
@@ -1157,7 +1184,7 @@ async def think_graph(
     parts.append("Status: added" + synth_warning)
     await _materialize_subject_rule_bindings(
         engine,
-        session_id,
+        info.session_id,
         subject_kind="thought",
         subject_id=nid,
         subject_label=thought,
@@ -1178,13 +1205,156 @@ async def think_graph(
     return _store_idempotent_result(sid, idempotency_key, warning + "\n".join(parts))
 
 
+# ── Tool: Sequential Thinking (gateway) ──────────────────────
+
+
+def _sequential_gateway_nudge(
+    node_count_after: int,
+    created_this_call: int,
+    next_thought_needed: bool,
+) -> str:
+    """Return the gateway tip, or "" when no nudge is due.
+
+    Fires once when the session crosses _SEQ_NUDGE_THRESHOLD nodes (stateless:
+    the count before this call was below the threshold and the count after is
+    at/above it) AND whenever the caller signals it is wrapping up
+    (next_thought_needed=False). Never fires on every call.
+    """
+    before = node_count_after - created_this_call
+    crossed = before < _SEQ_NUDGE_THRESHOLD <= node_count_after
+    concluding = not next_thought_needed
+    if not (crossed or concluding):
+        return ""
+    return (
+        f"\nTip: {node_count_after} thoughts recorded. To harden this: "
+        "think_model (scaffold the analysis) or think_monitor "
+        "(assess confidence + limits)."
+    )
+
+
+async def sequentialthinking(
+    thought: str = "",
+    thoughts: list[str] | None = None,
+    next_thought_needed: bool = True,
+    thought_number: int | None = None,
+    total_thoughts: int | None = None,
+    is_revision: bool = False,
+    revises_thought: str | None = None,
+    session_id: str | None = None,
+    reasoning_intent: str | None = None,
+    reasoning_depth: str | None = None,
+    ctx: _MCPContext | None = None,
+) -> str:
+    """Think step by step. Start here for open-ended reasoning.
+
+    One thought at a time, or pass thoughts=[...] to log several at once —
+    each entry becomes its own node. No setup and no required structure: a
+    session is created automatically and each thought continues the chain.
+
+    Args:
+        thought: A single thought (one move — a claim, observation, sub-goal,
+            or conclusion). Keep it short; branch instead of writing essays.
+        thoughts: Optional list of thought strings. Each is recorded as a
+            separate node, chained in order. Use either thought or thoughts.
+        next_thought_needed: False when you are wrapping up. Signals the tool
+            to suggest hardening the analysis with the structured tools.
+        thought_number / total_thoughts: Accepted for wire-compatibility with
+            sequential-thinking clients that send these counters. Advisory only
+            — the server does not read or persist them (node order is the chain).
+        is_revision: True to replace an earlier thought's content.
+        revises_thought: The node id (from a prior reply) to revise.
+        session_id: Omit to auto-create/reuse a session.
+        reasoning_intent / reasoning_depth: Select and store an initial route
+            when starting without suggest_reasoning.
+
+    Records into the thought graph underneath, so anything logged here is
+    queryable by think_graph, think_bridge, and think_refs_query later.
+    """
+    has_single = bool(thought and thought.strip())
+    has_batch = thoughts is not None
+    if has_single and has_batch:
+        raise ValueError("Provide either thought or thoughts, not both")
+    if not has_single and not has_batch:
+        raise ValueError("Provide a thought (str) or thoughts (list of strings)")
+
+    _, info = await run_sync(lambda: _get_or_create_think_session(session_id, ctx))
+    engine = _engine(info)
+    sid = info.session_id
+    if reasoning_depth is not None and reasoning_depth not in {"quick", "standard", "deep"}:
+        raise ValueError("reasoning_depth must be quick, standard, or deep")
+    if reasoning_intent is not None or reasoning_depth is not None:
+        route_task = thought.strip() if has_single else str((thoughts or [""])[0]).strip()
+        route = framework_catalog.recommend(
+            route_task,
+            intent=reasoning_intent or "auto",
+            depth=reasoning_depth or "standard",
+        )
+        info.reasoning_intent = route.intent
+        info.reasoning_depth = route.depth
+        engine.set_reasoning_progress(
+            ReasoningProgress(
+                task=route_task,
+                intent=route.intent,
+                depth=route.depth,
+                frameworks=list(route.frameworks),
+                steps=[
+                    {"phase": step.phase, "tool": step.tool, "purpose": step.purpose}
+                    for step in route.steps
+                ],
+            )
+        )
+
+    # Revision routes straight to the think_graph revise path.
+    if is_revision:
+        if not revises_thought:
+            raise ValueError("is_revision=True requires revises_thought (the node id to revise)")
+        if not has_single:
+            raise ValueError("Revision needs the new content in `thought`")
+        result = await think_graph(
+            thought=thought.strip(),
+            action="revise",
+            node_id=revises_thought,
+            session_id=sid,
+            ctx=ctx,
+        )
+        nudge = _sequential_gateway_nudge(len(engine.thought_nodes), 0, next_thought_needed)
+        return result + nudge
+
+    # Normalize to a list of non-empty thought strings.
+    contents = [thought.strip()] if has_single else [str(t).strip() for t in thoughts or []]
+    if not contents:
+        raise ValueError("thoughts must be a non-empty list")
+    if any(not c for c in contents):
+        raise ValueError("thoughts entries must be non-empty strings")
+
+    # Continue the existing chain from the most recently added node, so a
+    # session reads as one sequential chain rather than a forest of orphans.
+    last_id = None
+    if engine.thought_nodes:
+        last_id = list(engine.thought_nodes.values())[-1].id
+
+    batch: list[dict] = []
+    for i, content in enumerate(contents):
+        item: dict = {"thought": content}
+        if i == 0:
+            if last_id is not None:
+                item["parent_ref"] = last_id
+        else:
+            item["parent_ref"] = i - 1
+        batch.append(item)
+
+    result = await think_graph(thoughts=batch, session_id=sid, ctx=ctx)
+    nudge = _sequential_gateway_nudge(len(engine.thought_nodes), len(contents), next_thought_needed)
+    return result + nudge
+
+
 # ── Tool: Thought Graph Delegate ─────────────────────────────
 
 
 async def think_graph_delegate(
     session_id: str,
     node_id: str,
-    action: str = "package",
+    action: Literal["package", "receive"] = "package",
     result: str | None = None,
 ) -> str:
     """Manage delegation boundaries for thought graph subtrees.
@@ -1273,6 +1443,7 @@ async def think_graph_delegate(
 # ── Tool: Decision Framework ─────────────────────────────────
 
 
+@track_reasoning_progress("think_decide")
 async def think_decide(
     decision_statement: str = "",
     options: list[dict] | None = None,
@@ -1323,7 +1494,7 @@ async def think_decide(
     Returns a 'Suggested next:' line at end of response (items[] path) with
     canonical follow-up call pre-filled. Read it before deciding the next step.
     """
-    _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
+    _, info = await run_sync(lambda: _get_or_create_think_session(session_id, ctx))
     engine = _engine(info)
 
     # ── Items[] strict batch path ────────────────────────────
@@ -1378,7 +1549,7 @@ async def think_decide(
         for it in items:
             await _materialize_subject_rule_bindings(
                 engine,
-                session_id,
+                info.session_id,
                 subject_kind="decision",
                 subject_id=it["id"],
                 subject_label=it["decision_statement"],
@@ -1386,7 +1557,7 @@ async def think_decide(
                 source="think_decide",
             )
 
-        eff_auto_graph = resolve_auto_graph(auto_graph, info, session_id)
+        eff_auto_graph = resolve_auto_graph(auto_graph, info)
         eff_sid = effective_session_id(session_id, info)
         graph_count = 0
         if eff_auto_graph:
@@ -1443,7 +1614,7 @@ async def think_decide(
     engine.upsert_decision(record)
     await _materialize_subject_rule_bindings(
         engine,
-        session_id,
+        info.session_id,
         subject_kind="decision",
         subject_id=decision_id,
         subject_label=decision_statement,
@@ -1576,9 +1747,31 @@ _MODEL_GUIDANCE: dict[str, str] = {
         "6. For each root cause: what systemic fix prevents "
         "recurrence (not just this instance)?"
     ),
+    "inversion": (
+        "Framework: Inversion\n"
+        "1. State the desired outcome precisely\n"
+        "2. Ask what would guarantee the opposite outcome\n"
+        "3. Identify which failure conditions are present or plausible\n"
+        "4. Remove or contain the highest-leverage failure conditions"
+    ),
+    "kuba": (
+        "Framework: KUBA Communication\n"
+        "1. Knowledge — what facts must the audience receive?\n"
+        "2. Understanding — what relationships or model must become clear?\n"
+        "3. Belief — what evidence addresses doubt or resistance?\n"
+        "4. Action — what concrete next step should the audience take?"
+    ),
+    "systems_dynamics": (
+        "Framework: Systems Dynamics\n"
+        "1. Identify stocks, flows, actors, and system boundaries\n"
+        "2. Map reinforcing and balancing feedback loops\n"
+        "3. Locate delays, nonlinear effects, and accumulations\n"
+        "4. Test how interventions change behavior over time"
+    ),
 }
 
 
+@track_reasoning_progress("think_model")
 async def think_model(
     model_name: str,
     problem: str = "",
@@ -1655,7 +1848,7 @@ async def think_model(
     """
     _validate_enum(model_name, _MODEL_NAMES, "model_name")
 
-    _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
+    _, info = await run_sync(lambda: _get_or_create_think_session(session_id, ctx))
     engine = _engine(info)
 
     # ── Items[] strict batch path ────────────────────────────
@@ -1690,7 +1883,7 @@ async def think_model(
         for it in items:
             await _materialize_subject_rule_bindings(
                 engine,
-                session_id,
+                info.session_id,
                 subject_kind="model",
                 subject_id=it["id"],
                 subject_label=it["problem"],
@@ -1698,7 +1891,7 @@ async def think_model(
                 source="think_model",
             )
 
-        eff_auto_graph = resolve_auto_graph(auto_graph, info, session_id)
+        eff_auto_graph = resolve_auto_graph(auto_graph, info)
         eff_sid = effective_session_id(session_id, info)
         graph_count = 0
         if eff_auto_graph:
@@ -1728,7 +1921,7 @@ async def think_model(
             out.append(hint)
         if model_name == "systems_dynamics":
             out.append(
-                "Also consider: think_model(model_name=\"inversion\") — "
+                'Also consider: think_model(model_name="inversion") — '
                 "maps guaranteed-failure conditions from the loops you just identified."
             )
         return "\n".join(out)
@@ -1765,16 +1958,14 @@ async def think_model(
             lines.append(_MODEL_GUIDANCE[model_name])
             lines.append("Status: framework loaded — apply the steps above")
         else:
-            lines.append(
-                f"Status: framework {model_name} loaded — see prior guidance for steps"
-            )
+            lines.append(f"Status: framework {model_name} loaded — see prior guidance for steps")
     elif conclusion:
         lines.append(f"Conclusion: {conclusion[:200]}")
     else:
         lines.append("Status: applied")
     await _materialize_subject_rule_bindings(
         engine,
-        session_id,
+        info.session_id,
         subject_kind="model",
         subject_id=record.record_id or uuid.uuid4().hex[:8],
         subject_label=problem or model_name,
@@ -1787,6 +1978,7 @@ async def think_model(
 # ── Tool: Debugging Approach ─────────────────────────────────
 
 
+@track_reasoning_progress("think_debug")
 async def think_debug(
     approach_name: str = "binary_search",
     issue: str = "",
@@ -1816,7 +2008,7 @@ async def think_debug(
 
     Returns: debug ids[] (items[] mode) or single status.
     """
-    _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
+    _, info = await run_sync(lambda: _get_or_create_think_session(session_id, ctx))
     engine = _engine(info)
 
     # ── Items[] strict batch path ────────────────────────────
@@ -1884,6 +2076,7 @@ async def think_debug(
 # ── Tool: Structured Argumentation ───────────────────────────
 
 
+@track_reasoning_progress("think_argue")
 async def think_argue(
     claim: str = "",
     premises: list[str] | None = None,
@@ -1948,7 +2141,7 @@ async def think_argue(
     Returns a 'Suggested next:' line at end of response (chain[] path) with
     canonical follow-up call pre-filled. Read it before deciding the next step.
     """
-    _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
+    _, info = await run_sync(lambda: _get_or_create_think_session(session_id, ctx))
     engine = _engine(info)
 
     # ── Batch chain mode ─────────────────────────────────
@@ -2005,7 +2198,7 @@ async def think_argue(
                 engine.add_argument(chain_id, rec)
                 ids.append(aid)
 
-        eff_auto_graph = resolve_auto_graph(auto_graph, info, session_id)
+        eff_auto_graph = resolve_auto_graph(auto_graph, info)
         eff_sid = effective_session_id(session_id, info)
         graph_count = 0
         if eff_auto_graph:
@@ -2048,8 +2241,7 @@ async def think_argue(
             )
 
         out_lines = [
-            f"Session: {info.session_id} | Chain: {chain_id}"
-            f" | Batch: {len(ids)} arguments",
+            f"Session: {info.session_id} | Chain: {chain_id} | Batch: {len(ids)} arguments",
             f"Arg IDs: {', '.join(ids)}",
         ]
         if eff_auto_graph:
@@ -2132,15 +2324,38 @@ def _validate_hypothesis_dict(h: dict) -> str | None:
         return "'assumptions' must be non-empty list"
     if "confidence" not in h:
         return "missing 'confidence' (0.0-1.0)"
-    f = h.get("falsifiability") or ""
-    if len(f) < _MIN_FALSIFIABILITY_CHARS:
+    f = h.get("falsifiability")
+    if isinstance(f, dict):
+        method = f.get("method")
+        if not isinstance(method, str) or not method.strip():
+            return (
+                "'falsifiability.method' must be a non-empty string "
+                "describing how you would test the hypothesis"
+            )
+        eif = f.get("expected_if_false")
+        if not isinstance(eif, str) or not eif.strip():
+            return (
+                "'falsifiability.expected_if_false' must be a non-empty string — "
+                "what specific result would prove this hypothesis wrong"
+            )
+    elif isinstance(f, str) or f is None:
+        f = f or ""
+        if len(f) < _MIN_FALSIFIABILITY_CHARS:
+            return (
+                f"'falsifiability' must be ≥ {_MIN_FALSIFIABILITY_CHARS} chars "
+                "or a dict {{method: str, expected_if_false: str}} "
+                "(state a SPECIFIC observation that proves the hypothesis WRONG)"
+            )
+    else:
         return (
-            f"'falsifiability' must be ≥ {_MIN_FALSIFIABILITY_CHARS} chars "
-            "(state a SPECIFIC observation that proves the hypothesis WRONG)"
+            f"'falsifiability' must be a string (≥ {_MIN_FALSIFIABILITY_CHARS} chars) "
+            "or a dict {method: str, expected_if_false: str}; "
+            f"got {type(f).__name__}"
         )
     return None
 
 
+@track_reasoning_progress("think_science")
 async def think_science(
     stage: str = "hypothesis",
     inquiry_id: str = "",
@@ -2168,9 +2383,12 @@ async def think_science(
 
     items[]: STRICT batch — each item: id, observation, question, hypothesis
       {statement, variables[{name, role∈{independent,dependent,controlled}}],
-       assumptions[≥1], confidence, falsifiability ≥ 20 chars}.
-      Server REJECTS items where falsifiability is short or variables/assumptions
-      are missing.
+       assumptions[≥1], confidence,
+       falsifiability: str (≥ 20 chars) OR {method: str, expected_if_false: str}}.
+      The structured dict form is PREFERRED — it forces an operationalized test
+      protocol, not just a statement about falsifiability.
+      Server REJECTS items where falsifiability is short/missing or
+      variables/assumptions are missing.
       Each item is one candidate hypothesis. Competing hypotheses belong in
       separate items so they remain independently addressable and falsifiable.
     Single-stage: backward-compat staged form (observation → hypothesis →
@@ -2190,7 +2408,7 @@ async def think_science(
     Returns a 'Suggested next:' line at end of response (items[] path) with
     canonical follow-up call pre-filled. Read it before deciding the next step.
     """
-    _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
+    _, info = await run_sync(lambda: _get_or_create_think_session(session_id, ctx))
     engine = _engine(info)
 
     # ── Items[] strict batch path ────────────────────────────
@@ -2223,7 +2441,7 @@ async def think_science(
                 engine.upsert_inquiry(rec)
                 ids.append(it["id"])
 
-        eff_auto_graph = resolve_auto_graph(auto_graph, info, session_id)
+        eff_auto_graph = resolve_auto_graph(auto_graph, info)
         eff_sid = effective_session_id(session_id, info)
         graph_count = 0
         if eff_auto_graph:
@@ -2347,8 +2565,117 @@ def _validate_monitor_claims(claims_list: list) -> str | None:
     return None
 
 
+def _session_audit_lines(engine: ThinkingEngine) -> list[str]:
+    """Return deterministic epistemic gaps across the current thinking stores."""
+
+    unsupported: list[str] = []
+    overconfident: list[str] = []
+    with engine.state_lock:
+        for monitor in engine.monitors.values():
+            for index, claim in enumerate(monitor.claims):
+                claim_id = str(claim.get("id") or f"{monitor.monitoring_id}:claim:{index}")
+                evidence = claim.get("evidence")
+                has_evidence = bool(
+                    evidence and (not isinstance(evidence, list) or len(evidence) > 0)
+                )
+                status = str(claim.get("status", ""))
+                confidence = float(claim.get("confidence", 0.0) or 0.0)
+                if status in {"fact", "inference"} and not has_evidence:
+                    unsupported.append(claim_id)
+                if confidence > 0.8 and not has_evidence:
+                    overconfident.append(claim_id)
+
+        known_ids: set[str] = set(engine.thought_nodes)
+        known_ids.update(engine.hypotheses)
+        known_ids.update(engine.constraints)
+        known_ids.update(engine.evidence)
+        known_ids.update(engine.artifacts)
+        known_ids.update(engine.decisions)
+        known_ids.update(engine.inquiries)
+        known_ids.update(engine.monitors)
+        known_ids.update(record.record_id for record in engine.models if record.record_id)
+        dangling: set[str] = set()
+        for artifact in engine.artifacts.values():
+            for ref in (
+                artifact.refs
+                + artifact.connects_to
+                + artifact.supports
+                + artifact.contradicts
+                + artifact.derived_from
+            ):
+                if ref and ref not in known_ids:
+                    dangling.add(ref)
+        for node in engine.thought_nodes.values():
+            for ref in node.refs:
+                if ref and ref not in known_ids:
+                    dangling.add(ref)
+
+        untested = [
+            hyp.id
+            for hyp in engine.hypotheses.values()
+            if not hyp.invalidated and not hyp.evidence
+        ]
+        orphan_evidence = engine.orphan_evidence_ids()
+        missing_provenance = [
+            artifact.id
+            for artifact in engine.artifacts.values()
+            if (
+                artifact.kind in {"source", "finding", "sql_finding", "graph_finding"}
+                and not artifact.provenance
+            )
+        ]
+        missing_provenance.extend(
+            evidence.id for evidence in engine.evidence.values() if not evidence.source_ref
+        )
+        contradictions = [
+            f"{artifact.id}->{target}"
+            for artifact in engine.artifacts.values()
+            for target in artifact.contradicts
+        ]
+        progress = engine.reasoning_progress
+        route_missing: list[str] = []
+        next_tool = ""
+        if progress is not None:
+            remaining = list(progress.completed_tools)
+            for step in progress.steps:
+                tool = str(step.get("tool", ""))
+                if tool in remaining:
+                    remaining.remove(tool)
+                elif tool:
+                    route_missing.append(tool)
+            next_tool = progress.next_tool
+
+    lines = [
+        "Epistemic audit:",
+        f"unsupported_claims: {len(unsupported)}",
+        f"overconfident_claims: {len(overconfident)}",
+        f"untested_hypotheses: {len(untested)}",
+        f"orphan_evidence: {len(orphan_evidence)}",
+        f"missing_provenance: {len(missing_provenance)}",
+        f"contradictions: {len(contradictions)}",
+        f"dangling_refs: {len(dangling)}",
+        f"incomplete_route_steps: {len(route_missing)}",
+    ]
+    details = (
+        ("Unsupported", unsupported),
+        ("Overconfident", overconfident),
+        ("Untested hypotheses", untested),
+        ("Orphan evidence", orphan_evidence),
+        ("Missing provenance", missing_provenance),
+        ("Contradictions", contradictions),
+        ("Dangling refs", sorted(dangling)),
+        ("Missing route tools", route_missing),
+    )
+    for label, values in details:
+        if values:
+            lines.append(f"{label}: {', '.join(values[:10])}")
+    lines.append(f"Next recommended tool: {next_tool or 'none'}")
+    return lines
+
+
+@track_reasoning_progress("think_monitor")
 async def think_monitor(
-    action: str | None = None,
+    action: Literal["density", "audit_session"] | None = None,
     task: str = "",
     stage: str = "monitoring",
     overall_confidence: float = 0.5,
@@ -2378,6 +2705,8 @@ async def think_monitor(
     action="density": return session load stats (node_count, tree_count, max_depth,
       entity_refs, export_token_estimate, recommendation: summarize|delegate|continue).
       No items or stage needed. session_id: omit to auto-create or reuse active session.
+    action="audit_session": report unsupported claims, evidence and provenance
+      gaps, contradictions, dangling references, and incomplete route phases.
 
     items[]: STRICT batch — each item: id, task, knowledge {domain, level∈
       {expert,proficient,familiar,basic,minimal,none}, confidence,
@@ -2389,8 +2718,9 @@ async def think_monitor(
     Single-form: backward-compat staged form for iterative monitoring.
 
     Args:
-      action: optional dispatch — "density" returns session load stats; omit
-        for the standard items[]/single-form monitoring behavior.
+      action: optional dispatch — "density" returns load stats and
+        "audit_session" performs an epistemic/route audit; omit for standard
+        items[] or single-form monitoring.
       items: STRICT — list of monitoring items as above.
       auto_graph: when True + parent session has graph backend, materialise
         each item as a KnowledgeNode (entity_type=insight).
@@ -2412,11 +2742,11 @@ async def think_monitor(
     canonical follow-up call pre-filled. Read it before deciding the next step.
     """
     if action == "density":
-        _, info = await anyio.to_thread.run_sync(
+        _, info = await run_sync(
             lambda: _get_or_create_think_session(session_id, ctx)
         )
         engine = _engine(info)
-        stats = await anyio.to_thread.run_sync(engine.get_session_stats)
+        stats = await run_sync(engine.get_session_stats)
         total = stats.get("total_records", stats["node_count"])
         if total > 100 or stats["export_token_estimate"] > 6000:
             rec = "summarize"
@@ -2432,12 +2762,47 @@ async def think_monitor(
             f"entity_refs: {stats['entity_count']}  revisions: {stats['revision_count']}",
             f"export_token_estimate: {stats['export_token_estimate']}",
             f"by_type: {by_type}",
-            f"recommendation: {rec}",
         ]
+        # Clarify the inquiries/hypotheses distinction when relevant:
+        # think_science(items=[...]) records are stored as InquiryRecord
+        # (counted under 'inquiries'); 'hypotheses' counts the separate
+        # HypothesisRecord type from think_hypothesis. A density readout
+        # showing inquiries>0 and hypotheses=0 is normal, not a bug.
+        if by_type.get("inquiries", 0) > 0 and by_type.get("hypotheses", 0) == 0:
+            lines.append(
+                "note: think_science(items=[...]) records are counted under "
+                "'inquiries'; 'hypotheses' counts think_hypothesis records "
+                "(separate record type)."
+            )
+        lines.append(f"recommendation: {rec}")
         return "\n".join(lines)
 
-    _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
+    if action == "audit_session":
+        _, info = await run_sync(lambda: _get_or_create_think_session(session_id, ctx))
+        engine = _engine(info)
+        return "\n".join([f"Session: {info.session_id}", *_session_audit_lines(engine)])
+
+    _, info = await run_sync(lambda: _get_or_create_think_session(session_id, ctx))
     engine = _engine(info)
+    route_notice = ""
+    progress = engine.get_reasoning_progress()
+    if progress is not None:
+        remaining = list(progress.completed_tools)
+        missing_before_assess: list[str] = []
+        for step_item in progress.steps:
+            tool = str(step_item.get("tool", ""))
+            if tool == "think_monitor":
+                break
+            if tool in remaining:
+                remaining.remove(tool)
+            elif tool:
+                missing_before_assess.append(tool)
+        if missing_before_assess:
+            route_notice = "Incomplete route before assessment: " + ", ".join(
+                missing_before_assess
+            )
+            if info.enforcement == "strict":
+                raise ValueError(route_notice)
 
     # ── Items[] strict batch path ────────────────────────────
     if items is not None:
@@ -2480,7 +2845,7 @@ async def think_monitor(
                 engine.upsert_monitor(rec)
                 ids.append(it["id"])
 
-        eff_auto_graph = resolve_auto_graph(auto_graph, info, session_id)
+        eff_auto_graph = resolve_auto_graph(auto_graph, info)
         eff_sid = effective_session_id(session_id, info)
         graph_count = 0
         if eff_auto_graph:
@@ -2505,6 +2870,8 @@ async def think_monitor(
         ]
         if eff_auto_graph:
             out.append(f"Graph nodes created: {graph_count}")
+        if route_notice:
+            out.append(f"Advisory: {route_notice}")
         out.append("Status: monitored")
         hint = _compose_next_hint("think_validate", "refs", ids)
         if hint:
@@ -2570,13 +2937,25 @@ async def think_monitor(
         parts.append(f"Uncertainties: {len(uncertainty_areas)}")
     status = "monitoring" if next_assessment_needed else "assessed"
     lines = [" | ".join(parts), f"Status: {status}"]
+    if route_notice:
+        lines.append(f"Advisory: {route_notice}")
     if suggested_assessments:
         lines.append(f"Next: {', '.join(suggested_assessments)}")
     return "\n".join(lines)
 
 
 async def think_rules(
-    action: str,
+    action: Literal[
+        "create_profile",
+        "list_profiles",
+        "show_profile",
+        "add_rules_batch",
+        "update_weights_batch",
+        "deprecate_rules_batch",
+        "bind_profile",
+        "pin_snapshot",
+        "resolve_conflicts",
+    ],
     session_id: str | None = None,
     profile_id: str | None = None,
     name: str | None = None,
@@ -2611,7 +2990,7 @@ async def think_rules(
       resolve_conflicts: explicitly resolve open rule conflicts.
     """
     _validate_enum(action, _RULE_ACTIONS, "action")
-    _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
+    _, info = await run_sync(lambda: _get_or_create_think_session(session_id, ctx))
     engine = _engine(info)
 
     if action == "create_profile":
@@ -2624,7 +3003,7 @@ async def think_rules(
             refs=list(dict.fromkeys(list(refs or []))),
         )
         engine.upsert_rule_profile(record)
-        await _materialize_rule_graph(session_id, profile=record)
+        await _materialize_rule_graph(info.session_id, profile=record)
         return (
             f"Session: {info.session_id} | Rule profile: {profile_id}\n"
             f"Name: {name}\n"
@@ -2696,7 +3075,7 @@ async def think_rules(
                 )
             )
         profile = engine.add_rules_batch(profile_id, parsed)
-        await _materialize_rule_graph(session_id, profile=profile, rules=parsed)
+        await _materialize_rule_graph(info.session_id, profile=profile, rules=parsed)
         return (
             f"Session: {info.session_id} | Rule profile: {profile_id}\n"
             f"Rules added: {len(parsed)}\n"
@@ -2739,7 +3118,7 @@ async def think_rules(
         resolved_kind, bound = engine.bind_rule_profiles(subject_id, subject_kind, bindings)
         await _materialize_subject_rule_bindings(
             engine,
-            session_id,
+            info.session_id,
             subject_kind=resolved_kind,
             subject_id=subject_id,
             subject_label=f"bound-{resolved_kind}-{subject_id}",
@@ -2764,7 +3143,7 @@ async def think_rules(
             )
             await _materialize_subject_rule_bindings(
                 engine,
-                session_id,
+                info.session_id,
                 subject_kind=resolved_kind,
                 subject_id=subject_id,
                 subject_label=f"bound-{resolved_kind}-{subject_id}",
@@ -2835,9 +3214,9 @@ async def think_validate(
         refs (list[str], optional): cross-record references.
         nuance_notes (list[str], optional): caveats that do not affect scoring.
     """
-    _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
+    _, info = await run_sync(lambda: _get_or_create_think_session(session_id, ctx))
     engine = _engine(info)
-    eff_auto_graph = resolve_auto_graph(auto_graph, info, session_id)
+    eff_auto_graph = resolve_auto_graph(auto_graph, info)
     eff_sid = effective_session_id(session_id, info)
 
     if items is not None:
@@ -2862,7 +3241,7 @@ async def think_validate(
                     raise ValueError(
                         f"think_validate items[{i}].assessments[{j}]: "
                         "rule_id is required. Provide a rule identifier string "
-                        "(e.g. \"must_cover_auth\", \"R1\")."
+                        '(e.g. "must_cover_auth", "R1").'
                     )
                 parsed_assessments.append(
                     ValidationAssessment(
@@ -2904,13 +3283,9 @@ async def think_validate(
                 {
                     "id": ids[i],
                     "rationale": (
-                        item.get("rationale")
-                        or item.get("note")
-                        or item.get("subject_id", "")
+                        item.get("rationale") or item.get("note") or item.get("subject_id", "")
                     ),
-                    "subject_id": (
-                        [item["subject_id"]] if item.get("subject_id") else []
-                    ),
+                    "subject_id": ([item["subject_id"]] if item.get("subject_id") else []),
                 }
                 for i, item in enumerate(items)
             ]
@@ -2943,7 +3318,7 @@ async def think_validate(
             raise ValueError(
                 f"think_validate assessments[{i}]: "
                 "rule_id is required. Provide a rule identifier string "
-                "(e.g. \"must_cover_auth\", \"R1\")."
+                '(e.g. "must_cover_auth", "R1").'
             )
         parsed_assessments.append(
             ValidationAssessment(
@@ -2963,7 +3338,7 @@ async def think_validate(
         refs=refs,
         nuance_notes=nuance_notes,
     )
-    await _materialize_rule_graph(session_id, validation=record)
+    await _materialize_rule_graph(info.session_id, validation=record)
     lines = [
         f"Session: {info.session_id} | Validation: {record.id}",
         f"Subject: {record.subject_kind}:{record.subject_id}",
@@ -2998,7 +3373,7 @@ async def think_validate(
 async def think_set_active_session(session_id: str) -> str:
     """[ELABORATE] Set the implicit active session for subsequent tools."""
     mgr = get_session_manager()
-    actual = await anyio.to_thread.run_sync(lambda: mgr.set_active_session(session_id))
+    actual = await run_sync(lambda: mgr.set_active_session(session_id))
     return f"Active session set.\nsession_id: {actual}"
 
 
@@ -3097,7 +3472,7 @@ async def think_link_sessions(
 ) -> str:
     """[ELABORATE] Create a cross-session relationship between two nodes/artifacts."""
     mgr = get_session_manager()
-    link = await anyio.to_thread.run_sync(
+    link = await run_sync(
         lambda: mgr.add_session_link(session_a, node_a_id, session_b, node_b_id, relationship)
     )
     return (
@@ -3108,20 +3483,74 @@ async def think_link_sessions(
 
 
 async def think_get_session_links(session_id: str | None = None) -> str:
-    """[ELABORATE] Return all cross-session links touching a session."""
+    """[ELABORATE] Return all cross-session links touching a session.
+
+    Surfaces TWO link types:
+    - Parent-child unified-session relationships (think+graph+sql siblings)
+    - Explicit cross-session links created via think_link_sessions
+    """
     actual_session_id = resolve_active_or_provided_session_id(session_id)
     if not actual_session_id:
         raise ValueError("session_id is required unless an active session is set")
     mgr = get_session_manager()
-    links = await anyio.to_thread.run_sync(lambda: mgr.list_session_links(actual_session_id))
-    if not links:
-        return f"Session: {actual_session_id}\nNo cross-session links."
-    lines = [f"Session: {actual_session_id}", f"Links: {len(links)}"]
-    for link in links:
-        lines.append(
-            f"- {link.id}: {link.session_a}:{link.node_a_id} "
-            f"--[{link.relationship}]--> {link.session_b}:{link.node_b_id}"
+    links = await run_sync(lambda: mgr.list_session_links(actual_session_id))
+
+    # Detect unified-parent membership for this session_id.
+    parent_info_lines: list[str] = []
+    parent = mgr.resolve_to_parent(actual_session_id)
+    if parent is not None:
+        siblings = {b: cid for b, cid in parent.children.items() if cid != actual_session_id}
+        parent_info_lines.append(
+            f"Unified parent: {parent.parent_id} "
+            f"(backends: {sorted(parent.children.keys())})"
         )
+        if siblings:
+            for backend, cid in sorted(siblings.items()):
+                parent_info_lines.append(f"  sibling[{backend}]: {cid}")
+        parent_info_lines.append(
+            "Tip: any sibling/parent id is transparently routable to its backend's tools."
+        )
+
+    shared_lines: list[str] = []
+    candidates: list[tuple[str, str]] = []
+    if parent is not None:
+        candidates.extend(parent.children.items())
+    else:
+        try:
+            direct = mgr.get_session(actual_session_id)
+            candidates.append((direct.session_type, direct.session_id))
+        except ValueError:
+            pass
+    seen_members: set[tuple[str, str]] = set()
+    for backend, child_id in candidates:
+        try:
+            members = mgr.list_shared_members(child_id)
+        except ValueError:
+            continue
+        for member in members:
+            key = (backend, member.session_id)
+            if key in seen_members:
+                continue
+            seen_members.add(key)
+            shared_lines.append(f"  shared[{backend}]: {member.session_id}")
+
+    if not links and not parent_info_lines and not shared_lines:
+        return f"Session: {actual_session_id}\nNo cross-session links."
+
+    lines = [f"Session: {actual_session_id}"]
+    lines.extend(parent_info_lines)
+    if shared_lines:
+        lines.append(f"Shared mutable members: {len(shared_lines)}")
+        lines.extend(shared_lines)
+    if links:
+        lines.append(f"Cross-session links: {len(links)}")
+        for link in links:
+            lines.append(
+                f"- {link.id}: {link.session_a}:{link.node_a_id} "
+                f"--[{link.relationship}]--> {link.session_b}:{link.node_b_id}"
+            )
+    elif parent_info_lines:
+        lines.append("No explicit cross-session links (parent-child relationships shown above).")
     return "\n".join(lines)
 
 
@@ -3198,8 +3627,9 @@ async def think_graph_validate(
     return "\n".join(lines)
 
 
+@track_reasoning_progress("think_hypothesis")
 async def think_hypothesis(
-    action: str,
+    action: Literal["register", "evidence", "compare", "discriminate", "update", "invalidate"],
     session_id: str | None = None,
     hypothesis_id: str | None = None,
     statement: str | None = None,
@@ -3225,7 +3655,7 @@ async def think_hypothesis(
     round-trips. Single-record args remain supported for backward-compat.
     """
     _validate_enum(action, _HYPOTHESIS_ACTIONS, "action")
-    _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
+    _, info = await run_sync(lambda: _get_or_create_think_session(session_id, ctx))
     engine = _engine(info)
 
     if action == "register":
@@ -3233,12 +3663,7 @@ async def think_hypothesis(
         if items is not None:
             from aismartbuddy.tools import validate_items
 
-            single_form_args = bool(
-                statement
-                or hypothesis_id
-                or domain
-                or predictions
-            )
+            single_form_args = bool(statement or hypothesis_id or domain or predictions)
             if single_form_args:
                 raise ValueError(
                     "think_hypothesis.register: pass either items=[...] "
@@ -3267,11 +3692,7 @@ async def think_hypothesis(
                     )
                     engine.upsert_hypothesis(record)
                     ids.append(it["id"])
-            return (
-                f"Hypotheses registered: {len(ids)}\n"
-                f"IDs: {', '.join(ids)}\n"
-                "Status: registered"
-            )
+            return f"Hypotheses registered: {len(ids)}\nIDs: {', '.join(ids)}\nStatus: registered"
 
         if not statement:
             raise ValueError("statement is required for register")
@@ -3376,16 +3797,14 @@ async def think_hypothesis(
         for i, hid in enumerate(hypothesis_ids):
             if not (isinstance(hid, str) and hid):
                 raise ValueError(
-                    f"think_hypothesis.invalidate: hypothesis_ids[{i}] must be "
-                    "a non-empty string"
+                    f"think_hypothesis.invalidate: hypothesis_ids[{i}] must be a non-empty string"
                 )
             validated_ids.append(hid)
         seen: set[str] = set()
         for i, hid in enumerate(validated_ids):
             if hid in seen:
                 raise ValueError(
-                    f"think_hypothesis.invalidate: hypothesis_ids[{i}] "
-                    f"duplicate id '{hid}'"
+                    f"think_hypothesis.invalidate: hypothesis_ids[{i}] duplicate id '{hid}'"
                 )
             seen.add(hid)
         invalidated_records: list[str] = []
@@ -3413,7 +3832,7 @@ async def think_hypothesis(
 
 
 async def think_constraint(
-    action: str,
+    action: Literal["register", "validate", "list", "remove", "check_all"],
     session_id: str | None = None,
     constraint_id: str | None = None,
     domain: str | None = None,
@@ -3446,9 +3865,15 @@ async def think_constraint(
     matching target, it returns a matrix row. Existing validations are reused;
     missing ones are created as `uncertain` so the gap remains explicit rather
     than silently skipped.
+
+    For type="hard" constraints, `operationalization` is REQUIRED:
+        {method: str (required), resource: str (optional), priority: int (optional)}
+    Stating a hard constraint without specifying how to test it produces an
+    unactionable limitation. The server REJECTS hard constraints missing
+    operationalization.method. Soft constraints leave operationalization optional.
     """
     _validate_enum(action, _CONSTRAINT_ACTIONS, "action")
-    _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
+    _, info = await run_sync(lambda: _get_or_create_think_session(session_id, ctx))
     engine = _engine(info)
 
     def _target_rows(kind: str, explicit_id: str | None) -> list[tuple[str, str]]:
@@ -3498,9 +3923,7 @@ async def think_constraint(
         if items is not None:
             from aismartbuddy.tools import validate_items
 
-            single_form_args = bool(
-                constraint_id or statement or domain or type or applies_to
-            )
+            single_form_args = bool(constraint_id or statement or domain or type or applies_to)
             if single_form_args:
                 raise ValueError(
                     "think_constraint.register: pass either items=[...] "
@@ -3518,6 +3941,21 @@ async def think_constraint(
                 tool="think_constraint",
                 item_validators={"type": _check_type},
             )
+
+            # Hard constraints must be operationalized — a constraint you cannot
+            # test is just a statement. Separate loop (not item_validators) because
+            # validate_items only fires a field validator when the field key is present;
+            # here we must enforce presence conditionally on type='hard'.
+            for idx, it in enumerate(items):
+                if str(it.get("type", "")) == "hard":
+                    op = it.get("operationalization")
+                    if not isinstance(op, dict) or not str(op.get("method", "")).strip():
+                        raise ValueError(
+                            f"think_constraint items[{idx}] (id={it.get('id')!r}): "
+                            "type='hard' requires operationalization={{method: str, ...}}. "
+                            "State specifically how this constraint is tested before using it."
+                        )
+
             from aismartbuddy.tools import collect_item_refs as _collect_refs
 
             registered_ids: list[str] = []
@@ -3532,6 +3970,7 @@ async def think_constraint(
                             check_description=str(it.get("check_description", "") or ""),
                             applies_to=list(it.get("applies_to") or []),
                             refs=_collect_refs(it),
+                            operationalization=dict(it.get("operationalization") or {}),
                         )
                     )
                     registered_ids.append(it["id"])
@@ -3544,6 +3983,18 @@ async def think_constraint(
         if not constraint_id or not statement or not domain or not type:
             raise ValueError("constraint_id, domain, type, and statement are required for register")
         _validate_enum(type, _CONSTRAINT_TYPES, "type")
+        if type == "hard":
+            op = check_description  # check_description repurposed as operationalization hint
+            # Note: single-record path uses check_description for free-form notes, but
+            # operationalization is not a parameter here. Enforce at minimum a non-empty
+            # check_description when type="hard" so the invariant holds both paths.
+            if not check_description or not check_description.strip():
+                raise ValueError(
+                    f"think_constraint (id={constraint_id!r}): type='hard' requires "
+                    "check_description to describe how the constraint is tested. "
+                    "Use items=[...] form with operationalization={{method: str}} for "
+                    "richer structured operationalization."
+                )
         engine.upsert_constraint(
             ConstraintRecord(
                 id=constraint_id,
@@ -3579,16 +4030,14 @@ async def think_constraint(
             for i, cid in enumerate(constraint_ids):
                 if not (isinstance(cid, str) and cid):
                     raise ValueError(
-                        f"think_constraint.remove: constraint_ids[{i}] must be "
-                        "a non-empty string"
+                        f"think_constraint.remove: constraint_ids[{i}] must be a non-empty string"
                     )
                 validated_ids.append(cid)
             seen: set[str] = set()
             for i, cid in enumerate(validated_ids):
                 if cid in seen:
                     raise ValueError(
-                        f"think_constraint.remove: constraint_ids[{i}] "
-                        f"duplicate id '{cid}'"
+                        f"think_constraint.remove: constraint_ids[{i}] duplicate id '{cid}'"
                     )
                 seen.add(cid)
             with engine.state_lock:
@@ -3703,8 +4152,9 @@ async def think_constraint(
     return "\n".join(lines)
 
 
+@track_reasoning_progress("think_topology")
 async def think_topology(
-    action: str,
+    action: Literal["define", "abstract", "compare", "translate", "search"],
     session_id: str | None = None,
     topology_id: str | None = None,
     name: str | None = None,
@@ -3726,7 +4176,7 @@ async def think_topology(
     round-trips. Single-record args remain supported for backward-compat.
     """
     _validate_enum(action, _TOPOLOGY_ACTIONS, "action")
-    _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
+    _, info = await run_sync(lambda: _get_or_create_think_session(session_id, ctx))
     engine = _engine(info)
 
     if action == "define":
@@ -3735,8 +4185,7 @@ async def think_topology(
             from aismartbuddy.tools import validate_items
 
             single_form_args = bool(
-                topology_id or name or nodes or edges
-                or source_description or source_domain
+                topology_id or name or nodes or edges or source_description or source_domain
             )
             if single_form_args:
                 raise ValueError(
@@ -3751,10 +4200,7 @@ async def think_topology(
                     if not isinstance(n, dict):
                         return f"nodes[{j}] must be a dict"
                     if n.get("role") not in _TOPOLOGY_NODE_ROLES:
-                        return (
-                            f"nodes[{j}].role must be one of "
-                            f"{sorted(_TOPOLOGY_NODE_ROLES)}"
-                        )
+                        return f"nodes[{j}].role must be one of {sorted(_TOPOLOGY_NODE_ROLES)}"
                 return None
 
             def _check_edges(es: object) -> str | None:
@@ -3764,10 +4210,7 @@ async def think_topology(
                     if not isinstance(e, dict):
                         return f"edges[{j}] must be a dict"
                     if e.get("type") not in _TOPOLOGY_EDGE_TYPES:
-                        return (
-                            f"edges[{j}].type must be one of "
-                            f"{sorted(_TOPOLOGY_EDGE_TYPES)}"
-                        )
+                        return f"edges[{j}].type must be one of {sorted(_TOPOLOGY_EDGE_TYPES)}"
                 return None
 
             validate_items(
@@ -3914,8 +4357,9 @@ async def think_topology(
     return "\n".join(lines)
 
 
+@track_reasoning_progress("think_evidence")
 async def think_evidence(
-    action: str,
+    action: Literal["register", "chain", "trace", "strength", "list"],
     session_id: str | None = None,
     evidence_id: str | None = None,
     content: str | None = None,
@@ -3942,6 +4386,10 @@ async def think_evidence(
         register: store an evidence node. Required: content, source_type.
             source_type must be one of: analogy, expert_opinion, inference,
             literature, measurement, observation, simulation.
+            Optional: claim_id — when present, automatically creates an
+            inductive provenance chain (evidence → claim) so orphan evidence
+            is not possible. Pass claim_id on every items[] entry to link
+            all evidence to its claim in one round-trip.
         chain: link two evidence nodes. Required: from_id, to_id, inference_type.
             inference_type must be one of: abductive, analogical, deductive,
             inductive.
@@ -3952,7 +4400,7 @@ async def think_evidence(
     if action == "add":
         action = "register"
     _validate_enum(action, _EVIDENCE_ACTIONS, "action")
-    _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
+    _, info = await run_sync(lambda: _get_or_create_think_session(session_id, ctx))
     engine = _engine(info)
 
     if action == "register":
@@ -3960,10 +4408,7 @@ async def think_evidence(
         if items is not None:
             from aismartbuddy.tools import validate_items
 
-            single_form_args = bool(
-                evidence_id or content or source_type
-                or domain or source_ref
-            )
+            single_form_args = bool(evidence_id or content or source_type or domain or source_ref)
             if single_form_args:
                 raise ValueError(
                     "think_evidence.register: pass either items=[...] "
@@ -3984,6 +4429,7 @@ async def think_evidence(
             from aismartbuddy.tools import collect_item_refs as _collect_refs
 
             registered_ids: list[str] = []
+            auto_chained: list[str] = []
             with engine.state_lock:
                 for it in items:
                     conf = float(it.get("confidence", 0.5))
@@ -3999,11 +4445,30 @@ async def think_evidence(
                         )
                     )
                     registered_ids.append(it["id"])
-            return (
-                f"Evidence registered: {len(registered_ids)}\n"
-                f"IDs: {', '.join(registered_ids)}\n"
-                "Status: registered"
-            )
+                    cid = str(it.get("claim_id") or "").strip()
+                    if cid:
+                        engine.add_evidence_chain(
+                            EvidenceChainRecord(
+                                id=f"autochain_{it['id']}_{cid}",
+                                from_id=it["id"],
+                                to_id=cid,
+                                inference_type="inductive",
+                            )
+                        )
+                        auto_chained.append(it["id"])
+            out_lines = [
+                f"Evidence registered: {len(registered_ids)}",
+                f"IDs: {', '.join(registered_ids)}",
+            ]
+            if auto_chained:
+                out_lines.append(f"Auto-chained to claim: {len(auto_chained)} items")
+            else:
+                out_lines.append(
+                    "Tip: add claim_id to each item to auto-link evidence to its "
+                    "hypothesis/model and avoid orphan evidence."
+                )
+            out_lines.append("Status: registered")
+            return "\n".join(out_lines)
 
         if not evidence_id or not content or not source_type:
             raise ValueError("evidence_id, content, and source_type are required for register")
@@ -4018,6 +4483,20 @@ async def think_evidence(
                 source_ref=source_ref or "",
             )
         )
+        cid = str(claim_id or "").strip()
+        if cid:
+            engine.add_evidence_chain(
+                EvidenceChainRecord(
+                    id=f"autochain_{evidence_id}_{cid}",
+                    from_id=evidence_id,
+                    to_id=cid,
+                    inference_type="inductive",
+                )
+            )
+            return (
+                f"Session: {info.session_id} | Evidence: {evidence_id}\n"
+                f"Auto-chained to claim: {cid}\nStatus: registered"
+            )
         return f"Session: {info.session_id} | Evidence: {evidence_id}\nStatus: registered"
 
     if action == "chain":
@@ -4025,9 +4504,7 @@ async def think_evidence(
         if items is not None:
             from aismartbuddy.tools import validate_items
 
-            single_form_args = bool(
-                from_id or to_id or inference_type or assumptions
-            )
+            single_form_args = bool(from_id or to_id or inference_type or assumptions)
             if single_form_args:
                 raise ValueError(
                     "think_evidence.chain: pass either items=[...] "
@@ -4107,8 +4584,21 @@ async def think_evidence(
     return "\n".join(lines)
 
 
+@size_guarded
 async def think_bridge(
-    action: str,
+    action: Literal[
+        "thoughts_for_entity",
+        "entities_for_thought",
+        "hypotheses_for_entity",
+        "evidence_for_hypothesis",
+        "constraints_for_hypothesis",
+        "full_context",
+        "bundle",
+        "authoritative_source",
+        "domain_context",
+        "domain_connections",
+        "integrity",
+    ],
     session_id: str | None = None,
     entity_name: str | None = None,
     node_id: str | None = None,
@@ -4120,11 +4610,14 @@ async def think_bridge(
     include_sql_tables: list[str] | None = None,
     domain: str | None = None,
     domain_b: str | None = None,
+    session_ids: list[str] | None = None,
+    max_results: int | None = None,
+    max_chars: int | None = None,
     ctx: _MCPContext | None = None,
 ) -> str:
     """[ELABORATE] Query thought graph, hypotheses, constraints, evidence, topology state.
 
-    Ten actions:
+    Eleven actions:
       thoughts_for_entity(entity_name) -- thoughts mentioning the entity.
           Matches ThoughtNode metadata['knowledge_refs'] first; if empty,
           falls back to case-insensitive substring search on node content
@@ -4146,6 +4639,9 @@ async def think_bridge(
       domain_connections(domain, domain_b)
           -- find graph edges and shared entities linking two domains. Useful
              for cross-domain bridge analysis.
+      integrity() -- report unsupported claims, missing provenance,
+          contradictions, dangling refs, untested hypotheses, unused evidence,
+          confidence mismatches, and incomplete route phases.
 
     Args:
       action: one of the ten action names above.
@@ -4153,6 +4649,8 @@ async def think_bridge(
         entity_ids / confidence_min / include_sql_tables: per-action inputs.
       domain: domain tag for domain_context / domain_connections.
       domain_b: second domain tag for domain_connections.
+      session_ids: optional same-owner/project thinking sessions to query.
+      max_results / max_chars: bound records and response size.
 
     Note: ThoughtNodes produced via `think_graph(thoughts=[...])` accept
     `entity_refs: list[str]` (registers to metadata.knowledge_refs) and
@@ -4166,8 +4664,54 @@ async def think_bridge(
     fails, the think-side response still succeeds.
     """
     _validate_enum(action, _BRIDGE_ACTIONS, "action")
-    _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
+    if max_results is not None and not 1 <= max_results <= 1_000:
+        raise ValueError("max_results must be between 1 and 1000")
+    if max_chars is not None and not 500 <= max_chars <= 500_000:
+        raise ValueError("max_chars must be between 500 and 500000")
+    _, info = await run_sync(lambda: _get_or_create_think_session(session_id, ctx))
     engine = _engine(info)
+    limit = max_results or 20
+
+    if session_ids:
+        resolved_infos = [info]
+        seen = {info.session_id}
+        mgr = get_session_manager()
+        for candidate in session_ids:
+            resolved = mgr.resolve_backend_session(candidate, "think")
+            if resolved.user_id != info.user_id or resolved.project_id != info.project_id:
+                raise ValueError("Cross-session context requires the same user_id and project_id")
+            if resolved.session_id not in seen:
+                seen.add(resolved.session_id)
+                resolved_infos.append(resolved)
+        per_session_chars = (
+            max(500, max_chars // len(resolved_infos)) if max_chars is not None else None
+        )
+        sections: list[str] = []
+        for resolved in resolved_infos:
+            value = await think_bridge(
+                action=action,
+                session_id=resolved.session_id,
+                entity_name=entity_name,
+                node_id=node_id,
+                hypothesis_id=hypothesis_id,
+                target_id=target_id,
+                target_type=target_type,
+                entity_ids=entity_ids,
+                confidence_min=confidence_min,
+                include_sql_tables=include_sql_tables,
+                domain=domain,
+                domain_b=domain_b,
+                session_ids=None,
+                max_results=max_results,
+                max_chars=per_session_chars,
+                ctx=ctx,
+            )
+            sections.append(f"## Session {resolved.session_id}\n{value}")
+        return "\n\n".join(sections)
+
+    if action == "integrity":
+        lines = [f"Session: {info.session_id}", *_session_audit_lines(engine)]
+        return "\n".join(lines[: max_results or 100])
 
     if action == "thoughts_for_entity":
         if not entity_name:
@@ -4185,7 +4729,7 @@ async def think_bridge(
                     if len(matches) >= 50:
                         break
         lines = [f"Session: {info.session_id}", f"Thought matches: {len(matches)}"]
-        lines.extend(f"- {item}" for item in matches[:20])
+        lines.extend(f"- {item}" for item in matches[:limit])
         graph_lines = await _safe_graph_context_lines(
             info.session_id,
             entity_names=[entity_name],
@@ -4230,7 +4774,7 @@ async def think_bridge(
             [
                 f"- {record.id}: posterior={record.posterior_weight:.3f} | "
                 f"{_short(record.statement, 80)}"
-                for record in matches[:20]
+                for record in matches[:limit]
             ]
         )
         graph_lines = await _safe_graph_context_lines(
@@ -4257,7 +4801,7 @@ async def think_bridge(
             lines.append("Direct evidence:")
             lines.extend(
                 f"- {item.direction}:{item.strength:.2f} | {_short(item.text, 80)}"
-                for item in direct.evidence[:10]
+                for item in direct.evidence[:limit]
             )
         graph_lines = await _safe_graph_context_lines(info.session_id, target_name=hypothesis_id)
         if graph_lines:
@@ -4272,7 +4816,9 @@ async def think_bridge(
         if not rows:
             return f"Session: {info.session_id}\nNo constraint validations for {hypothesis_id}."
         lines = [f"Session: {info.session_id}", f"Constraint validations: {len(rows)}"]
-        lines.extend(f"- {row.constraint_id}: {row.status} | {row.note}" for row in rows[:20])
+        lines.extend(
+            f"- {row.constraint_id}: {row.status} | {row.note}" for row in rows[:limit]
+        )
         graph_lines = await _safe_graph_context_lines(info.session_id, target_name=hypothesis_id)
         if graph_lines:
             lines.append("Graph context:")
@@ -4295,10 +4841,7 @@ async def think_bridge(
         if matching_hyps:
             lines.append("## Think hypotheses")
             for h in matching_hyps[:5]:
-                lines.append(
-                    f"  {h.id}: {h.statement[:80]} "
-                    f"(posterior={h.posterior_weight:.3f})"
-                )
+                lines.append(f"  {h.id}: {h.statement[:80]} (posterior={h.posterior_weight:.3f})")
         # graph-side: knowledge nodes ranked by authority
         companion_id = _companion_graph_session_id(think_session_id)
         if companion_id:
@@ -4310,9 +4853,7 @@ async def think_bridge(
                 f"RETURN n.name, n.authority, n.source, n.confidence"
             )
             try:
-                _, rows = await run_with_lock(
-                    g_info, lambda: g_info.engine.execute(q)
-                )
+                _, rows = await run_with_lock(g_info, lambda: g_info.engine.execute(q))
                 if rows:
                     rank = {
                         "ground_truth": 0,
@@ -4351,15 +4892,9 @@ async def think_bridge(
         ]
         matching_hyps = [h for h in engine.hypotheses.values() if h.domain == d]
         matching_models = [m for m in engine.models if m.domain == d]
-        matching_decisions = [
-            dec for dec in engine.decisions.values() if dec.domain == d
-        ]
-        matching_inquiries = [
-            i for i in engine.inquiries.values() if i.domain == d
-        ]
-        matching_monitors = [
-            mo for mo in engine.monitors.values() if mo.domain == d
-        ]
+        matching_decisions = [dec for dec in engine.decisions.values() if dec.domain == d]
+        matching_inquiries = [i for i in engine.inquiries.values() if i.domain == d]
+        matching_monitors = [mo for mo in engine.monitors.values() if mo.domain == d]
 
         graph_rows: list[tuple] = []
         companion_id = _companion_graph_session_id(think_session_id)
@@ -4369,12 +4904,10 @@ async def think_bridge(
             q = (
                 f"MATCH (n:KnowledgeNode) "
                 f"WHERE n.domain = '{_escape_cypher_string(d)}' "
-                f"RETURN n.name, n.entity_type, n.confidence, n.authority LIMIT 30"
+                f"RETURN n.name, n.entity_type, n.confidence, n.authority LIMIT {limit}"
             )
             try:
-                _, rows = await run_with_lock(
-                    g_info, lambda: g_info.engine.execute(q)
-                )
+                _, rows = await run_with_lock(g_info, lambda: g_info.engine.execute(q))
                 graph_rows = list(rows)
             except Exception as exc:
                 logger.debug("domain_context graph query failed for %s: %s", d, exc)
@@ -4421,27 +4954,34 @@ async def think_bridge(
             lambda m: m.problem,
         )
         _emit_domain_section(
-            lines, "Decisions", matching_decisions,
-            lambda d: d.decision_id, lambda d: d.statement,
+            lines,
+            "Decisions",
+            matching_decisions,
+            lambda d: d.decision_id,
+            lambda d: d.statement,
         )
         _emit_domain_section(
-            lines, "Inquiries", matching_inquiries,
-            lambda i: i.inquiry_id, lambda i: i.question,
+            lines,
+            "Inquiries",
+            matching_inquiries,
+            lambda i: i.inquiry_id,
+            lambda i: i.question,
         )
         _emit_domain_section(
-            lines, "Monitors", matching_monitors,
-            lambda mo: mo.monitoring_id, lambda mo: mo.task,
+            lines,
+            "Monitors",
+            matching_monitors,
+            lambda mo: mo.monitoring_id,
+            lambda mo: mo.task,
         )
         if graph_rows:
             lines.append("## Graph KnowledgeNodes")
-            for row in graph_rows[:30]:
+            for row in graph_rows[:limit]:
                 name = row[0] if len(row) > 0 else ""
                 etype = row[1] if len(row) > 1 else ""
                 conf = row[2] if len(row) > 2 else ""
                 auth = row[3] if len(row) > 3 else ""
-                lines.append(
-                    f"  name={name} type={etype} conf={conf} auth={auth or 'unset'}"
-                )
+                lines.append(f"  name={name} type={etype} conf={conf} auth={auth or 'unset'}")
         return "\n".join(lines)
 
     if action == "domain_connections":
@@ -4473,12 +5013,10 @@ async def think_bridge(
                 f"MATCH (a:KnowledgeNode)-[r]-(b:KnowledgeNode) "
                 f"WHERE a.domain = '{_escape_cypher_string(d_a)}' "
                 f"AND b.domain = '{_escape_cypher_string(d_b)}' "
-                f"RETURN a.name, label(r), b.name, r.weight LIMIT 20"
+                f"RETURN a.name, label(r), b.name, r.weight LIMIT {limit}"
             )
             try:
-                _, rows = await run_with_lock(
-                    g_info, lambda: g_info.engine.execute(q)
-                )
+                _, rows = await run_with_lock(g_info, lambda: g_info.engine.execute(q))
                 if rows:
                     lines.append("## Graph connections")
                     for row in rows:
@@ -4486,9 +5024,7 @@ async def think_bridge(
                         rel = row[1] if len(row) > 1 else ""
                         b_name = row[2] if len(row) > 2 else ""
                         weight = row[3] if len(row) > 3 else ""
-                        lines.append(
-                            f"  {a_name} -[{rel} w={weight}]- {b_name}"
-                        )
+                        lines.append(f"  {a_name} -[{rel} w={weight}]- {b_name}")
                 else:
                     lines.append("## Graph connections: (none)")
             except Exception as exc:
@@ -4538,7 +5074,7 @@ async def think_bridge(
                 for n in all_nodes
                 if eid.lower() in (n.content or "").lower() or eid in (n.refs or [])
             ]
-            for n in nodes_for_entity[:10]:
+            for n in nodes_for_entity[:limit]:
                 think_lines.append(f"  [{n.id}] {n.content[:120]}")
         if think_lines:
             lines.append("## Think")
@@ -4558,12 +5094,10 @@ async def think_bridge(
                         f"MATCH (n:KnowledgeNode) "
                         f"WHERE n.name = '{_escape_cypher_string(eid)}' "
                         f"AND n.confidence >= {conf_val} "
-                        f"RETURN n.name, n.confidence, n.source, n.authority LIMIT 10"
+                        f"RETURN n.name, n.confidence, n.source, n.authority LIMIT {limit}"
                     )
                     try:
-                        _, rows = await run_with_lock(
-                            g_info, lambda q=q: g_info.engine.execute(q)
-                        )
+                        _, rows = await run_with_lock(g_info, lambda q=q: g_info.engine.execute(q))
                         for row in rows:
                             graph_conf_lines.append(
                                 f"  name={row[0]} conf={row[1]} src={row[2]} "
@@ -4577,9 +5111,7 @@ async def think_bridge(
             else:
                 lines.append("## Graph — confidence_min ignored (no graph backend in session)")
         else:
-            graph_ctx = await _safe_graph_context_lines(
-                think_session_id, entity_names=entity_ids
-            )
+            graph_ctx = await _safe_graph_context_lines(think_session_id, entity_names=entity_ids)
             if graph_ctx:
                 lines.append("## Graph")
                 lines.extend(graph_ctx)
@@ -4597,7 +5129,7 @@ async def think_bridge(
                         continue
                     try:
                         csv_result = await execute_and_format(
-                            sql_info, mgr3, f"SELECT * FROM {table} LIMIT 20"
+                            sql_info, mgr3, f"SELECT * FROM {table} LIMIT {limit}"
                         )
                         lines.append(f"## SQL [{table}]")
                         lines.append(csv_result)
@@ -4630,12 +5162,14 @@ async def think_bridge(
         if target_id in record.refs:
             ref_matches.append(f"model:{record.record_id or record.model_name}")
     if ref_matches:
-        lines.append("Inbound refs: " + ", ".join(ref_matches[:20]))
+        lines.append("Inbound refs: " + ", ".join(ref_matches[:limit]))
     graph_lines = await _safe_graph_context_lines(
         info.session_id,
-        entity_names=list(node.metadata.get("knowledge_refs", []))
-        if target_id in engine.thought_nodes
-        else None,
+        entity_names=(
+            list(engine.thought_nodes[target_id].metadata.get("knowledge_refs", []))
+            if target_id in engine.thought_nodes
+            else None
+        ),
         target_name=target_id,
     )
     if graph_lines:
@@ -4652,6 +5186,8 @@ async def think_summarize(
     session_id: str | None = None,
     max_items_per_category: int = 20,
     detail_level: str = "index",
+    max_chars: int | None = None,
+    include_linked_sessions: bool = False,
 ) -> str:
     """[ASSESS] Get a token-optimized summary of all thinking activity in a session.
 
@@ -4668,15 +5204,66 @@ async def think_summarize(
             - "index" (default, backward-compat): terse one-liners.
             - "synopsis": RECOMMENDED when resuming a session — ~400-char
               previews, more branches per tree, full synthesis nodes.
+            - "handoff": route progress, conclusions, evidence, open gaps,
+              important IDs, and the exact next recommended tool.
             - "full": all branches, long previews. For end-of-session review.
+        max_chars: Explicit response budget; otherwise use the session budget.
+        include_linked_sessions: Append bounded context from linked or shared
+            same-owner/project thinking sessions.
 
     Returns:
         Compact summary of all thinking activity.
     """
+    if max_chars is not None and not 500 <= max_chars <= 500_000:
+        raise ValueError("max_chars must be between 500 and 500000")
+
     _, info = _require_think_session(session_id)
     engine = _engine(info)
-    summary = engine.get_summary(max_items_per_category, detail_level=detail_level)
-    links = get_session_manager().list_session_links(info.session_id)
+    effective_budget = max_chars or info.output_budget_chars
+    if detail_level == "handoff":
+        progress = engine.get_reasoning_progress()
+        route_lines = ["## Handoff"]
+        if progress is not None:
+            route_lines.extend(
+                [
+                    f"Task: {progress.task}",
+                    f"Intent: {progress.intent} | Depth: {progress.depth}",
+                    f"Frameworks: {', '.join(progress.frameworks) or '(none)'}",
+                    f"Completed phases: {', '.join(progress.completed_phases) or '(none)'}",
+                    f"Next tool: {progress.next_tool or 'none'}",
+                    f"Important refs: {', '.join(progress.important_refs[:20]) or '(none)'}",
+                ]
+            )
+            if progress.constraints:
+                route_lines.append("Constraints: " + "; ".join(progress.constraints[:10]))
+            if progress.unresolved_questions:
+                route_lines.append(
+                    "Open questions: " + "; ".join(progress.unresolved_questions[:10])
+                )
+        else:
+            route_lines.append("No explicit reasoning route stored.")
+        summary = "\n".join(
+            [
+                *route_lines,
+                "",
+                engine.get_summary(max_items_per_category, detail_level="synopsis"),
+                "",
+                "## Quality Gaps",
+                *_session_audit_lines(engine),
+            ]
+        )
+    else:
+        summary = engine.get_summary(max_items_per_category, detail_level=detail_level)
+
+    mgr = get_session_manager()
+    links = mgr.list_session_links(info.session_id)
+    parent = mgr.resolve_to_parent(info.session_id)
+    if parent is not None:
+        links.extend(
+            link
+            for link in mgr.list_session_links(parent.parent_id)
+            if link.id not in {item.id for item in links}
+        )
     if links:
         link_lines = ["\n### Cross-Session Links"]
         for link in links[:10]:
@@ -4685,6 +5272,39 @@ async def think_summarize(
                 f"--[{link.relationship}]--> {link.session_b}:{link.node_b_id}"
             )
         summary = summary + "\n" + "\n".join(link_lines)
+
+    if include_linked_sessions:
+        related_ids: set[str] = set()
+        aliases = {info.session_id}
+        if parent is not None:
+            aliases.add(parent.parent_id)
+        for link in links:
+            if link.session_a in aliases:
+                related_ids.add(link.session_b)
+            elif link.session_b in aliases:
+                related_ids.add(link.session_a)
+        related_ids.update(member.session_id for member in mgr.list_shared_members(info.session_id))
+        related_sections: list[str] = []
+        for related_id in sorted(related_ids)[:5]:
+            try:
+                related = mgr.resolve_backend_session(related_id, "think")
+            except ValueError:
+                continue
+            if related.user_id != info.user_id or related.project_id != info.project_id:
+                continue
+            per_budget = max(500, (effective_budget or 10_000) // max(1, len(related_ids)))
+            related_summary = await think_summarize(
+                session_id=related.session_id,
+                max_items_per_category=min(max_items_per_category, 10),
+                detail_level="synopsis",
+                max_chars=per_budget,
+                include_linked_sessions=False,
+            )
+            related_sections.append(
+                f"### Linked Session {related.session_id}\n{related_summary}"
+            )
+        if related_sections:
+            summary += "\n\n## Linked Session Context\n" + "\n\n".join(related_sections)
     graph_refs = sorted(
         {
             ref
@@ -4697,11 +5317,18 @@ async def think_summarize(
         entity_names=graph_refs[:5],
     )
     if graph_lines:
-        summary = summary + "\n\n### Cross-Backend Graph Context\n" + "\n".join(
-            f"- {line}" if index == 0 else f"  {line}"
-            for index, line in enumerate(graph_lines)
+        summary = (
+            summary
+            + "\n\n### Cross-Backend Graph Context\n"
+            + "\n".join(
+                f"- {line}" if index == 0 else f"  {line}" for index, line in enumerate(graph_lines)
+            )
         )
-    return f"Session: {info.session_id}\n{summary}"
+    result = f"Session: {info.session_id}\n{summary}"
+    if effective_budget is not None and len(result) > effective_budget:
+        suffix = "\n\n[Summary truncated. Use index or narrower refs.]"
+        return result[: max(0, effective_budget - len(suffix))] + suffix
+    return result
 
 
 # ── Tool: Destroy Session ────────────────────────────────────
@@ -4710,6 +5337,10 @@ async def think_summarize(
 async def think_create_session(
     user_id: str | None = None,
     project_id: str | None = None,
+    reasoning_intent: str | None = None,
+    reasoning_depth: str | None = None,
+    output_budget_chars: int | None = None,
+    share_from_session_id: str | None = None,
     ctx: _MCPContext | None = None,
 ) -> str:
     """[INFRA] Create a new thinking session bound to (user_id, project_id).
@@ -4718,28 +5349,61 @@ async def think_create_session(
     lets you create an identity-bound session explicitly when you need to
     share it across multiple agents in the same project.
 
-    Multi-tenant: if Bearer auth is configured, user_id comes from
-    ctx.client_id (parameter ignored); otherwise the parameter (or the
-    configured default) is used.
+    Multi-tenant: a verified MCP v2 bearer principal overrides request metadata
+    and parameters; otherwise the request metadata, parameter, or configured
+    default is used.
 
     Example: think_create_session(project_id="analysis") → returns session_id
 
     Args:
         user_id: Owner identity. Ignored when Bearer auth is configured.
         project_id: Project scope. Default: configured default_project_id.
+        reasoning_intent / reasoning_depth: Optional route metadata.
+        output_budget_chars: Default bound used by session summaries.
+        share_from_session_id: Reuse another same-owner/project session's
+            mutable thinking engine and lock under a distinct session ID.
 
     Returns:
         Session ID bound to the resolved (user_id, project_id).
     """
+    if reasoning_depth is not None and reasoning_depth not in {"quick", "standard", "deep"}:
+        raise ValueError("reasoning_depth must be quick, standard, or deep")
+    if output_budget_chars is not None and not 1_000 <= output_budget_chars <= 500_000:
+        raise ValueError("output_budget_chars must be between 1000 and 500000")
     resolved_user, resolved_project = resolve_identity(ctx, user_id, project_id)
     mgr = get_session_manager()
-    info = await anyio.to_thread.run_sync(
-        lambda: mgr.create_session("think", resolved_user, resolved_project)
-    )
+    if share_from_session_id:
+        info = await run_sync(
+            lambda: mgr.create_shared_session(
+                share_from_session_id,
+                "think",
+                resolved_user,
+                resolved_project,
+                reasoning_intent=reasoning_intent,
+                reasoning_depth=reasoning_depth,
+                output_budget_chars=output_budget_chars,
+            )
+        )
+    else:
+        info = await run_sync(
+            lambda: mgr.create_session(
+                "think",
+                resolved_user,
+                resolved_project,
+                reasoning_intent=reasoning_intent,
+                reasoning_depth=reasoning_depth,
+                output_budget_chars=output_budget_chars,
+            )
+        )
+    shared_line = f"\nshared_from: {share_from_session_id}" if share_from_session_id else ""
     return (
         f"Thinking session created.\n"
         f"session_id: {info.session_id}\n"
         f"user_id: {info.user_id} | project_id: {info.project_id}\n"
+        f"reasoning_intent: {info.reasoning_intent or '(unset)'}"
+        f" | reasoning_depth: {info.reasoning_depth or '(unset)'}"
+        f" | output_budget_chars: {info.output_budget_chars or '(default)'}"
+        f"{shared_line}\n"
         f"Pass this session_id to think_graph, think_decide, think_model, etc. "
         f"to scope thinking to this project. Share the session_id with other "
         f"agents in the same project to collaborate."
@@ -4756,7 +5420,7 @@ async def think_destroy_session(session_id: str) -> str:
         Confirmation of session destruction.
     """
     mgr, _ = _require_think_session(session_id)
-    await anyio.to_thread.run_sync(lambda: mgr.destroy_session(session_id))
+    await run_sync(lambda: mgr.destroy_session(session_id))
     return f"Session: {session_id} | Destroyed"
 
 
@@ -4881,8 +5545,21 @@ def _ip_status_output(
     return "\n".join(lines)
 
 
+@track_reasoning_progress("think_interfere")
 async def think_interfere(
-    action: str,
+    action: Literal[
+        "set_domain",
+        "add_frame",
+        "add_source",
+        "add_fragment",
+        "add_tension",
+        "crystallize",
+        "add_necessity",
+        "update_necessity",
+        "stress_test",
+        "finalize",
+        "recurse",
+    ],
     session_id: str | None = None,
     protocol_id: str | None = None,
     target_domain: str | None = None,
@@ -4980,7 +5657,7 @@ async def think_interfere(
     """
     _validate_enum(action, _IP_ACTIONS, "action")
 
-    _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
+    _, info = await run_sync(lambda: _get_or_create_think_session(session_id, ctx))
     engine = _engine(info)
     sid = info.session_id
 

@@ -9,11 +9,11 @@ AISmartBuddy is a Python MCP server providing AI assistants with temporary SQL (
 ## Tech Stack
 
 - **Language:** Python 3.12+
-- **MCP SDK:** `mcp` (FastMCP) — official Python SDK
+- **MCP SDK:** `mcp==2.0.0b1` (`MCPServer`) — official Python SDK v2 beta
 - **SQL Engine:** DuckDB via `duckdb` package
-- **Graph Engine:** LadybugDB via `real-ladybug` package
+- **Graph Engine:** LadybugDB via the maintained `ladybug` package
 - **Data Pipeline:** Arrow (`pyarrow`) → Polars (`polars`) for query results. 10-100x faster than csv.writer.
-- **Transport:** stdio (default), SSE for remote
+- **Transport:** stdio (default), Streamable HTTP for remote, legacy SSE
 - **Package manager:** `uv` (preferred)
 - **Build backend:** hatchling
 
@@ -22,7 +22,7 @@ AISmartBuddy is a Python MCP server providing AI assistants with temporary SQL (
 ```bash
 uv sync                                  # Install dependencies
 uv run python -m aismartbuddy            # Run server (stdio)
-uv run python -m aismartbuddy --transport sse --port 8000  # Run server (SSE)
+uv run python -m aismartbuddy --transport streamable-http --port 8000
 uv run pytest -v                         # Run all tests
 uv run pytest tests/test_sql_tools.py::test_name -v  # Single test
 uv run pyright                           # Type check
@@ -33,7 +33,7 @@ uv run ruff format src/ tests/           # Format
 ## Architecture
 
 ```
-__main__.py (Click CLI) → server.py (FastMCP + lifespan + optional Entra auth)
+__main__.py (Click CLI) → server.py (MCPServer + lifespan + optional Entra auth)
   ├── identity.py (resolve_identity from ctx/params/env)
   ├── auth.py (optional EntraTokenVerifier — activated via env vars)
   ├── youtube_client.py (shared YoutubeDL + http session)
@@ -52,8 +52,8 @@ __main__.py (Click CLI) → server.py (FastMCP + lifespan + optional Entra auth)
       formatting.py (Arrow/Polars CSV + legacy csv.writer) ─┘
 ```
 
-- **server.py** — FastMCP instance with ~55 tools, 5 prompts, 2 resources. Lifespan manages SessionManager + YouTubeClient init/cleanup.
-- **identity.py** — Multi-tenant identity resolution. `resolve_identity(ctx, user_id, project_id)` returns validated `(user_id, project_id)` tuple using priority: ctx.client_id (Bearer auth) → tool parameter → RuntimeConfig default → literal "default". Path-component validation prevents filesystem traversal.
+- **server.py** — MCPServer v2 instance with 74 tools, prompts, and resources. Lifespan manages shared services and cleanup.
+- **identity.py** — Multi-tenant identity resolution. Bearer identity comes from MCP v2 `get_access_token()` and takes priority over request metadata/tool parameters. Path-component validation prevents filesystem traversal.
 - **youtube_client.py** — Shared `YouTubeClient` dataclass (requests.Session + YoutubeDL) plus `parse_video_id()` helper that accepts raw 11-char IDs, `watch?v=`, `youtu.be/`, `embed/`, and `shorts/` URLs. Module-level singleton initialized in `app_lifespan` (best-effort — failure does not block server startup; the tool checks for `None` at call time). YoutubeDL uses a no-op logger (to bypass `no_warnings` being overridden by custom loggers) and skips dash/hls format manifests for 2-3× faster metadata-only extraction.
 - **session.py** — Thread-safe SessionManager singleton (uses `threading.Lock`). Maps session_id → engine. Supports "sql", "graph", and "think" session types. Auto-cleans expired sessions and stale pagination cursors.
 - **tools/** — Async tool functions. Access SessionManager via `tools.get_session_manager()`. Wrap blocking engine calls with `anyio.to_thread.run_sync()`.
@@ -111,8 +111,8 @@ When a SCAFFOLD/ASSESS items[] call sets `auto_graph=True` AND the session has a
 
 Sessions are bound to **(user_id, project_id)** at creation. This supports multiple users, multiple projects per user, and multiple sessions/agents per (user, project) — all isolated from each other on the backend:
 
-- **Identity resolution** (in `identity.py`): `user_id` comes from `ctx.client_id` when MCP Bearer auth is configured (priority 1), otherwise from explicit tool parameter (priority 2), otherwise from `--default-user-id` / `AISMARTBUDDY_DEFAULT_USER_ID` config (priority 3), otherwise literal `"default"`. `project_id` follows the same fallback chain without the Bearer-token path.
-- **Session ID entropy:** 128 bits (`uuid.uuid4().hex`, 32 hex chars) — session_id acts as a capability token. Possession equals authorization in the default case; under Bearer auth the ownership check also validates `session.user_id == ctx.client_id`.
+- **Identity resolution** (in `identity.py`): verified MCP v2 bearer identity from `get_access_token()` wins, followed by request metadata, explicit tool parameter, configured default, then `"default"`.
+- **Session ID entropy:** 128 bits (`uuid.uuid4().hex`, 32 hex chars) — session_id acts as a capability token. Under Bearer auth ownership is validated against the verified access-token principal.
 - **Temp layout:** `{temp_dir}/aismartbuddy/{user_id}/{project_id}/{session_id}/` — disk hierarchy mirrors logical hierarchy.
 - **Per-session lock:** each `SessionInfo` carries a `threading.Lock`. SQL/graph tools acquire it via `run_with_lock(info, fn)` (in `tools/__init__.py`) so two agents sharing a session serialize rather than corrupt engine state.
 - **ThinkingEngine thread safety (three layered patterns):**
@@ -140,16 +140,16 @@ export AISMARTBUDDY_ENTRA_AUDIENCE="api://<app-id-uri>"
 # Optional:
 export AISMARTBUDDY_ENTRA_REQUIRED_SCOPE="mcp.invoke"
 export AISMARTBUDDY_ENTRA_RESOURCE_SERVER_URL="https://your-host/"
-uvx --from git+https://github.com/meghuizen/aismartbuddy aismartbuddy --transport sse
+uvx --from git+https://github.com/meghuizen/aismartbuddy aismartbuddy --transport streamable-http
 ```
 
-When activated, `server.py:_maybe_build_entra_auth` constructs the verifier + `AuthSettings` and passes them to `FastMCP(...)`. `ctx.client_id` in tool calls becomes the Entra `oid` claim — automatically picked up by `identity.py:resolve_identity` so every session is bound to the authenticated principal. Without these env vars, the server starts unauthenticated (current default behaviour).
+When activated, `server.py:_maybe_build_entra_auth` constructs the verifier + `AuthSettings` and passes them to `MCPServer(...)`. `identity.py` reads the verified Entra `oid` from MCP v2's bearer auth context, so every session is bound to the authenticated principal. Without these env vars, the server starts unauthenticated.
 
 If only one of the two required env vars is set, the server logs a warning and runs without auth (fail-open by design — partial config is treated as "not configured"). If `[entra]` extras aren't installed but the env vars are set, the server exits with a clear "install aismartbuddy[entra]" message (fail-closed for security).
 
 ### 2. Generic Bearer token (write your own verifier)
 
-For non-Entra OAuth issuers, implement your own `TokenVerifier` subclass and pass it to `FastMCP(...)` like the Entra path does. The pattern in `auth.py` (JWKS fetch + cache + RS256 verify) is reusable.
+For non-Entra OAuth issuers, implement your own `TokenVerifier` subclass and pass it to `MCPServer(...)` like the Entra path does. The pattern in `auth.py` is reusable.
 
 ```python
 from mcp.server.auth.provider import TokenVerifier
@@ -164,7 +164,7 @@ class MyVerifier(TokenVerifier):
 
 `server.py:_maybe_build_entra_auth` shows the wiring pattern for any custom verifier (read RuntimeConfig, lazy-import the verifier class, return `(verifier, AuthSettings)` tuple). Replace `EntraTokenVerifier` with your own.
 
-When configured, `ctx.client_id` becomes the authoritative `user_id` — tool-level `user_id` parameters are ignored to prevent claim spoofing. Without configuration, `user_id` is taken from the tool parameter or the configured default, which is appropriate for single-tenant stdio use.
+When configured, `get_access_token().client_id` becomes the authoritative `user_id` — tool-level parameters and request metadata cannot spoof it. Without configuration, `user_id` comes from request metadata, the tool parameter, or the configured default.
 
 ## MCP Integration
 

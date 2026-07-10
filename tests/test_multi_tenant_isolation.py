@@ -11,6 +11,7 @@ from __future__ import annotations
 import threading
 import time
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -67,11 +68,13 @@ class TestIdentityResolution:
         assert project_id == "default"
 
     def test_resolve_identity_ctx_overrides_param(self):
-        """ctx.client_id wins over user_id parameter (Bearer auth case)."""
+        """Request metadata client_id wins when no bearer auth is present."""
         class FakeCtx:
             client_id = "authenticated_user"
         user_id, _ = resolve_identity(
-            ctx=FakeCtx(), user_id="attacker_claim", project_id="p"
+            ctx=cast(Any, FakeCtx()),
+            user_id="attacker_claim",
+            project_id="p",
         )
         assert user_id == "authenticated_user"
 
@@ -138,12 +141,14 @@ class TestOwnership:
         # Case 1: truly missing
         try:
             mt_manager.get_session("00000000000000000000000000000000")
+            pytest.fail("expected ValueError for missing session")
         except ValueError as e:
             missing_msg = str(e)
 
         # Case 2: exists but owned by alice
         try:
             mt_manager.get_session(alice.session_id, user_id="bob", project_id="acme")
+            pytest.fail("expected ValueError for wrong-owner session")
         except ValueError as e:
             wrong_user_msg = str(e)
 

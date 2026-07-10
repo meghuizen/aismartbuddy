@@ -3,7 +3,7 @@
 Multi-tenant model:
 - Every session is bound to (user_id, project_id) at creation.
 - Session_id acts as a capability token (128-bit entropy, unguessable).
-- When identity is known via ctx.client_id (Bearer auth), ownership is verified.
+- When identity is known via MCP v2 bearer auth context, ownership is verified.
 - Per-session threading.Lock serializes concurrent tool calls from multiple agents
   sharing the same session, preventing ThinkingEngine state corruption.
 - Temp directory layout: {base}/aismartbuddy/{user_id}/{project_id}/{session_id}/
@@ -58,6 +58,9 @@ class ParentSession:
     enforcement: str = "advisory"
     max_node_chars: int = 500
     auto_graph: bool = False
+    reasoning_intent: str | None = None
+    reasoning_depth: str | None = None
+    output_budget_chars: int | None = None
 
 
 @dataclass
@@ -96,7 +99,31 @@ class SessionInfo:
     mode: str = "analyze"
     enforcement: str = "advisory"
     max_node_chars: int = 500
+    reasoning_intent: str | None = None
+    reasoning_depth: str | None = None
+    output_budget_chars: int | None = None
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+
+@dataclass
+class SharedBackendHandle:
+    """Own one engine, lock, backing directory, and its session aliases."""
+
+    id: str
+    session_type: str
+    user_id: str
+    project_id: str
+    db_path: str
+    temp_dir: str
+    engine: Union[DuckDBEngine, LadybugEngine, ThinkingEngine, None] = field(
+        default=None, repr=False
+    )
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    members: set[str] = field(default_factory=set)
+
+    @property
+    def ref_count(self) -> int:
+        return len(self.members)
 
 
 class SessionManager:
@@ -129,6 +156,8 @@ class SessionManager:
         self._ladybug_buffer_pool_size = ladybug_buffer_pool_size
         self._ladybug_max_threads = ladybug_max_threads
         self._sessions: dict[str, SessionInfo] = {}
+        self._backend_handles: dict[str, SharedBackendHandle] = {}
+        self._handle_id_by_session: dict[str, str] = {}
         # parent_id → ParentSession (facade routing to backend children)
         self._parent_sessions: dict[str, ParentSession] = {}
         self._active_session_id: str | None = None
@@ -163,6 +192,9 @@ class SessionManager:
         mode: str = "analyze",
         enforcement: str = "advisory",
         max_node_chars: int = 500,
+        reasoning_intent: str | None = None,
+        reasoning_depth: str | None = None,
+        output_budget_chars: int | None = None,
     ) -> SessionInfo:
         """Create a new database session bound to (user_id, project_id).
 
@@ -230,6 +262,16 @@ class SessionManager:
             shutil.rmtree(str(session_dir), ignore_errors=True)
             raise
 
+        handle = SharedBackendHandle(
+            id=uuid.uuid4().hex,
+            session_type=session_type,
+            user_id=user_id,
+            project_id=project_id,
+            db_path=db_path,
+            temp_dir=str(session_dir),
+            engine=engine,
+            members={session_id},
+        )
         info = SessionInfo(
             session_id=session_id,
             session_type=session_type,
@@ -242,10 +284,16 @@ class SessionManager:
             mode=mode,
             enforcement=enforcement,
             max_node_chars=max_node_chars,
+            reasoning_intent=reasoning_intent,
+            reasoning_depth=reasoning_depth,
+            output_budget_chars=output_budget_chars,
             engine=engine,
+            lock=handle.lock,
         )
         with self._lock:
             self._sessions[session_id] = info
+            self._backend_handles[handle.id] = handle
+            self._handle_id_by_session[session_id] = handle.id
             if self._active_session_id is None:
                 self._active_session_id = session_id
         logger.info(
@@ -256,6 +304,110 @@ class SessionManager:
             project_id,
         )
         return info
+
+    def _handle_for_session_locked(self, info: SessionInfo) -> SharedBackendHandle:
+        """Return or adopt the handle for a session while ``self._lock`` is held."""
+
+        handle_id = self._handle_id_by_session.get(info.session_id)
+        handle = self._backend_handles.get(handle_id or "")
+        if handle is not None:
+            return handle
+        handle = SharedBackendHandle(
+            id=uuid.uuid4().hex,
+            session_type=info.session_type,
+            user_id=info.user_id,
+            project_id=info.project_id,
+            db_path=info.db_path,
+            temp_dir=info.temp_dir,
+            engine=info.engine,
+            lock=info.lock,
+            members={info.session_id},
+        )
+        self._backend_handles[handle.id] = handle
+        self._handle_id_by_session[info.session_id] = handle.id
+        return handle
+
+    def create_shared_session(
+        self,
+        source_session_id: str,
+        session_type: str,
+        user_id: str,
+        project_id: str,
+        *,
+        mode: str | None = None,
+        enforcement: str | None = None,
+        max_node_chars: int | None = None,
+        reasoning_intent: str | None = None,
+        reasoning_depth: str | None = None,
+        output_budget_chars: int | None = None,
+    ) -> SessionInfo:
+        """Create a distinct session ID over an existing mutable backend."""
+
+        source = self.resolve_backend_session(source_session_id, session_type)
+        if source.user_id != user_id or source.project_id != project_id:
+            raise ValueError("Shared sessions must have the same user_id and project_id")
+
+        alias_id = uuid.uuid4().hex
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            # Re-check that the source was not destroyed after resolution.
+            current = self._sessions.get(source.session_id)
+            if current is None:
+                raise ValueError(_NOT_FOUND_MSG_TMPL.format(session_id=source_session_id))
+            handle = self._handle_for_session_locked(current)
+            handle.members.add(alias_id)
+            info = SessionInfo(
+                session_id=alias_id,
+                session_type=session_type,
+                user_id=user_id,
+                project_id=project_id,
+                db_path=handle.db_path,
+                temp_dir=handle.temp_dir,
+                created_at=now,
+                last_accessed=now,
+                engine=handle.engine,
+                mode=mode if mode is not None else source.mode,
+                enforcement=enforcement if enforcement is not None else source.enforcement,
+                max_node_chars=(
+                    max_node_chars if max_node_chars is not None else source.max_node_chars
+                ),
+                reasoning_intent=(
+                    reasoning_intent
+                    if reasoning_intent is not None
+                    else source.reasoning_intent
+                ),
+                reasoning_depth=(
+                    reasoning_depth if reasoning_depth is not None else source.reasoning_depth
+                ),
+                output_budget_chars=(
+                    output_budget_chars
+                    if output_budget_chars is not None
+                    else source.output_budget_chars
+                ),
+                lock=handle.lock,
+            )
+            self._sessions[alias_id] = info
+            self._handle_id_by_session[alias_id] = handle.id
+        logger.info(
+            "Created shared %s session %s from %s (members=%d)",
+            session_type,
+            alias_id,
+            source.session_id,
+            handle.ref_count,
+        )
+        return info
+
+    def list_shared_members(self, session_id: str) -> list[SessionInfo]:
+        """Return other session aliases sharing the same mutable backend."""
+
+        info = self.get_session(session_id)
+        with self._lock:
+            handle_id = self._handle_id_by_session.get(info.session_id)
+            handle = self._backend_handles.get(handle_id or "")
+            if handle is None:
+                return []
+            member_ids = [value for value in handle.members if value != info.session_id]
+            return [self._sessions[value] for value in member_ids if value in self._sessions]
 
     def get_session(
         self,
@@ -312,13 +464,30 @@ class SessionManager:
             if project_id is not None and info.project_id != project_id:
                 raise not_found
             self._sessions.pop(session_id, None)
+            close_backend = self._detach_handle_locked(session_id)
             if self._active_session_id == session_id:
                 self._active_session_id = None
             self._drop_session_aux_state(session_id)
         # Wait for any in-flight tool call on this session to finish
         with info.lock:
-            self._close_session(info)
+            if close_backend:
+                self._close_session(info)
         logger.info("Destroyed session: %s", session_id)
+
+    def _detach_handle_locked(self, session_id: str) -> bool:
+        """Detach one alias; return True when its backend must be closed."""
+
+        handle_id = self._handle_id_by_session.pop(session_id, None)
+        if handle_id is None:
+            return True  # legacy or test-created SessionInfo
+        handle = self._backend_handles.get(handle_id)
+        if handle is None:
+            return True
+        handle.members.discard(session_id)
+        if handle.members:
+            return False
+        self._backend_handles.pop(handle_id, None)
+        return True
 
     def create_parent_session(
         self,
@@ -329,6 +498,11 @@ class SessionManager:
         enforcement: str = "advisory",
         max_node_chars: int = 500,
         auto_graph: bool = False,
+        reasoning_intent: str | None = None,
+        reasoning_depth: str | None = None,
+        output_budget_chars: int | None = None,
+        share_from_session_id: str | None = None,
+        share_backends: list[str] | None = None,
     ) -> ParentSession:
         """Create a parent session that holds one child session per backend.
 
@@ -358,18 +532,67 @@ class SessionManager:
         validate_identity(user_id, "user_id")
         validate_identity(project_id, "project_id")
 
+        requested_shared = set(share_backends or (backends if share_from_session_id else []))
+        if requested_shared - set(backends):
+            raise ValueError("share_backends must be a subset of backends")
+        if share_backends and not share_from_session_id:
+            raise ValueError("share_from_session_id is required when share_backends is set")
+        if share_from_session_id:
+            source_parent = self.resolve_to_parent(share_from_session_id)
+            if source_parent is not None:
+                source_user = source_parent.user_id
+                source_project = source_parent.project_id
+            else:
+                source_info = self.get_session(share_from_session_id)
+                source_user = source_info.user_id
+                source_project = source_info.project_id
+            if source_user != user_id or source_project != project_id:
+                raise ValueError("Shared sessions must have the same user_id and project_id")
+
         # Create child sessions sequentially. If any fails, roll back.
         children: dict[str, str] = {}
         try:
             for backend in backends:
-                child = self.create_session(
-                    backend,
-                    user_id,
-                    project_id,
-                    mode=mode,
-                    enforcement=enforcement,
-                    max_node_chars=max_node_chars,
-                )
+                if share_from_session_id and backend in requested_shared:
+                    try:
+                        child = self.create_shared_session(
+                            share_from_session_id,
+                            backend,
+                            user_id,
+                            project_id,
+                            mode=mode,
+                            enforcement=enforcement,
+                            max_node_chars=max_node_chars,
+                            reasoning_intent=reasoning_intent,
+                            reasoning_depth=reasoning_depth,
+                            output_budget_chars=output_budget_chars,
+                        )
+                    except ValueError:
+                        if share_backends is not None:
+                            raise
+                        child = self.create_session(
+                            backend,
+                            user_id,
+                            project_id,
+                            mode=mode,
+                            enforcement=enforcement,
+                            max_node_chars=max_node_chars,
+                            reasoning_intent=reasoning_intent,
+                            reasoning_depth=reasoning_depth,
+                            output_budget_chars=output_budget_chars,
+                        )
+                else:
+                    child = self.create_session(
+                        backend,
+                        user_id,
+                        project_id,
+                        mode=mode,
+                        enforcement=enforcement,
+                        max_node_chars=max_node_chars,
+                        reasoning_intent=reasoning_intent,
+                        reasoning_depth=reasoning_depth,
+                        output_budget_chars=output_budget_chars,
+                    )
                 children[backend] = child.session_id
         except Exception:
             # Roll back any children already created
@@ -391,6 +614,9 @@ class SessionManager:
             enforcement=enforcement,
             max_node_chars=max_node_chars,
             auto_graph=auto_graph,
+            reasoning_intent=reasoning_intent,
+            reasoning_depth=reasoning_depth,
+            output_budget_chars=output_budget_chars,
             created_at=now,
             last_accessed=now,
         )
@@ -413,10 +639,18 @@ class SessionManager:
     ) -> SessionInfo:
         """Resolve session_id (parent OR direct child) to a SessionInfo for a backend.
 
-        - If session_id is a direct child session_id (single-backend): returns
-          its SessionInfo unchanged. Backend type must match (else ValueError).
-        - If session_id is a parent_id: looks up the child for `backend`. Raises
-          ValueError if the parent has no child for that backend.
+        Three resolution paths:
+        1. parent_id → returns the child for `backend` (raises if parent has no
+           child of that backend type).
+        2. direct child_id matching `backend` → returns it unchanged.
+        3. direct child_id of WRONG backend type that belongs to a unified
+           parent → walks up to the parent and returns the sibling child for
+           `backend`. This makes the documented "pass the returned session_id
+           to all tools" contract work transparently when the user holds a
+           think child ID but is calling a graph tool (or vice versa).
+
+        Falls through to ValueError only when (a) no parent exists OR (b) the
+        parent has no sibling for the requested backend.
 
         Args:
             session_id: Either a direct child session_id or a parent_id.
@@ -430,14 +664,31 @@ class SessionManager:
                     "Create a session first or call think_set_active_session(session_id)."
                 )
 
-        # Try parent first
+        # Resolve to the target backend child in one locked block. Three
+        # paths considered atomically so a concurrent destroy_parent_session
+        # cannot create a stale-reference window between the type check and
+        # the sibling lookup:
+        #   1. session_id is a parent_id → use parent.children[backend]
+        #   2. session_id is a child of some parent → walk up, then dispatch
+        #      to the sibling for `backend`
+        #   3. session_id is a standalone session of the requested backend
+        #      → fall through to validation
+        actual_session_id: str
+        wrong_type_seen: str | None = None
         with self._lock:
             parent = self._parent_sessions.get(session_id)
+            if parent is None:
+                # Could be a child of a unified parent — search children index
+                # (linear over parents; small N in practice, single-pass).
+                for candidate in self._parent_sessions.values():
+                    if session_id in candidate.children.values():
+                        parent = candidate
+                        break
             if parent is not None:
                 child_id = parent.children.get(backend)
                 if child_id is None:
                     raise ValueError(
-                        f"Parent session '{session_id}' has no '{backend}' "
+                        f"Parent session '{parent.parent_id}' has no '{backend}' "
                         "backend. Recreate with session_create("
                         f"backends=[..., '{backend}']) or use a "
                         f"{backend}_create_session."
@@ -446,7 +697,16 @@ class SessionManager:
                 actual_session_id = child_id
             else:
                 actual_session_id = session_id
-        # Fall back to direct child lookup (also enforces session_type)
+                # Peek session_type to surface the same wrong-backend error
+                # message as before when no parent linkage exists.
+                peek = self._sessions.get(actual_session_id)
+                if peek is not None and peek.session_type != backend:
+                    wrong_type_seen = peek.session_type
+        if wrong_type_seen is not None:
+            raise ValueError(
+                f"Session '{actual_session_id}' is a {wrong_type_seen} session, not {backend}."
+            )
+        # Direct child lookup (also enforces session_type for the resolved id)
         info = self.get_session(actual_session_id)
         if info.session_type != backend:
             raise ValueError(
@@ -540,6 +800,26 @@ class SessionManager:
                     return parent
         return None
 
+    def resolve_to_parent(self, session_id: str | None) -> ParentSession | None:
+        """Return the parent for a session_id, whether it IS a parent_id or
+        a child of one. Returns None if no parent linkage exists.
+
+        Use this in tools that need parent-aware behavior without caring
+        whether the caller passed the parent's own id or a child id. Replaces
+        the ``parents.get(sid) or find_parent_for_child(sid)`` pattern that
+        previously reached into ``_parent_sessions`` from multiple call sites.
+        """
+        if not session_id:
+            return None
+        with self._lock:
+            parent = self._parent_sessions.get(session_id)
+            if parent is not None:
+                return parent
+            for candidate in self._parent_sessions.values():
+                if session_id in candidate.children.values():
+                    return candidate
+        return None
+
     def find_companion_session(self, child_session_id: str, backend: str) -> str | None:
         """Return a sibling backend session for a child session, if available."""
         parent = self.find_parent_for_child(child_session_id)
@@ -553,36 +833,63 @@ class SessionManager:
         Internal use only — not exposed as an MCP tool.
         Returns the new child session_id.
         Raises ValueError if parent not found or backend already exists.
+
+        Concurrency: we drop the lock to call create_session (which acquires
+        info.lock and may take non-trivial time to spin up an engine). To
+        prevent two racing add_backend calls from both creating a child and
+        the second one orphaning the first, we re-check `backend in
+        parent.children` under the lock after creation and destroy our own
+        child on conflict.
         """
         with self._lock:
             parent = self._parent_sessions.get(parent_id)
             if parent is None:
                 raise ValueError(_NOT_FOUND_MSG_TMPL.format(session_id=parent_id))
             if backend in parent.children:
-                raise ValueError(
-                    f"Parent session '{parent_id}' already has a '{backend}' backend."
-                )
+                raise ValueError(f"Parent session '{parent_id}' already has a '{backend}' backend.")
+            # Snapshot the fields create_session needs so we don't dereference
+            # a possibly-destroyed parent outside the lock.
+            user_id = parent.user_id
+            project_id = parent.project_id
+            mode = parent.mode
+            enforcement = parent.enforcement
+            max_node_chars = parent.max_node_chars
+            reasoning_intent = parent.reasoning_intent
+            reasoning_depth = parent.reasoning_depth
+            output_budget_chars = parent.output_budget_chars
         child = self.create_session(
             backend,
-            parent.user_id,
-            parent.project_id,
-            mode=parent.mode,
-            enforcement=parent.enforcement,
-            max_node_chars=parent.max_node_chars,
+            user_id,
+            project_id,
+            mode=mode,
+            enforcement=enforcement,
+            max_node_chars=max_node_chars,
+            reasoning_intent=reasoning_intent,
+            reasoning_depth=reasoning_depth,
+            output_budget_chars=output_budget_chars,
         )
         cleanup_child: str | None = None
+        conflict = False
         with self._lock:
             parent = self._parent_sessions.get(parent_id)
             if parent is None:
                 cleanup_child = child.session_id
+            elif backend in parent.children:
+                # Lost a race against another add_backend for the same backend.
+                cleanup_child = child.session_id
+                conflict = True
             else:
                 parent.children[backend] = child.session_id
         if cleanup_child is not None:
             self.destroy_session(cleanup_child)
+            if conflict:
+                raise ValueError(f"Parent session '{parent_id}' already has a '{backend}' backend.")
             raise ValueError(_NOT_FOUND_MSG_TMPL.format(session_id=parent_id))
         logger.info(
             "Added '%s' backend to parent session %s (child=%s)",
-            backend, parent_id, child.session_id,
+            backend,
+            parent_id,
+            child.session_id,
         )
         return child.session_id
 
@@ -608,8 +915,10 @@ class SessionManager:
         if not relationship:
             raise ValueError("relationship is required")
         # Existence check resolves parent/direct child capability tokens.
-        self.resolve_backend_session(session_a, "think")
-        self.resolve_backend_session(session_b, "think")
+        left = self.resolve_backend_session(session_a, "think")
+        right = self.resolve_backend_session(session_b, "think")
+        if left.user_id != right.user_id or left.project_id != right.project_id:
+            raise ValueError("Linked sessions must have the same user_id and project_id")
         link = SessionLink(
             id=uuid.uuid4().hex[:12],
             session_a=session_a,
@@ -640,7 +949,7 @@ class SessionManager:
         Returns count of sessions removed.
         """
         now = datetime.now(timezone.utc)
-        to_close: list[SessionInfo] = []
+        to_close: list[tuple[SessionInfo, bool]] = []
         active_sessions: list[SessionInfo] = []
         with self._lock:
             expired = [
@@ -651,7 +960,7 @@ class SessionManager:
             for sid in expired:
                 info = self._sessions.pop(sid, None)
                 if info is not None:
-                    to_close.append(info)
+                    to_close.append((info, self._detach_handle_locked(sid)))
             # Snapshot still-active sessions for cursor cleanup outside _lock
             active_sessions = list(self._sessions.values())
             # GC parent sessions whose children are all gone OR whose
@@ -670,22 +979,24 @@ class SessionManager:
                 self._drop_session_aux_state(pid)
 
         # Close expired sessions (waits for any in-flight call first)
-        for info in to_close:
+        for info, close_backend in to_close:
             with info.lock:
-                self._close_session(info)
+                if close_backend:
+                    self._close_session(info)
             logger.info("Expired session cleaned up: %s", info.session_id)
 
         # Cursor cleanup on active sessions (try-acquire with short timeout;
         # skip if tool call is active — next cycle will retry)
         for info in active_sessions:
-            if info.engine is None or not hasattr(info.engine, "cleanup_expired_cursors"):
+            cleanup_cursors = getattr(info.engine, "cleanup_expired_cursors", None)
+            if not callable(cleanup_cursors):
                 continue
             # threading.Lock.acquire(timeout=1) is non-blocking enough
             got = info.lock.acquire(timeout=1.0)
             if not got:
                 continue
             try:
-                info.engine.cleanup_expired_cursors(self._cursor_timeout)
+                cleanup_cursors(self._cursor_timeout)
             except Exception:
                 logger.debug("Error cleaning cursors for %s", info.session_id)
             finally:
@@ -697,15 +1008,39 @@ class SessionManager:
         """Destroy all sessions. Called on server shutdown."""
         with self._lock:
             all_sessions = list(self._sessions.values())
+            handles = list(self._backend_handles.values())
             self._sessions.clear()
+            self._backend_handles.clear()
+            self._handle_id_by_session.clear()
             self._parent_sessions.clear()
             self._active_session_id = None
             self._idempotency_results.clear()
             self._session_links.clear()
-        for info in all_sessions:
-            # Waits for any in-flight tool call to finish
-            with info.lock:
-                self._close_session(info)
+        if handles:
+            handled_ids: set[str] = set()
+            for handle in handles:
+                with handle.lock:
+                    representative = next(
+                        (
+                            info
+                            for info in all_sessions
+                            if info.session_id in handle.members
+                        ),
+                        None,
+                    )
+                    if representative is not None:
+                        self._close_session(representative)
+                        handled_ids.update(handle.members)
+            for info in all_sessions:
+                if info.session_id in handled_ids:
+                    continue
+                with info.lock:
+                    self._close_session(info)
+        else:
+            for info in all_sessions:
+                # Legacy or test-created sessions without registered handles.
+                with info.lock:
+                    self._close_session(info)
         logger.info("All sessions cleaned up")
 
     def _close_session(self, info: SessionInfo) -> None:
@@ -716,8 +1051,9 @@ class SessionManager:
         """
         if info.engine is not None:
             try:
-                if hasattr(info.engine, "close_all_cursors"):
-                    info.engine.close_all_cursors()
+                close_cursors = getattr(info.engine, "close_all_cursors", None)
+                if callable(close_cursors):
+                    close_cursors()
                 info.engine.close()
             except Exception:
                 logger.exception("Error closing engine for session %s", info.session_id)

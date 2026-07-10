@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from aismartbuddy.config import (  # noqa: E402
+    DEFAULT_CRAWL_RETENTION,
     DEFAULT_CURSOR_TIMEOUT,
     DEFAULT_HOLON_TRUNCATE_CHARS,
     DEFAULT_HOLON_TRUNCATE_LONG,
@@ -27,18 +28,18 @@ from aismartbuddy.config import (  # noqa: E402
 @click.command()
 @click.option(
     "--transport",
-    type=click.Choice(["stdio", "sse"]),
+    type=click.Choice(["stdio", "streamable-http", "sse"]),
     default="stdio",
     envvar="AISMARTBUDDY_TRANSPORT",
-    help="Transport protocol (default: stdio).",
+    help="Transport protocol (default: stdio; streamable-http recommended remotely).",
 )
 @click.option(
     "--port", type=int, default=DEFAULT_PORT,
-    envvar="AISMARTBUDDY_PORT", help="Port for SSE transport.",
+    envvar="AISMARTBUDDY_PORT", help="Port for HTTP transports.",
 )
 @click.option(
     "--host", type=str, default=DEFAULT_HOST,
-    envvar="AISMARTBUDDY_HOST", help="Host for SSE transport.",
+    envvar="AISMARTBUDDY_HOST", help="Host for HTTP transports.",
 )
 @click.option(
     "--temp-dir", type=str, default=None,
@@ -59,6 +60,11 @@ from aismartbuddy.config import (  # noqa: E402
 @click.option(
     "--cursor-timeout", type=int, default=DEFAULT_CURSOR_TIMEOUT,
     envvar="AISMARTBUDDY_CURSOR_TIMEOUT", help="Pagination cursor timeout in seconds.",
+)
+@click.option(
+    "--crawl-retention", type=click.IntRange(min=60), default=DEFAULT_CRAWL_RETENTION,
+    envvar="AISMARTBUDDY_CRAWL_RETENTION",
+    help="Retain resumable crawl files in the temp folder for this many seconds.",
 )
 @click.option(
     "--duckdb-threads", type=int, default=0,
@@ -133,6 +139,7 @@ def main(
     max_chars: int,
     session_timeout: int,
     cursor_timeout: int,
+    crawl_retention: int,
     duckdb_threads: int,
     duckdb_memory_limit: str,
     ladybug_buffer_size: int,
@@ -157,6 +164,7 @@ def main(
         max_chars=max_chars,
         session_timeout=session_timeout,
         cursor_timeout=cursor_timeout,
+        crawl_retention=crawl_retention,
         host=host,
         port=port,
         transport=transport,
@@ -187,8 +195,11 @@ def main(
 
     if transport == "stdio":
         mcp.run(transport="stdio")
+    elif transport == "streamable-http":
+        click.echo(f"Streamable HTTP server: http://{host}:{port}/mcp", err=True)
+        mcp.run(transport="streamable-http", host=host, port=port)
     elif transport == "sse":
-        click.echo(f"SSE server: http://{host}:{port}", err=True)
+        click.echo(f"Legacy SSE server: http://{host}:{port}/sse", err=True)
         mcp.run(transport="sse", host=host, port=port)
 
 

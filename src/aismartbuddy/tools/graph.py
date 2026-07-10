@@ -7,9 +7,9 @@ import io
 import logging
 import re
 
-import anyio
-from mcp.server.fastmcp import Context
+from mcp.server.mcpserver import Context
 
+from aismartbuddy.concurrency import run_sync
 from aismartbuddy.engines import BaseEngine
 from aismartbuddy.formatting import format_result
 from aismartbuddy.identity import resolve_identity
@@ -85,9 +85,9 @@ async def graph_create_session(
     IMPORTANT: You must CREATE NODE TABLE before creating nodes.
     LadybugDB requires schema-first: define tables, then insert data.
 
-    Multi-tenant: bound to (user_id, project_id). If Bearer auth is configured,
-    user_id comes from ctx.client_id (parameter ignored); otherwise the
-    parameter (or configured default) is used.
+    Multi-tenant: bound to (user_id, project_id). A verified MCP v2 bearer
+    principal overrides request metadata and parameters; otherwise the request
+    metadata, parameter, or configured default is used.
 
     Example: graph_create_session(project_id="social") → returns session_id
 
@@ -100,7 +100,7 @@ async def graph_create_session(
     """
     resolved_user, resolved_project = resolve_identity(ctx, user_id, project_id)
     mgr = get_session_manager()
-    info = await anyio.to_thread.run_sync(
+    info = await run_sync(
         lambda: mgr.create_session("graph", resolved_user, resolved_project)
     )
     return (
@@ -243,7 +243,7 @@ async def graph_destroy_session(session_id: str | None = None) -> str:
         Confirmation message.
     """
     mgr, info = _require_graph_session(session_id)
-    await anyio.to_thread.run_sync(lambda: mgr.destroy_session(info.session_id))
+    await run_sync(lambda: mgr.destroy_session(info.session_id))
     return f"Graph session '{info.session_id}' destroyed and cleaned up."
 
 
@@ -1125,27 +1125,34 @@ async def graph_knowledge_relate(
 
     ts = datetime.now(timezone.utc).isoformat()
 
-    # Ensure relationship table exists
-    try:
-        await run_with_lock(
-            info,
-            lambda rt=rel_table: info.engine.execute(
-                f"CREATE REL TABLE IF NOT EXISTS {rt} ("
+    def _create_relation() -> tuple[int, int, int]:
+        try:
+            _, from_rows = info.engine.execute(
+                f"MATCH (a:KnowledgeNode {{name: '{safe_from}'}}) RETURN count(a);"
+            )
+            _, to_rows = info.engine.execute(
+                f"MATCH (b:KnowledgeNode {{name: '{safe_to}'}}) RETURN count(b);"
+            )
+        except Exception:
+            return 0, 0, 0
+        from_count = int(from_rows[0][0]) if from_rows else 0
+        to_count = int(to_rows[0][0]) if to_rows else 0
+        if from_count == 0 or to_count == 0:
+            return from_count, to_count, 0
+        try:
+            info.engine.execute(
+                f"CREATE REL TABLE IF NOT EXISTS {rel_table} ("
                 f"FROM KnowledgeNode TO KnowledgeNode, "
                 f"weight DOUBLE, justification STRING, "
                 f"source STRING, domain STRING, directionality STRING, "
                 f"confidence_basis STRING, created_at STRING);"
-            ),
-        )
-    except Exception:
-        pass  # Table may already exist
-
-    await run_with_lock(
-        info,
-        lambda rt=rel_table: info.engine.execute(
+            )
+        except Exception:
+            pass
+        info.engine.execute(
             f"MATCH (a:KnowledgeNode {{name: '{safe_from}'}}), "
             f"(b:KnowledgeNode {{name: '{safe_to}'}}) "
-            f"CREATE (a)-[:{rt} {{"
+            f"CREATE (a)-[:{rel_table} {{"
             f"weight: {weight}, "
             f"justification: '{safe_just}', "
             f"source: '{safe_source}', "
@@ -1154,11 +1161,15 @@ async def graph_knowledge_relate(
             f"confidence_basis: '{safe_confidence_basis}', "
             f"created_at: '{ts}'"
             f"}}]->(b);"
-        ),
-    )
+        )
+        return from_count, to_count, from_count * to_count
+
+    from_count, to_count, created_count = await run_with_lock(info, _create_relation)
     result = (
         f"Related: '{from_name}' --[{relation} w={weight}]--> '{to_name}'"
-        f"{f' ({justification})' if justification else ''}"
+        f"{f' ({justification})' if justification else ''}\n"
+        f"Matched endpoints: from={from_count} to={to_count} | "
+        f"Relationships created: {created_count}"
     )
     if idempotency_key:
         mgr.store_idempotent_result(info.session_id, idempotency_key, result)
@@ -1170,6 +1181,7 @@ async def knowledge_batch(
     nodes: list[dict] | None = None,
     relations: list[dict] | None = None,
     idempotency_key: str | None = None,
+    validate_refs: bool = False,
 ) -> str:
     """[ELABORATE] Bulk-create knowledge graph nodes and relations in one call.
 
@@ -1202,6 +1214,8 @@ async def knowledge_batch(
 
     Returns:
         Counts of nodes/relations created plus any per-item errors.
+        When nodes > 0, includes a "Suggested next: graph_knowledge_infer(...)"
+        hint to prompt inference traversal across the created nodes.
     """
     from datetime import datetime, timezone
 
@@ -1239,6 +1253,28 @@ async def knowledge_batch(
         rel = r.get("relation")
         if not str(rel or "").strip():
             raise ValueError(f"relations[{i}] relation must be non-empty")
+
+    if validate_refs and relations:
+        available = {str(node["entity"]) for node in nodes}
+        try:
+            _, existing_rows = await run_with_lock(
+                info,
+                lambda: info.engine.execute("MATCH (n:KnowledgeNode) RETURN n.name;"),
+            )
+            available.update(str(row[0]) for row in existing_rows)
+        except Exception:
+            pass
+        missing: list[str] = []
+        for relation_item in relations:
+            for field_name in ("from_name", "to_name"):
+                value = str(relation_item[field_name])
+                if value not in available and value not in missing:
+                    missing.append(value)
+        if missing:
+            raise ValueError(
+                "knowledge_batch reference validation failed; missing endpoints: "
+                + ", ".join(missing)
+            )
 
     ts = datetime.now(timezone.utc).isoformat()
 
@@ -1301,6 +1337,20 @@ async def knowledge_batch(
             edge_directionality = _escape_cypher_string(r.get("directionality", ""))
             edge_confidence_basis = _escape_cypher_string(r.get("confidence_basis", ""))
             try:
+                _, from_rows = info.engine.execute(
+                    f"MATCH (a:KnowledgeNode {{name: '{from_n}'}}) RETURN count(a);"
+                )
+                _, to_rows = info.engine.execute(
+                    f"MATCH (b:KnowledgeNode {{name: '{to_n}'}}) RETURN count(b);"
+                )
+                from_count = int(from_rows[0][0]) if from_rows else 0
+                to_count = int(to_rows[0][0]) if to_rows else 0
+                if from_count == 0 or to_count == 0:
+                    errors.append(
+                        f"relations[{i}]: missing endpoint "
+                        f"(from_matches={from_count}, to_matches={to_count})"
+                    )
+                    continue
                 info.engine.execute(
                     f"MATCH (a:KnowledgeNode {{name: '{from_n}'}}), "
                     f"(b:KnowledgeNode {{name: '{to_n}'}}) "
@@ -1312,7 +1362,7 @@ async def knowledge_batch(
                     f"created_at: '{ts}'"
                     f"}}]->(b);"
                 )
-                count += 1
+                count += from_count * to_count
             except Exception as e:
                 errors.append(f"relations[{i}]: {e}")
         return count, errors
@@ -1334,6 +1384,12 @@ async def knowledge_batch(
     out = " | ".join(parts)
     if r_errors:
         out += "\nRelation errors:\n  " + "\n  ".join(r_errors)
+    if n_count > 0:
+        out += f"\nSuggested next: graph_knowledge_infer(session_id='{info.session_id}')"
+        out += (
+            f"\nTip: {n_count} nodes added — run inference to surface "
+            "contradiction chains and indirect connections"
+        )
     if idempotency_key:
         mgr.store_idempotent_result(info.session_id, idempotency_key, out)
     return out
@@ -1357,7 +1413,10 @@ async def graph_knowledge_infer(
             - "gaps" — high-degree nodes with low avg edge confidence
             - "chains" — transitive support chains (A supports B, B supports C)
             - "clusters" — groups of tightly connected nodes
-            - "convergence" — nodes supported by 2+ distinct domains
+            - "convergence" — nodes receiving edges from sources whose
+              domains span 2+ distinct values. Uses source-node domain
+              (set via items[].domain or knowledge_batch node.domain) and
+              falls back to edge-level domain when the source has none.
             - "weak_links" — assumed/analogical links lacking corroboration
             - "prediction_conflicts" — competing hypothesis/question nodes disagreeing on a target
         max_depth: For chains, bounds the transitive search depth (default 5,
@@ -1476,19 +1535,25 @@ async def graph_knowledge_infer(
         return format_result(cols, rows, mgr.max_rows, mgr.max_chars, "table")
 
     elif inference_type == "convergence":
+        # Convergence = a node receives edges from sources that span 2+
+        # distinct domains. Source-node domain is preferred over edge domain
+        # because auto_graph edges (DerivedFrom, RespondsTo, PartOf, etc.) do
+        # not carry a domain field, but the source NODE carries item.domain
+        # from items[]. The CASE WHEN falls back to r.domain so user-curated
+        # graph_knowledge_relate edges with explicit domain still count.
         cypher = (
             "MATCH (a:KnowledgeNode)-[r]->(b:KnowledgeNode) "
-            "WHERE r.domain IS NOT NULL AND r.domain <> '' "
-            "WITH b, count(DISTINCT r.domain) AS domains, "
-            "collect(DISTINCT r.domain) AS domain_list "
+            "WITH b, "
+            "CASE WHEN a.domain IS NOT NULL AND a.domain <> '' "
+            "THEN a.domain ELSE r.domain END AS effective_domain "
+            "WHERE effective_domain IS NOT NULL AND effective_domain <> '' "
+            "WITH b, count(DISTINCT effective_domain) AS domains, "
+            "collect(DISTINCT effective_domain) AS domain_list "
             "WHERE domains >= 2 "
             "RETURN b.name AS target, domains, domain_list "
             "ORDER BY domains DESC LIMIT 20;"
         )
-        try:
-            cols, rows = await run_with_lock(info, lambda: info.engine.execute(cypher))
-        except Exception:
-            return "No convergence found."
+        cols, rows = await run_with_lock(info, lambda: info.engine.execute(cypher))
         if not rows:
             return "No convergence found."
         return format_result(cols, rows, mgr.max_rows, mgr.max_chars, "table")

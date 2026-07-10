@@ -5,11 +5,11 @@ from __future__ import annotations
 import json
 import uuid
 from collections import Counter
-from typing import Any
+from typing import Any, NoReturn
 
-import anyio
-from mcp.server.fastmcp import Context as _MCPContext
+from mcp.server.mcpserver import Context as _MCPContext
 
+from aismartbuddy.concurrency import run_sync
 from aismartbuddy.engines.thinking_engine import (
     ArgRecord,
     ArtifactRecord,
@@ -68,7 +68,7 @@ def _json_notice(code: str, message: str, next_tool: str | None = None) -> str:
     return json.dumps(payload, separators=(",", ":"))
 
 
-def _raise_json(code: str, message: str, next_tool: str | None = None) -> None:
+def _raise_json(code: str, message: str, next_tool: str | None = None) -> NoReturn:
     raise ValueError(_json_notice(code, message, next_tool))
 
 
@@ -181,6 +181,7 @@ def _artifact_to_dict(art: ArtifactRecord) -> dict[str, Any]:
         "contradicts": art.contradicts,
         "derived_from": art.derived_from,
         "confidence": art.confidence,
+        "provenance": art.provenance,
         "created_at": art.created_at.isoformat(),
     }
 
@@ -258,6 +259,7 @@ def _store_artifact(
     confidence: float | None = None,
     domain_tags: list[str] | None = None,
     status: str = "active",
+    provenance: dict[str, Any] | None = None,
 ) -> ArtifactRecord:
     record = ArtifactRecord(
         id=artifact_id,
@@ -274,6 +276,7 @@ def _store_artifact(
         contradicts=list(contradicts or []),
         derived_from=list(derived_from or []),
         confidence=confidence,
+        provenance=dict(provenance or {}),
     )
     engine.upsert_artifact(record)
     return record
@@ -360,7 +363,7 @@ async def _auto_graph_if_enabled(parent, items: list[dict], *, source_tag: str) 
                 graph_info.engine.execute(";\n".join(edge_statements) + ";")
         return mappings
 
-    return await anyio.to_thread.run_sync(_do)
+    return await run_sync(_do)
 
 
 def _require_artifact(
@@ -380,7 +383,7 @@ async def scaffold(
 ) -> str:
     """[SCAFFOLD] Force structured analysis early with a generic model."""
     _validate_enum(model_name, _SCAFFOLD_MODELS, "model_name")
-    _, parent, info = await anyio.to_thread.run_sync(
+    _, parent, info = await run_sync(
         lambda: _resolve_reason_session(
             session_id, ctx, required_backends=["think"], default_mode="analyze"
         )
@@ -455,7 +458,7 @@ async def hypothesize(
     ctx: _MCPContext | None = None,
 ) -> str:
     """[SCAFFOLD] Force falsifiable hypotheses with mechanisms and expected signals."""
-    _, parent, info = await anyio.to_thread.run_sync(
+    _, parent, info = await run_sync(
         lambda: _resolve_reason_session(
             session_id, ctx, required_backends=["think"], default_mode="analyze"
         )
@@ -548,7 +551,7 @@ async def argue(
     ctx: _MCPContext | None = None,
 ) -> str:
     """[SCAFFOLD] Record a structured argument chain."""
-    _, parent, info = await anyio.to_thread.run_sync(
+    _, parent, info = await run_sync(
         lambda: _resolve_reason_session(
             session_id, ctx, required_backends=["think"], default_mode="analyze"
         )
@@ -626,7 +629,7 @@ async def self_assess(
     ctx: _MCPContext | None = None,
 ) -> str:
     """[SCAFFOLD] Force knowledge-boundary awareness before deeper work."""
-    _, parent, info = await anyio.to_thread.run_sync(
+    _, parent, info = await run_sync(
         lambda: _resolve_reason_session(
             session_id, ctx, required_backends=["think"], default_mode="analyze"
         )
@@ -721,7 +724,7 @@ async def reason_graph(
     from aismartbuddy.tools.think import think_graph
 
     _validate_enum(action, _REASON_GRAPH_ACTIONS, "action")
-    _, parent, info = await anyio.to_thread.run_sync(
+    _, parent, info = await run_sync(
         lambda: _resolve_reason_session(
             session_id, ctx, required_backends=["think"], default_mode="analyze"
         )
@@ -788,7 +791,7 @@ async def model_system(
     ctx: _MCPContext | None = None,
 ) -> str:
     """[ELABORATE] Model multi-scale systems and cross-domain interactions."""
-    _, parent, info = await anyio.to_thread.run_sync(
+    _, parent, info = await run_sync(
         lambda: _resolve_reason_session(
             session_id, ctx, required_backends=["think"], default_mode="analyze"
         )
@@ -866,7 +869,7 @@ async def mine_patterns(
     ctx: _MCPContext | None = None,
 ) -> str:
     """[ELABORATE] Store pattern, anomaly, cluster, or cohort findings."""
-    _, parent, info = await anyio.to_thread.run_sync(
+    _, parent, info = await run_sync(
         lambda: _resolve_reason_session(
             session_id, ctx, required_backends=["think"], default_mode="analyze"
         )
@@ -922,7 +925,7 @@ async def test_interventions(
     ctx: _MCPContext | None = None,
 ) -> str:
     """[ELABORATE] Store structured intervention analyses."""
-    _, parent, info = await anyio.to_thread.run_sync(
+    _, parent, info = await run_sync(
         lambda: _resolve_reason_session(
             session_id, ctx, required_backends=["think"], default_mode="analyze"
         )
@@ -992,7 +995,7 @@ async def compare_models(
     ctx: _MCPContext | None = None,
 ) -> str:
     """[ELABORATE] Compare competing explanations or models."""
-    _, parent, info = await anyio.to_thread.run_sync(
+    _, parent, info = await run_sync(
         lambda: _resolve_reason_session(
             session_id, ctx, required_backends=["think"], default_mode="analyze"
         )
@@ -1053,7 +1056,7 @@ async def reason_trace(
     ctx: _MCPContext | None = None,
 ) -> str:
     """[ASSESS] Produce a grounded trace using existing artifacts only."""
-    _, parent, info = await anyio.to_thread.run_sync(
+    _, parent, info = await run_sync(
         lambda: _resolve_reason_session(
             session_id, ctx, required_backends=["think"], default_mode="analyze"
         )
@@ -1107,7 +1110,7 @@ async def synthesize_conclusion(
     ctx: _MCPContext | None = None,
 ) -> str:
     """[ASSESS] Final grounded synthesis backed by a prior reason trace."""
-    _, parent, info = await anyio.to_thread.run_sync(
+    _, parent, info = await run_sync(
         lambda: _resolve_reason_session(
             session_id, ctx, required_backends=["think"], default_mode="analyze"
         )
@@ -1183,7 +1186,7 @@ async def reason_index(
     limit: int = 20,
 ) -> str:
     """[ELABORATE] List stored artifacts for targeted retrieval."""
-    _, parent, info = await anyio.to_thread.run_sync(
+    _, parent, info = await run_sync(
         lambda: _resolve_reason_session(
             session_id, None, required_backends=["think"], default_mode="analyze"
         )
@@ -1210,7 +1213,7 @@ async def reason_index(
 @size_guarded
 async def reason_get(session_id: str, artifact_id: str) -> str:
     """[ELABORATE] Fetch one artifact and its immediate links."""
-    _, parent, info = await anyio.to_thread.run_sync(
+    _, parent, info = await run_sync(
         lambda: _resolve_reason_session(
             session_id, None, required_backends=["think"], default_mode="analyze"
         )
@@ -1246,7 +1249,7 @@ async def reason_get(session_id: str, artifact_id: str) -> str:
 @size_guarded
 async def reason_refs(session_id: str, artifact_id: str) -> str:
     """[ELABORATE] Query inbound references to an artifact."""
-    _, parent, info = await anyio.to_thread.run_sync(
+    _, parent, info = await run_sync(
         lambda: _resolve_reason_session(
             session_id, None, required_backends=["think"], default_mode="analyze"
         )
@@ -1491,6 +1494,7 @@ async def extract_findings_from_sql(
                 mode=_mode_for(think_info, parent),
                 phase="ELABORATE",
                 content={str(key): value for key, value in row_dict.items()},
+                provenance={"backend": "sql", "query": query},
             )
             ids.append(artifact_id)
     lines = []
@@ -1548,6 +1552,7 @@ async def extract_findings_from_graph(
                 mode=_mode_for(think_info, parent),
                 phase="ELABORATE",
                 content={str(key): value for key, value in row_dict.items()},
+                provenance={"backend": "graph", "query": query},
             )
             ids.append(artifact_id)
     lines = []
@@ -1571,7 +1576,7 @@ async def brainstorm(
     ctx: _MCPContext | None = None,
 ) -> str:
     """[DIVERGE] Generate divergent ideas without early convergence."""
-    _, parent, info = await anyio.to_thread.run_sync(
+    _, parent, info = await run_sync(
         lambda: _resolve_reason_session(
             session_id, ctx, required_backends=["think"], default_mode="diverge"
         )
@@ -1633,7 +1638,7 @@ async def iterate(
     ctx: _MCPContext | None = None,
 ) -> str:
     """[ITERATE] Track build-test-learn attempts with an optional metric ratchet."""
-    _, parent, info = await anyio.to_thread.run_sync(
+    _, parent, info = await run_sync(
         lambda: _resolve_reason_session(
             session_id, ctx, required_backends=["think"], default_mode="iterate"
         )
@@ -1748,7 +1753,7 @@ async def think_debug(
     ctx: _MCPContext | None = None,
 ) -> str:
     """[ITERATE] Apply systematic debugging to one or more issues."""
-    _, parent, info = await anyio.to_thread.run_sync(
+    _, parent, info = await run_sync(
         lambda: _resolve_reason_session(
             session_id, ctx, required_backends=["think"], default_mode="iterate"
         )

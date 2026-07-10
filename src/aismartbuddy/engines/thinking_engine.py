@@ -467,6 +467,7 @@ class ConstraintRecord:
     check_description: str = ""
     applies_to: list[str] = field(default_factory=list)
     refs: list[str] = field(default_factory=list)
+    operationalization: dict = field(default_factory=dict)
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -551,7 +552,28 @@ class ArtifactRecord:
     contradicts: list[str] = field(default_factory=list)
     derived_from: list[str] = field(default_factory=list)
     confidence: float | None = None
+    provenance: dict = field(default_factory=dict)
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+@dataclass
+class ReasoningProgress:
+    """Compact route state used for continuation, auditing, and handoff."""
+
+    task: str
+    intent: str
+    depth: str
+    frameworks: list[str] = field(default_factory=list)
+    steps: list[dict] = field(default_factory=list)
+    constraints: list[str] = field(default_factory=list)
+    available_sources: list[str] = field(default_factory=list)
+    completed_tools: list[str] = field(default_factory=list)
+    completed_phases: list[str] = field(default_factory=list)
+    important_refs: list[str] = field(default_factory=list)
+    unresolved_questions: list[str] = field(default_factory=list)
+    next_tool: str = ""
+    started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 MAX_RUBRICS = 100
@@ -641,6 +663,7 @@ class ThinkingEngine:
         self._artifact_ids_by_mode: dict[str, set[str]] = {}
         self._artifact_ids_by_ref: dict[str, set[str]] = {}
         self._artifact_order: list[str] = []
+        self.reasoning_progress: ReasoningProgress | None = None
 
     @property
     def state_lock(self):
@@ -691,6 +714,7 @@ class ThinkingEngine:
         self._artifact_ids_by_mode.clear()
         self._artifact_ids_by_ref.clear()
         self._artifact_order.clear()
+        self.reasoning_progress = None
 
     # ── Thought graph ──────────────────────────────────────
 
@@ -1002,6 +1026,51 @@ class ThinkingEngine:
                 continue
             ordered.append(artifact)
         return ordered
+
+    # ── Reasoning route progress ─────────────────────────
+
+    @_synchronized
+    def set_reasoning_progress(self, progress: ReasoningProgress) -> None:
+        """Start or replace the session's selected reasoning route."""
+
+        progress.updated_at = datetime.now(timezone.utc)
+        progress.next_tool = str(progress.steps[0].get("tool", "")) if progress.steps else ""
+        self.reasoning_progress = progress
+
+    @_synchronized
+    def record_reasoning_tool(self, tool_name: str, refs: list[str] | None = None) -> None:
+        """Mark a routed tool call complete and advance the next-tool pointer."""
+
+        progress = self.reasoning_progress
+        if progress is None:
+            return
+        progress.completed_tools.append(tool_name)
+        for ref in refs or []:
+            value = str(ref).strip()
+            if value and value not in progress.important_refs:
+                progress.important_refs.append(value)
+
+        completed_indexes: set[int] = set()
+        remaining_calls = list(progress.completed_tools)
+        for index, step in enumerate(progress.steps):
+            expected = str(step.get("tool", ""))
+            if expected in remaining_calls:
+                completed_indexes.add(index)
+                remaining_calls.remove(expected)
+                phase = str(step.get("phase", ""))
+                if phase and phase not in progress.completed_phases:
+                    progress.completed_phases.append(phase)
+
+        progress.next_tool = ""
+        for index, step in enumerate(progress.steps):
+            if index not in completed_indexes:
+                progress.next_tool = str(step.get("tool", ""))
+                break
+        progress.updated_at = datetime.now(timezone.utc)
+
+    @_synchronized
+    def get_reasoning_progress(self) -> ReasoningProgress | None:
+        return self.reasoning_progress
 
     # ── Mental models ────────────────────────────────────
 

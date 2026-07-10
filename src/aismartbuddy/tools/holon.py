@@ -9,12 +9,12 @@ in multiple holarchies with different parents and roles.
 from __future__ import annotations
 
 import uuid
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
-import anyio
-from mcp.server.fastmcp import Context as _MCPContext
+from mcp.server.mcpserver import Context as _MCPContext
 
 from aismartbuddy import config as cfg
+from aismartbuddy.concurrency import run_sync
 from aismartbuddy.engines.thinking_engine import HolonNode
 
 if TYPE_CHECKING:
@@ -222,7 +222,7 @@ async def holon_create(
         Batch mode: ref→id mapping for all created holons (+ graph node
         count if auto_graph).
     """
-    _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
+    _, info = await run_sync(lambda: _get_or_create_think_session(session_id, ctx))
     engine = _engine(info)
     sid = info.session_id
 
@@ -238,7 +238,7 @@ async def holon_create(
                 engine.bind_rule_profiles(holon_id, "holon", bindings)
                 await _materialize_subject_rule_bindings(
                     engine,
-                    session_id,
+                    info.session_id,
                     subject_kind="holon",
                     subject_id=holon_id,
                     subject_label=next(
@@ -254,7 +254,7 @@ async def holon_create(
             hids_used.add(hid_val)
         ref_lines = ", ".join(f"{r}={i}" for r, i in ref_to_id.items())
 
-        eff_auto_graph = resolve_auto_graph(auto_graph, info, session_id)
+        eff_auto_graph = resolve_auto_graph(auto_graph, info)
         eff_sid = effective_session_id(session_id, info)
         graph_count = 0
         if eff_auto_graph:
@@ -305,8 +305,7 @@ async def holon_create(
     # ── Single mode (existing behavior) ────────────────
     if auto_graph:
         raise ValueError(
-            "auto_graph is only supported in batch mode. "
-            "Pass holons=[...] to use auto_graph."
+            "auto_graph is only supported in batch mode. Pass holons=[...] to use auto_graph."
         )
     if not name:
         raise ValueError("Single-mode holon_create requires 'name'")
@@ -352,7 +351,7 @@ async def holon_create(
     engine.add_holon(node)
     await _materialize_subject_rule_bindings(
         engine,
-        session_id,
+        info.session_id,
         subject_kind="holon",
         subject_id=nid,
         subject_label=name,
@@ -381,7 +380,9 @@ async def holon_create(
 async def holon_update(
     session_id: str,
     holon_id: str,
-    action: str,
+    action: Literal[
+        "context", "rules", "description", "properties", "projection", "join_holarchy", "add_lens"
+    ],
     content: str | None = None,
     rules: list[str] | None = None,
     properties: list[str] | None = None,
@@ -459,7 +460,7 @@ async def holon_update(
         subject_label = node.name
     await _materialize_subject_rule_bindings(
         engine,
-        session_id,
+        info.session_id,
         subject_kind="holon",
         subject_id=holon_id,
         subject_label=subject_label,
@@ -590,7 +591,9 @@ def _holon_update_locked(
 async def holon_view(
     session_id: str,
     holon_id: str,
-    action: str = "cross_level",
+    action: Literal[
+        "zoom_in", "zoom_out", "sideways", "cross_level", "memberships"
+    ] = "cross_level",
     holarchy_id: str | None = None,
     levels_up: int = 1,
     levels_down: int = 1,
@@ -665,9 +668,11 @@ async def holon_view(
     if action == "zoom_in":
         children = engine.get_holon_children(holon_id, hid)
         parent = engine.get_holon_parent(holon_id, hid)
+        membership = _get_membership(node, hid)
+        level = membership["level"] if membership else "?"
         lines = [
             f"Session: {session_id} | Holarchy: {hid}",
-            f"## Zooming into: {node.name} (Level {_get_membership(node, hid)['level']})",
+            f"## Zooming into: {node.name} (Level {level})",
         ]
         if parent:
             lines.append("\n### Parent Context (constraint header):")
@@ -809,7 +814,17 @@ async def holon_view(
 @size_guarded
 async def holon_analyze(
     session_id: str,
-    action: str,
+    action: Literal[
+        "tensions",
+        "emergence",
+        "propagate_up",
+        "propagate_down",
+        "coherence",
+        "bridge",
+        "lens",
+        "feedback_loops",
+        "leverage_points",
+    ],
     holon_id: str | None = None,
     holarchy_id: str | None = None,
     insight: str | None = None,

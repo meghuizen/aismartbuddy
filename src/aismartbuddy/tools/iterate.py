@@ -7,14 +7,16 @@ enables ratcheting + stagnation detection (M5 — already wired here).
 from __future__ import annotations
 
 import uuid
+from typing import Literal
 
-import anyio
-from mcp.server.fastmcp import Context as _MCPContext
+from mcp.server.mcpserver import Context as _MCPContext
 
+from aismartbuddy.concurrency import run_sync
 from aismartbuddy.engines.thinking_engine import (
     IterationRecord,
     ThinkingEngine,
 )
+from aismartbuddy.tools import track_reasoning_progress
 from aismartbuddy.tools.think import _get_or_create_think_session
 
 _ACTIONS = frozenset({"start", "attempt", "status", "conclude"})
@@ -26,8 +28,9 @@ def _engine(info) -> ThinkingEngine:
     return info.engine
 
 
+@track_reasoning_progress("iterate")
 async def iterate(
-    action: str,
+    action: Literal["start", "attempt", "status", "conclude"],
     session_id: str | None = None,
     iteration_id: str | None = None,
     goal: str | None = None,
@@ -66,7 +69,7 @@ async def iterate(
             f"action must be one of {sorted(_ACTIONS)}, got {action!r}"
         )
 
-    _, info = await anyio.to_thread.run_sync(
+    _, info = await run_sync(
         lambda: _get_or_create_think_session(session_id, ctx)
     )
     engine = _engine(info)

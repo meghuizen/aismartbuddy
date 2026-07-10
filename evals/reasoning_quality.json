@@ -1,0 +1,131 @@
+[
+  {
+    "id": "diagnosis-1",
+    "category": "diagnosis",
+    "task": "Diagnose the root cause of repeated deployment failures without reducing test coverage.",
+    "expected_intent": "solve_problem",
+    "expected_entry_tool": "think_model",
+    "quality_dimensions": ["correctness", "alternatives", "evidence", "actionability"]
+  },
+  {
+    "id": "diagnosis-2",
+    "category": "diagnosis",
+    "task": "Fix a recurring latency problem by separating symptoms from root causes.",
+    "expected_intent": "solve_problem",
+    "expected_entry_tool": "think_model",
+    "quality_dimensions": ["correctness", "causal_depth", "calibration"]
+  },
+  {
+    "id": "evidence-1",
+    "category": "evidence_synthesis",
+    "task": "Investigate whether the available evidence verifies a disputed scientific claim.",
+    "expected_intent": "investigate_truth",
+    "expected_entry_tool": "think_science",
+    "quality_dimensions": ["evidence", "provenance", "calibration"]
+  },
+  {
+    "id": "evidence-2",
+    "category": "evidence_synthesis",
+    "task": "Research and verify conflicting claims from several sources.",
+    "expected_intent": "investigate_truth",
+    "expected_entry_tool": "think_science",
+    "quality_dimensions": ["correctness", "contradictions", "provenance"]
+  },
+  {
+    "id": "decision-1",
+    "category": "decision",
+    "task": "Choose between two architecture options under uncertainty and explicit tradeoffs.",
+    "expected_intent": "make_decision",
+    "expected_entry_tool": "think_decide",
+    "quality_dimensions": ["tradeoffs", "uncertainty", "reversibility"]
+  },
+  {
+    "id": "decision-2",
+    "category": "decision",
+    "task": "Decide which risky option to select when outcome probabilities are incomplete.",
+    "expected_intent": "make_decision",
+    "expected_entry_tool": "think_decide",
+    "quality_dimensions": ["calibration", "robustness", "actionability"]
+  },
+  {
+    "id": "systems-1",
+    "category": "systems_reasoning",
+    "task": "Map the architecture, relationships, and feedback loops of a distributed system.",
+    "expected_intent": "understand_system",
+    "expected_entry_tool": "think_model",
+    "quality_dimensions": ["structure", "feedback", "completeness"]
+  },
+  {
+    "id": "systems-2",
+    "category": "systems_reasoning",
+    "task": "Understand how system delays and dependencies change behavior over time.",
+    "expected_intent": "understand_system",
+    "expected_entry_tool": "think_model",
+    "quality_dimensions": ["dynamics", "causality", "scope"]
+  },
+  {
+    "id": "challenge-1",
+    "category": "adversarial_review",
+    "task": "Review this plan for weaknesses, failure modes, and hidden assumptions.",
+    "expected_intent": "challenge",
+    "expected_entry_tool": "think_model",
+    "quality_dimensions": ["failure_coverage", "assumptions", "severity"]
+  },
+  {
+    "id": "challenge-2",
+    "category": "adversarial_review",
+    "task": "Red team a consequential design and find the simplest way it can fail.",
+    "expected_intent": "challenge",
+    "expected_entry_tool": "think_model",
+    "quality_dimensions": ["adversarial_depth", "evidence", "mitigations"]
+  },
+  {
+    "id": "novelty-1",
+    "category": "novelty",
+    "task": "Invent a novel approach rather than incrementally improving the existing design.",
+    "expected_intent": "generate_novelty",
+    "expected_entry_tool": "think_interfere",
+    "quality_dimensions": ["novelty", "coherence", "necessity"]
+  },
+  {
+    "id": "novelty-2",
+    "category": "novelty",
+    "task": "Generate a creative new idea by combining unrelated structural principles.",
+    "expected_intent": "generate_novelty",
+    "expected_entry_tool": "think_interfere",
+    "quality_dimensions": ["novelty", "structure", "testability"]
+  },
+  {
+    "id": "knowledge-1",
+    "category": "knowledge_retrieval",
+    "task": "Extract requirements and assumptions from a stakeholder interview.",
+    "expected_intent": "extract_knowledge",
+    "expected_entry_tool": "think_model",
+    "quality_dimensions": ["coverage", "provenance", "ambiguity"]
+  },
+  {
+    "id": "knowledge-2",
+    "category": "knowledge_retrieval",
+    "task": "Extract authoritative technical knowledge from documentation and retain source references.",
+    "expected_intent": "extract_knowledge",
+    "expected_entry_tool": "think_model",
+    "quality_dimensions": ["authority", "provenance", "retrieval"]
+  },
+  {
+    "id": "learning-1",
+    "category": "data_supported_learning",
+    "task": "Run a postmortem to learn from an experiment outcome and define the next test.",
+    "expected_intent": "learn_from_outcome",
+    "expected_entry_tool": "iterate",
+    "quality_dimensions": ["learning", "causality", "next_experiment"]
+  },
+  {
+    "id": "communication-1",
+    "category": "communication",
+    "task": "Explain a complex change to an audience and persuade them to take a concrete action.",
+    "expected_intent": "communicate",
+    "expected_entry_tool": "think_model",
+    "quality_dimensions": ["clarity", "belief", "actionability"]
+  }
+]
+

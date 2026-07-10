@@ -302,7 +302,9 @@ class TestHolonUpdate:
         hid = _extract(r, "Holon:")
         with pytest.raises(ValueError, match="Invalid action"):
             await holon_update(
-                session_id=sid, holon_id=hid, action="nope",
+                session_id=sid,
+                holon_id=hid,
+                action="nope",  # type: ignore[arg-type]
             )
 
 

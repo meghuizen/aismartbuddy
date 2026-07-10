@@ -10,9 +10,9 @@ from __future__ import annotations
 import re
 import uuid
 
-import anyio
-from mcp.server.fastmcp import Context as _MCPContext
+from mcp.server.mcpserver import Context as _MCPContext
 
+from aismartbuddy.concurrency import run_sync
 from aismartbuddy.engines.thinking_engine import ThinkingEngine
 from aismartbuddy.tools.think import _get_or_create_think_session
 
@@ -140,7 +140,7 @@ async def brainstorm(
                 f"ideas[{i}] missing 'spark' — what triggered this idea?"
             )
 
-    _, info = await anyio.to_thread.run_sync(
+    _, info = await run_sync(
         lambda: _get_or_create_think_session(session_id, ctx)
     )
     engine = _engine(info)

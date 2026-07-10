@@ -6,7 +6,7 @@ the `refs` list plus rule bindings / validations across the think backend.
 
 from __future__ import annotations
 
-from mcp.server.fastmcp import Context as _MCPContext
+from mcp.server.mcpserver import Context as _MCPContext
 
 from aismartbuddy.engines.thinking_engine import ThinkingEngine
 from aismartbuddy.tools.think import _engine, _get_or_create_think_session

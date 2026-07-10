@@ -4,12 +4,13 @@ import pytest
 
 from aismartbuddy import config as cfg
 from aismartbuddy.server import _build_tool_specs, aismartbuddy_guide
+from aismartbuddy.tool_catalog import ToolSpec
 from aismartbuddy.tools.graph import graph_import
 from aismartbuddy.tools.sql import sql_import, sql_import_batch
 
 
-def _tool_names(specs: list[tuple]) -> set[str]:
-    return {name for _, name, _, _ in specs}
+def _tool_names(specs: list[ToolSpec]) -> set[str]:
+    return {spec.name for spec in specs}
 
 
 def test_default_registry_hides_legacy_reasoning_surface():

@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import anyio
-from mcp.server.fastmcp import Context
+from mcp.server.mcpserver import Context
 
+from aismartbuddy.concurrency import run_sync
 from aismartbuddy.engines import BaseEngine
 from aismartbuddy.formatting import format_result, format_schema_compact
 from aismartbuddy.identity import resolve_identity
@@ -52,7 +52,7 @@ def _require_sql_session(session_id: str | None):
 def _get_or_create_sql_session(session_id: str | None):
     """Return an existing SQL session or auto-create an in-memory one.
 
-    Callers must wrap in anyio.to_thread.run_sync -- create_session does
+    Callers must wrap in run_sync -- create_session does
     blocking disk I/O (mkdir + DB connect). Side effect: if no active
     session exists, the new session becomes the process-wide active session.
     """
@@ -77,16 +77,15 @@ async def sql_create_session(
     SQL sessions use DuckDB — ideal for tabular data, analytics,
     aggregations, joins, window functions, and time-series analysis.
 
-    Multi-tenant: the session is bound to (user_id, project_id). If Bearer
-    auth is configured, user_id comes from ctx.client_id (parameter ignored);
-    otherwise the parameter (or a configured default) is used. project_id
-    is always taken from the parameter or the configured default.
+    Multi-tenant: the session is bound to (user_id, project_id). A verified
+    MCP v2 bearer principal overrides request metadata and parameters.
+    project_id is taken from the parameter or configured default.
 
     Example: sql_create_session(project_id="analytics") → returns session_id
 
     Args:
-        user_id: Owner identity. Ignored when Bearer auth is configured
-            (ctx.client_id wins). Default: configured default_user_id.
+        user_id: Owner identity. Ignored when Bearer auth is configured.
+            Default: configured default_user_id.
         project_id: Project scope. Default: configured default_project_id.
 
     Returns:
@@ -94,7 +93,7 @@ async def sql_create_session(
     """
     resolved_user, resolved_project = resolve_identity(ctx, user_id, project_id)
     mgr = get_session_manager()
-    info = await anyio.to_thread.run_sync(
+    info = await run_sync(
         lambda: mgr.create_session("sql", resolved_user, resolved_project)
     )
     return (
@@ -139,7 +138,7 @@ async def sql_query(
     Returns:
         Query results formatted according to output_format.
     """
-    mgr, info = await anyio.to_thread.run_sync(lambda: _get_or_create_sql_session(session_id))
+    mgr, info = await run_sync(lambda: _get_or_create_sql_session(session_id))
     return await execute_and_format(
         info,
         mgr,
@@ -226,7 +225,7 @@ async def sql_import(
     Returns:
         Import confirmation with row count.
     """
-    mgr, info = await anyio.to_thread.run_sync(lambda: _get_or_create_sql_session(session_id))
+    mgr, info = await run_sync(lambda: _get_or_create_sql_session(session_id))
     count = await run_with_lock(
         info,
         lambda: info.engine.import_data(table_name, data, data_format, create_table, delimiter),
@@ -275,7 +274,7 @@ async def sql_import_batch(
     Returns:
         Import confirmation with total row count and chunk count.
     """
-    mgr, info = await anyio.to_thread.run_sync(lambda: _get_or_create_sql_session(session_id))
+    mgr, info = await run_sync(lambda: _get_or_create_sql_session(session_id))
     total = await run_with_lock(
         info,
         lambda: info.engine.import_batch(table_name, chunks or [], data_format, delimiter),
@@ -301,7 +300,7 @@ async def sql_schema(session_id: str | None = None, table_name: str | None = Non
     Returns:
         Schema information in compact format.
     """
-    mgr, info = await anyio.to_thread.run_sync(lambda: _get_or_create_sql_session(session_id))
+    mgr, info = await run_sync(lambda: _get_or_create_sql_session(session_id))
 
     if table_name:
         columns, rows = await run_with_lock(info, lambda: info.engine.describe_table(table_name))
@@ -339,7 +338,7 @@ async def data_profile(
         unique_count, min/max/mean/median/stddev, quantiles, top_values
         (categorical), outlier_count.
     """
-    mgr, info = await anyio.to_thread.run_sync(lambda: _get_or_create_sql_session(session_id))
+    mgr, info = await run_sync(lambda: _get_or_create_sql_session(session_id))
     _validate_sql_identifier(table, "table")
     if columns:
         for c in columns:
@@ -391,7 +390,7 @@ async def data_anomalies(
             "isolation_forest requires an external library (scikit-learn). "
             "Use 'zscore' or 'iqr' for built-in detection."
         )
-    mgr, info = await anyio.to_thread.run_sync(lambda: _get_or_create_sql_session(session_id))
+    mgr, info = await run_sync(lambda: _get_or_create_sql_session(session_id))
     _validate_sql_identifier(table, "table")
     for c in columns:
         _validate_sql_identifier(c, "column")
@@ -444,5 +443,5 @@ async def sql_destroy_session(session_id: str | None = None) -> str:
     """
     mgr, info = _require_sql_session(session_id)
     # destroy_session handles its own locking (pop-then-lock protocol)
-    await anyio.to_thread.run_sync(lambda: mgr.destroy_session(info.session_id))
+    await run_sync(lambda: mgr.destroy_session(info.session_id))
     return f"SQL session '{info.session_id}' destroyed and cleaned up."

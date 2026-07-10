@@ -50,7 +50,7 @@ class YouTubeClient:
     - dlp: configured YoutubeDL for fast metadata-only extraction
     - Each tool call constructs its OWN YouTubeTranscriptApi instance around
       the shared http_client. The library is not thread-safe; per-call
-      instances partially mitigate future parallel FastMCP dispatch (full
+      instances partially mitigate parallel MCPServer dispatch (full
       safety would require per-call http_client too, but under the current
       one-worker-per-call model this is unnecessary overhead).
     """

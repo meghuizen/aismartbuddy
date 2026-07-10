@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import json
 import uuid
+from typing import Literal
 
-import anyio
-from mcp.server.fastmcp import Context
+from mcp.server.mcpserver import Context
 
+from aismartbuddy.concurrency import run_sync
 from aismartbuddy.engines.thinking_engine import (
     EvaluationRecord,
     FindingRecord,
@@ -65,7 +66,7 @@ _DEFAULT_SEVERITY_LEVELS = list(_DEFAULT_SEVERITY_DEDUCTIONS.keys())
 
 
 async def score_rubric(
-    action: str,
+    action: Literal["create", "update", "list"],
     session_id: str | None = None,
     rubric_id: str | None = None,
     description: str | None = None,
@@ -122,7 +123,7 @@ async def score_rubric(
     """
     _validate_enum(action, _SCORE_RUBRIC_ACTIONS, "action")
 
-    _, info = await anyio.to_thread.run_sync(lambda: _get_or_create_think_session(session_id, ctx))
+    _, info = await run_sync(lambda: _get_or_create_think_session(session_id, ctx))
     engine = _engine(info)
     sid = info.session_id
 
@@ -217,8 +218,8 @@ def _extract_parent_session_id(session_id: str | None) -> str | None:
     """Return the caller-provided session id only when it's a parent facade id."""
     if not session_id:
         return None
-    mgr = get_session_manager()
-    if session_id in getattr(mgr, "_parent_sessions", {}):
+    parent = get_session_manager().resolve_to_parent(session_id)
+    if parent is not None and parent.parent_id == session_id:
         return session_id
     return None
 
@@ -372,7 +373,7 @@ async def _materialize_evaluation_graph(
 
 
 async def rubric_templates(
-    action: str,
+    action: Literal["list", "load"],
     template_id: str | None = None,
     session_id: str | None = None,
     ctx: Context | None = None,
@@ -496,7 +497,16 @@ def _build_finalize_block(
 
 
 async def score_evaluate(
-    action: str,
+    action: Literal[
+        "start",
+        "start_with_rubric",
+        "finding",
+        "note",
+        "batch_findings",
+        "finding_batch",
+        "review",
+        "finalize",
+    ],
     session_id: str | None = None,
     evaluation_id: str | None = None,
     rubric_id: str | None = None,
@@ -583,7 +593,7 @@ async def score_evaluate(
 
     # ── start ────────────────────────────────────────────
     if action == "start":
-        _, info = await anyio.to_thread.run_sync(
+        _, info = await run_sync(
             lambda: _get_or_create_think_session(session_id, ctx)
         )
         engine = _engine(info)
@@ -622,7 +632,7 @@ async def score_evaluate(
             raise ValueError("rubric_id is required for start_with_rubric")
         if not dimensions:
             raise ValueError("dimensions is required for start_with_rubric")
-        _, info = await anyio.to_thread.run_sync(
+        _, info = await run_sync(
             lambda: _get_or_create_think_session(session_id, ctx)
         )
         resolved_session_id = info.session_id
@@ -947,7 +957,7 @@ async def score_evaluate(
 
 
 async def score_gate(
-    action: str,
+    action: Literal["gate", "list"],
     session_id: str | None = None,
     evaluation_id: str | None = None,
     rubric_id: str | None = None,

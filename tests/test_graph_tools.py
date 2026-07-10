@@ -372,3 +372,135 @@ class TestKnowledgeNodeDomain:
         )
         assert "metabolism" in result
         assert "concept_metab_x" in result
+
+
+@pytest.mark.usefixtures("_init_session_manager")
+class TestCrossBackendResolution:
+    """A child session_id resolves transparently to its sibling backend
+    when the parent is a unified session. Closes the UX gap where the
+    documented contract ('pass the returned session_id to all tools')
+    failed for users holding a think-child id but calling a graph tool."""
+
+    @pytest.mark.anyio
+    async def test_think_child_id_routes_to_graph_sibling(self):
+        from aismartbuddy.tools import get_session_manager
+        from aismartbuddy.tools.think import think_science
+
+        # Auto-create a parent with think+graph backends via think_science.
+        res = await think_science(
+            items=[
+                {
+                    "id": "H_test",
+                    "observation": "obs",
+                    "question": "q?",
+                    "hypothesis": {
+                        "statement": "stmt",
+                        "variables": [{"name": "v", "role": "independent"}],
+                        "assumptions": ["a1"],
+                        "confidence": 0.5,
+                        "falsifiability": {
+                            "method": "test method spec",
+                            "expected_if_false": "negative result",
+                        },
+                    },
+                }
+            ],
+            auto_graph=True,
+        )
+        think_child_sid = ""
+        for line in res.split("\n"):
+            if line.startswith("Session: "):
+                think_child_sid = line.split("Session: ", 1)[1].split(" |", 1)[0].strip()
+                break
+        assert think_child_sid
+
+        # The think-child id should now resolve transparently to the graph
+        # sibling when passed to a graph tool. Before the fix this raised
+        # "Session 'X' is a think session, not graph."
+        mgr = get_session_manager()
+        graph_info = mgr.resolve_backend_session(think_child_sid, "graph")
+        assert graph_info.session_type == "graph"
+        # And the inverse: the resolved graph id is itself routable for think.
+        think_info = mgr.resolve_backend_session(graph_info.session_id, "think")
+        assert think_info.session_type == "think"
+        assert think_info.session_id == think_child_sid
+
+    @pytest.mark.anyio
+    async def test_standalone_session_still_raises_on_wrong_backend(self):
+        """Standalone (non-unified) sessions must still raise — no silent
+        misrouting when there's no parent to walk up to."""
+        from aismartbuddy.tools import get_session_manager
+        from aismartbuddy.tools.think import think_create_session
+
+        res = await think_create_session()
+        sid = ""
+        for line in res.split("\n"):
+            if line.startswith("session_id:"):
+                sid = line.split("session_id:", 1)[1].strip()
+                break
+        assert sid
+        mgr = get_session_manager()
+        with pytest.raises(ValueError, match="is a think session, not graph"):
+            mgr.resolve_backend_session(sid, "graph")
+
+    @pytest.mark.anyio
+    async def test_parent_id_passed_directly_resolves_both_backends(self):
+        """Passing the parent_id (returned by session_create(backends=[...]))
+        resolves correctly for any sibling backend."""
+        from aismartbuddy.tools import get_session_manager
+        from aismartbuddy.tools.infra import session_create
+
+        res = await session_create(backends=["think", "graph"])
+        parent_sid = ""
+        for line in res.split("\n"):
+            line = line.strip()
+            if line.startswith("session_id:"):
+                parent_sid = line.split("session_id:", 1)[1].strip()
+                break
+        assert parent_sid
+        mgr = get_session_manager()
+        think_info = mgr.resolve_backend_session(parent_sid, "think")
+        graph_info = mgr.resolve_backend_session(parent_sid, "graph")
+        assert think_info.session_type == "think"
+        assert graph_info.session_type == "graph"
+        assert think_info.session_id != graph_info.session_id
+
+
+@pytest.mark.usefixtures("_init_session_manager")
+class TestConvergenceInference:
+    """graph_knowledge_infer(convergence) detects nodes whose source-node
+    domains span 2+ distinct values. The previous implementation filtered
+    only on edge.domain, which is empty on auto_graph edges and missed the
+    most common convergence case."""
+
+    @pytest.mark.anyio
+    async def test_convergence_uses_source_node_domain(self):
+        from aismartbuddy.tools.graph import graph_knowledge_infer
+
+        sid = await _create_graph_session()
+        await knowledge_batch(
+            session_id=sid,
+            nodes=[
+                {"entity": "src_a", "entity_type": "concept", "domain": "metabolism"},
+                {"entity": "src_b", "entity_type": "concept", "domain": "immunology"},
+                {"entity": "src_c", "entity_type": "concept", "domain": "endocrine"},
+                # Convergence target — supported by sources in 3 distinct domains
+                {"entity": "hub_target", "entity_type": "concept"},
+                # Non-convergence — supported by only one domain
+                {"entity": "single_src_target", "entity_type": "concept"},
+            ],
+            relations=[
+                # No domain set on edges — must use source-node domain
+                {"from_name": "src_a", "to_name": "hub_target", "relation": "supports"},
+                {"from_name": "src_b", "to_name": "hub_target", "relation": "supports"},
+                {"from_name": "src_c", "to_name": "hub_target", "relation": "supports"},
+                {"from_name": "src_a", "to_name": "single_src_target", "relation": "supports"},
+            ],
+        )
+        # Need >= min_nodes_override to bypass the 10-node minimum
+        result = await graph_knowledge_infer(
+            session_id=sid, inference_type="convergence", min_nodes_override=2
+        )
+        # hub_target spans 3 domains → must appear; single_src_target only 1 → must not
+        assert "hub_target" in result
+        assert "single_src_target" not in result

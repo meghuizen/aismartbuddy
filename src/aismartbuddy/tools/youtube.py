@@ -19,10 +19,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import anyio
 from lxml import etree
 
 from aismartbuddy import youtube_client as yt_mod
+from aismartbuddy.concurrency import run_sync
 from aismartbuddy.youtube_client import parse_video_id
 
 if TYPE_CHECKING:
@@ -258,7 +258,7 @@ def _fetch_payload(
 ) -> tuple[_CachedPayload, _ErrorInfo | None]:
     """Fetch title/description + available languages + transcript synchronously.
 
-    Called inside anyio.to_thread.run_sync from the async tool.
+    Called inside run_sync from the async tool.
 
     Returns:
         (payload, None) on full success — caller writes to cache.
@@ -580,7 +580,7 @@ async def get_youtube_information(
     payload: _CachedPayload | None = None
     if cache_path.exists():
         try:
-            payload = await anyio.to_thread.run_sync(_parse_xml, cache_path)
+            payload = await run_sync(_parse_xml, cache_path)
             cache_hit = True
         except _CacheMissError:
             payload = None
@@ -594,7 +594,7 @@ async def get_youtube_information(
                 "to construct it — check server startup logs."
             )
         client = yt_mod.youtube_client
-        payload, error_info = await anyio.to_thread.run_sync(
+        payload, error_info = await run_sync(
             _fetch_payload, client, url_or_id, video_id, language
         )
         # Cache only when ALL information is present. If any data element is
@@ -604,7 +604,7 @@ async def get_youtube_information(
         # response.
         if error_info is None:
             xml_bytes = _build_xml(payload)
-            await anyio.to_thread.run_sync(
+            await run_sync(
                 lambda: cache_path.write_bytes(xml_bytes)
             )
 

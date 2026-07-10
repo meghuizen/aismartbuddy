@@ -7,9 +7,9 @@ is the intended failure mode (clearly diagnosed in server.py:_maybe_build_auth).
 Activated only when both AISMARTBUDDY_ENTRA_TENANT and
 AISMARTBUDDY_ENTRA_AUDIENCE are set. When active, every MCP tool call
 requires a Bearer token issued by the configured Entra tenant for the
-configured audience; `ctx.client_id` resolves to the Entra `oid` claim
-(stable principal object ID), which the existing multi-tenant model in
-`identity.py` automatically uses as `user_id`.
+configured audience; MCP v2's bearer auth context resolves to the Entra `oid`
+claim (stable principal object ID), which the multi-tenant model in
+`identity.py` uses as `user_id`.
 
 Configure on the Entra side:
 - Register an app, expose an API scope (e.g. `mcp.invoke`)

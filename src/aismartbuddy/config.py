@@ -16,6 +16,7 @@ DEFAULT_MAX_ROWS = 1000
 DEFAULT_MAX_CHARS = 50000
 DEFAULT_SESSION_TIMEOUT = 3600
 DEFAULT_CURSOR_TIMEOUT = 300
+DEFAULT_CRAWL_RETENTION = 7 * 24 * 60 * 60
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
 DEFAULT_USER_ID = "default"
@@ -33,6 +34,7 @@ class RuntimeConfig:
     max_chars: int = DEFAULT_MAX_CHARS
     session_timeout: int = DEFAULT_SESSION_TIMEOUT
     cursor_timeout: int = DEFAULT_CURSOR_TIMEOUT
+    crawl_retention: int = DEFAULT_CRAWL_RETENTION
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
     transport: str = "stdio"

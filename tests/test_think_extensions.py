@@ -10,6 +10,7 @@ from aismartbuddy.tools.graph import graph_knowledge_add, graph_query
 from aismartbuddy.tools.infra import session_create
 from aismartbuddy.tools.sql import sql_query
 from aismartbuddy.tools.think import (
+    sequentialthinking,
     think_argue,
     think_bridge,
     think_constraint,
@@ -38,6 +39,10 @@ def _extract_value(result: str, prefix: str) -> str:
             if part.startswith(prefix):
                 return part[len(prefix) :].strip()
     raise AssertionError(f"missing prefix {prefix!r} in {result!r}")
+
+
+def _node_ids(result: str) -> list[str]:
+    return [n.strip() for n in _extract_value(result, "Node IDs:").split(",") if n.strip()]
 
 
 @pytest.mark.usefixtures("_init_session_manager")
@@ -153,6 +158,7 @@ class TestReasoningExtensions:
             domain="resource",
             type="hard",
             statement="Queue depth cannot stay near zero if backpressure is the cause",
+            check_description="Monitor queue_depth metric under load; must exceed threshold",
         )
         validated = await think_constraint(
             action="validate",
@@ -747,6 +753,36 @@ class TestThinkConstraintListForm:
             )
 
     @pytest.mark.anyio
+    async def test_hard_constraint_requires_operationalization(self):
+        with pytest.raises(ValueError, match="operationalization"):
+            await think_constraint(
+                action="register",
+                items=[{"id": "c_hard_no_op", "domain": "d", "type": "hard", "statement": "s"}],
+            )
+
+    @pytest.mark.anyio
+    async def test_soft_constraint_operationalization_optional(self):
+        result = await think_constraint(
+            action="register",
+            items=[{"id": "c_soft_no_op", "domain": "d", "type": "soft", "statement": "s"}],
+        )
+        assert "Constraints registered: 1" in result
+
+    @pytest.mark.anyio
+    async def test_hard_constraint_operationalization_missing_method(self):
+        with pytest.raises(ValueError, match="operationalization"):
+            await think_constraint(
+                action="register",
+                items=[{
+                    "id": "c_bad_op",
+                    "domain": "d",
+                    "type": "hard",
+                    "statement": "s",
+                    "operationalization": {"resource": "no method key"},
+                }],
+            )
+
+    @pytest.mark.anyio
     async def test_register_invalid_type_rejected(self):
         with pytest.raises(ValueError, match=r"field 'type'"):
             await think_constraint(
@@ -779,6 +815,7 @@ class TestThinkConstraintListForm:
                 "domain": "data",
                 "type": "hard",
                 "statement": "Single-item constraint",
+                "operationalization": {"method": "run CIBERSORT-absolute on count matrix"},
             }],
         )
         assert "Constraints registered: 1" in result
@@ -794,9 +831,21 @@ class TestThinkConstraintListForm:
             action="register",
             session_id=sid,
             items=[
-                {"id": "ck_a", "domain": "d", "type": "hard", "statement": "A"},
+                {
+                    "id": "ck_a",
+                    "domain": "d",
+                    "type": "hard",
+                    "statement": "A",
+                    "operationalization": {"method": "test A"},
+                },
                 {"id": "ck_b", "domain": "d", "type": "soft", "statement": "B"},
-                {"id": "ck_c", "domain": "d", "type": "hard", "statement": "C"},
+                {
+                    "id": "ck_c",
+                    "domain": "d",
+                    "type": "hard",
+                    "statement": "C",
+                    "operationalization": {"method": "test C"},
+                },
             ],
         )
         assert "Constraints registered: 3" in result
@@ -814,16 +863,44 @@ class TestThinkConstraintListForm:
 
     @pytest.mark.anyio
     async def test_register_single_form_unchanged(self):
+        # Use type="soft" — the return format test should not be conflated with the
+        # operationalization enforcement test (which covers type="hard" separately).
         result = await think_constraint(
             action="register",
             constraint_id="c_baseline",
             domain="d",
-            type="hard",
+            type="soft",
             statement="single-form",
         )
         sid = _extract_value(result, "Session:")
         assert result == (
             f"Session: {sid} | Constraint: c_baseline\nStatus: registered"
+        )
+
+    @pytest.mark.anyio
+    async def test_hard_single_form_requires_check_description(self):
+        with pytest.raises(ValueError, match="check_description"):
+            await think_constraint(
+                action="register",
+                constraint_id="c_hard_no_check",
+                domain="d",
+                type="hard",
+                statement="hard without check_description",
+            )
+
+    @pytest.mark.anyio
+    async def test_hard_single_form_with_check_description_succeeds(self):
+        result = await think_constraint(
+            action="register",
+            constraint_id="c_hard_with_check",
+            domain="d",
+            type="hard",
+            statement="hard with check_description",
+            check_description="run deconvolution algorithm on count matrix",
+        )
+        sid = _extract_value(result, "Session:")
+        assert result == (
+            f"Session: {sid} | Constraint: c_hard_with_check\nStatus: registered"
         )
 
     @pytest.mark.anyio
@@ -854,6 +931,7 @@ class TestThinkConstraintListForm:
             domain="d",
             type="hard",
             statement="x",
+            check_description="test method",
         )
         result = await think_constraint(
             action="remove",
@@ -872,7 +950,8 @@ class TestThinkConstraintListForm:
             action="register",
             session_id=sid,
             items=[
-                {"id": f"crm_{n}", "domain": "d", "type": "hard", "statement": "x"}
+                {"id": f"crm_{n}", "domain": "d", "type": "hard", "statement": "x",
+                 "operationalization": {"method": f"test method {n}"}}
                 for n in range(3)
             ],
         )
@@ -903,6 +982,7 @@ class TestThinkConstraintListForm:
             domain="d",
             type="hard",
             statement="x",
+            check_description="test method",
         )
         emitted_sid = _extract_value(registered, "Session:")
         result = await think_constraint(
@@ -959,6 +1039,35 @@ class TestThinkEvidenceListForm:
         )
         assert "Evidence registered: 1" in result
         assert "e_solo" in result
+
+    @pytest.mark.anyio
+    async def test_register_with_claim_id_auto_chains(self):
+        from aismartbuddy.tools.infra import session_create
+        sess = await session_create(backends=["think"], mode="analyze")
+        sid = _extract_value(sess, "session_id:")
+        result = await think_evidence(
+            action="register",
+            session_id=sid,
+            items=[{
+                "id": "e_linked",
+                "content": "measured gene expression",
+                "source_type": "measurement",
+                "claim_id": "some_hypothesis",
+            }],
+        )
+        assert "Evidence registered: 1" in result
+        assert "Auto-chained to claim: 1" in result
+        # provenance chain is queryable
+        chains = await think_evidence(action="trace", session_id=sid, claim_id="some_hypothesis")
+        assert "e_linked" in chains
+
+    @pytest.mark.anyio
+    async def test_register_without_claim_id_shows_tip(self):
+        result = await think_evidence(
+            action="register",
+            items=[{"id": "e_orphan", "content": "obs", "source_type": "observation"}],
+        )
+        assert "claim_id" in result
 
     @pytest.mark.anyio
     async def test_register_nk_creates_all(self):
@@ -1188,3 +1297,92 @@ class TestThinkTopologyListForm:
         assert result == (
             f"Session: {sid} | Topology: t_baseline\nStatus: defined"
         )
+
+
+@pytest.mark.usefixtures("_init_session_manager")
+class TestSequentialThinking:
+    @pytest.mark.anyio
+    async def test_single_thought_creates_one_node(self):
+        result = await sequentialthinking(thought="First insight")
+        assert "Batch nodes created: 1" in result
+        assert "Session:" in result
+        assert len(_node_ids(result)) == 1
+
+    @pytest.mark.anyio
+    async def test_batch_thoughts_each_separate_node(self):
+        result = await sequentialthinking(thoughts=["Observation A", "Therefore B", "Conclusion C"])
+        assert "Batch nodes created: 3" in result
+        ids = _node_ids(result)
+        assert len(ids) == 3
+        # Chained sequentially: the root's subtree contains all three.
+        subtree = await think_get_subtree(
+            node_id=ids[0], session_id=_extract_value(result, "Session:")
+        )
+        assert "Observation A" in subtree
+        assert "Therefore B" in subtree
+        assert "Conclusion C" in subtree
+
+    @pytest.mark.anyio
+    async def test_mutual_exclusion_both_raises(self):
+        with pytest.raises(ValueError):
+            await sequentialthinking(thought="x", thoughts=["y"])
+
+    @pytest.mark.anyio
+    async def test_mutual_exclusion_neither_raises(self):
+        with pytest.raises(ValueError):
+            await sequentialthinking()
+
+    @pytest.mark.anyio
+    async def test_empty_batch_entry_raises(self):
+        with pytest.raises(ValueError):
+            await sequentialthinking(thoughts=["valid", "  "])
+
+    @pytest.mark.anyio
+    async def test_session_auto_created_and_reusable(self):
+        first = await sequentialthinking(thought="auto")
+        sid = _extract_value(first, "Session:")
+        assert sid
+        second = await sequentialthinking(thought="follow up", session_id=sid)
+        assert _extract_value(second, "Session:") == sid
+
+    @pytest.mark.anyio
+    async def test_revision_maps_to_revise(self):
+        first = await sequentialthinking(thought="original claim")
+        sid = _extract_value(first, "Session:")
+        node_id = _node_ids(first)[0]
+        revised = await sequentialthinking(
+            thought="corrected claim",
+            is_revision=True,
+            revises_thought=node_id,
+            session_id=sid,
+        )
+        assert "Status: revised" in revised
+
+    @pytest.mark.anyio
+    async def test_revision_without_target_raises(self):
+        with pytest.raises(ValueError):
+            await sequentialthinking(thought="x", is_revision=True)
+
+    @pytest.mark.anyio
+    async def test_no_nudge_before_threshold(self):
+        result = await sequentialthinking(thought="solo", next_thought_needed=True)
+        assert "Tip:" not in result
+
+    @pytest.mark.anyio
+    async def test_nudge_when_concluding(self):
+        result = await sequentialthinking(thought="final", next_thought_needed=False)
+        assert "Tip:" in result
+        assert "think_model" in result
+        assert "think_monitor" in result
+
+    @pytest.mark.anyio
+    async def test_nudge_fires_once_when_crossing_threshold(self):
+        first = await sequentialthinking(
+            thoughts=["t1", "t2", "t3", "t4"], next_thought_needed=True
+        )
+        sid = _extract_value(first, "Session:")
+        assert "Tip:" not in first  # only 4 nodes
+        second = await sequentialthinking(thoughts=["t5"], next_thought_needed=True, session_id=sid)
+        assert "Tip:" in second  # crossed 5
+        third = await sequentialthinking(thoughts=["t6"], next_thought_needed=True, session_id=sid)
+        assert "Tip:" not in third  # already past threshold, no repeat
