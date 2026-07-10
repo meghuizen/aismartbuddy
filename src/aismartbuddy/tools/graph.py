@@ -1650,6 +1650,24 @@ async def graph_knowledge_summary(session_id: str | None = None) -> str:
         lines.append("\nNo KnowledgeNode table found. Use graph_knowledge_add first.")
         return "\n".join(lines)
 
+    # Authority tier counts (only shown when at least one node has a tier set)
+    try:
+        cols, rows = await run_with_lock(
+            info,
+            lambda: info.engine.execute(
+                "MATCH (n:KnowledgeNode) "
+                "RETURN n.authority, count(n) AS cnt "
+                "ORDER BY cnt DESC;"
+            ),
+        )
+        tiers = [(row[0] or "(unset)", row[1]) for row in rows]
+        if any(name != "(unset)" for name, _ in tiers):
+            lines.append("\n### Authority")
+            for name, count in tiers:
+                lines.append(f"  {name}: {count}")
+    except Exception:
+        pass
+
     # Relationship counts
     stats = await run_with_lock(info, info.engine.get_statistics)
     rel_tables = {

@@ -8,6 +8,7 @@ from aismartbuddy.engines.ladybug_engine import LadybugEngine
 from aismartbuddy.tools.graph import (
     graph_create_session,
     graph_knowledge_add,
+    graph_knowledge_summary,
     graph_query,
     knowledge_batch,
 )
@@ -251,6 +252,42 @@ class TestKnowledgeNodeAuthority:
                     {"entity": "X", "entity_type": "concept", "authority": "nope"},
                 ],
             )
+
+
+@pytest.mark.usefixtures("_init_session_manager")
+class TestKnowledgeSummaryAuthority:
+    """graph_knowledge_summary surfaces authority tier counts."""
+
+    @pytest.mark.anyio
+    async def test_summary_includes_authority_counts(self):
+        sid = await _create_graph_session()
+        await knowledge_batch(
+            session_id=sid,
+            nodes=[
+                {"entity": "GT", "entity_type": "fact", "authority": "ground_truth"},
+                {"entity": "Inf1", "entity_type": "concept", "authority": "inferred"},
+                {"entity": "Inf2", "entity_type": "concept", "authority": "inferred"},
+                {"entity": "Plain", "entity_type": "concept"},
+            ],
+        )
+        result = await graph_knowledge_summary(session_id=sid)
+        assert "### Authority" in result
+        assert "ground_truth: 1" in result
+        assert "inferred: 2" in result
+        assert "(unset): 1" in result
+
+    @pytest.mark.anyio
+    async def test_summary_omits_authority_section_when_all_unset(self):
+        sid = await _create_graph_session()
+        await knowledge_batch(
+            session_id=sid,
+            nodes=[
+                {"entity": "A", "entity_type": "concept"},
+                {"entity": "B", "entity_type": "concept"},
+            ],
+        )
+        result = await graph_knowledge_summary(session_id=sid)
+        assert "### Authority" not in result
 
 
 @pytest.mark.usefixtures("_init_session_manager")
