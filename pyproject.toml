@@ -8,6 +8,12 @@ license = "MIT"
 dependencies = [
     # MCP v2 is pre-release: pin exactly until the stable API ships.
     "mcp==2.0.0b1",
+    # Transitive pre-release of mcp==2.0.0b1. Older uv releases (e.g. 0.11.x)
+    # only allow pre-releases for packages that carry a pre-release specifier
+    # in the *requested* dependencies, so `uvx --from git+...` fails without
+    # `--prerelease=allow` unless this is pinned here too. Keep in lockstep
+    # with the mcp pin above.
+    "mcp-types==2.0.0b1",
     "duckdb>=1.5.4",
     "ladybug>=0.18.1",
     "polars>=1.0",
